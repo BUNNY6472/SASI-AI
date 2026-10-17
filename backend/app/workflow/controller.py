@@ -35,6 +35,7 @@ from ..config import Settings
 from ..files import FileStore, StoredFile
 from ..gateway import fit as fitting
 from ..gateway.base import ModelCall, ModelResult, ProviderError, reply_room
+from .context import compact_attachments
 from ..gateway.catalog import name, reads, seat
 from ..gateway.registry import FRONTIER, ModelRegistry
 from ..gateway.routes import VIA, lasting_problem
@@ -209,18 +210,24 @@ class Controller:
             self._event(run, "research_unavailable", "Public search skipped because the remaining token or call budget is too small.")
             return
         self._token_reservations[run.id] = self._token_reservations.get(run.id, 0) + reserve
+        search_attempts = reported_attempts = 0
         def charge_attempt() -> None:
+            nonlocal search_attempts
             # Each route can make a billable request, including a failed fallback.
             self._check_budget(run)
             run.usage.calls += 1
+            search_attempts += 1
             run.usage.by_provider.setdefault("gemini", {"calls": 0, "input_tokens": 0, "output_tokens": 0})["calls"] += 1
 
         def charge_result(result: ModelResult) -> None:
-            run.usage.input_tokens += result.input_tokens
-            run.usage.output_tokens += result.output_tokens
-            bp = run.usage.by_provider.setdefault("gemini", {"calls": 0, "input_tokens": 0, "output_tokens": 0})
-            bp["input_tokens"] += result.input_tokens
-            bp["output_tokens"] += result.output_tokens
+            nonlocal reported_attempts
+            reported_attempts += 1
+            if result.usage_estimated and not result.total_tokens:
+                result.input_tokens = fitting.tokens(run.request)
+                result.output_tokens = max(0, reserve - result.input_tokens)
+            self._record_usage(run, "research", result)
+            # Research route attempts were already counted at dispatch.
+            run.usage.by_provider["gemini"]["calls"] -= 1
             self._record(run, ModelCall(system="", prompt=run.request, kind="research"), result)
 
         started = time.monotonic()
@@ -252,6 +259,10 @@ class Controller:
             run.research_status = "unavailable"
             self._event(run, "research_unavailable", "Public search did not finish: " + (str(exc)[:300] or "time limit reached") + ". Supplied evidence is still available.")
         finally:
+            for _ in range(max(0, search_attempts - reported_attempts)):
+                prompt_tokens = fitting.tokens(run.request)
+                run.usage.record("gemini", "research", prompt_tokens, max(0, reserve - prompt_tokens), estimated=True)
+                run.usage.by_provider["gemini"]["calls"] -= 1
             self._token_reservations[run.id] = max(0, self._token_reservations.get(run.id, 0) - reserve)
         await self._publish(run, checkpoint=True)
 
@@ -600,7 +611,10 @@ class Controller:
     def _out_cap(self, run: Run) -> int:
         """Longest answer one call may write. Eris runs need room for a whole training script."""
         s = self.settings
-        return s.eris_max_output_tokens_per_call if run.eris else s.max_output_tokens_per_call
+        ceiling = s.eris_max_output_tokens_per_call if run.eris else s.max_output_tokens_per_call
+        if run.mode == "deep":
+            return ceiling
+        return min(ceiling, 32_000 if run.eris else 16_000)
 
     def _live(self, run: Run, call: ModelCall, provider: str, key: str, label: str) -> None:
         """Stream this call's text to the screen while the model writes it."""
@@ -617,6 +631,15 @@ class Controller:
 
         previous = call.on_text
         call.on_text = on_text
+
+    @staticmethod
+    def _record_usage(run: Run, stage: str, result: ModelResult) -> None:
+        run.usage.record(result.provider, stage, result.input_tokens, result.output_tokens,
+                         uncached_input_tokens=result.uncached_input_tokens,
+                         cache_read_input_tokens=result.cache_read_input_tokens,
+                         cache_write_input_tokens=result.cache_write_input_tokens,
+                         thinking_tokens=result.thinking_tokens,
+                         detailed=result.usage_details_available, estimated=result.usage_estimated)
 
     def _record(self, run: Run, call: ModelCall, result: ModelResult) -> None:
         """Keep every model output, so each model's work can be seen and compared (saved to BigQuery)."""
@@ -647,10 +670,13 @@ class Controller:
         """Trim this call's input, if needed, so it fits the model's context window with room for the reply."""
         context = self.registry.context(provider)
         note = fitting.fit(call, context, reads(provider), reply_room(call, model_max))
+        if fitting.measure(call, reads(provider)) + reply_room(call, model_max) + fitting.MARGIN > context:
+            raise ProviderError(provider, "The complete request or artifact cannot fit this model's context safely. "
+                                "No partial-artifact review is accepted; use a model with a larger context.")
         if note and (run.id, f"{provider}:{call.kind}") not in self._trim_noted:
             self._trim_noted.add((run.id, f"{provider}:{call.kind}"))
             self._event(run, "trimmed", f"Trimmed {note} so the input fits {name(provider)}'s context window "
-                        f"({context:,} tokens). Models with larger windows read all of it.", provider)
+                        f"({context:,} tokens). Omitted content is not verified by this call.", provider)
 
     async def _call_inner(self, run: Run, provider: str, call: ModelCall, live: tuple[str, str] | None) -> ModelResult:
         """Admit once, then preserve the active model's window across retries."""
@@ -773,12 +799,7 @@ class Controller:
         if not usage_recorded:
             input_estimate = min(reserve, fitting.measure(call, reads(provider)))
             output_estimate = max(0, reserve - input_estimate)
-            run.usage.input_tokens += input_estimate
-            run.usage.output_tokens += output_estimate
-            bp = run.usage.by_provider.setdefault(provider, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
-            bp["calls"] += 1
-            bp["input_tokens"] += input_estimate
-            bp["output_tokens"] += output_estimate
+            run.usage.record(provider, call.kind, input_estimate, output_estimate, estimated=True)
         self.store.record_output(run.id, {
             "run_id": run.id, "stage": call.kind, "provider": provider, "model": partial.model,
             "task_id": partial.task_id, "title": partial.label + " (incomplete)", "content": partial.text,
@@ -796,13 +817,29 @@ class Controller:
             run.skipped[provider] = "its key was removed during the run"
             raise ProviderError(provider, "its key was removed")
         call = dataclasses.replace(call)  # this model's own copy: trimming for one model never reaches another
+        before_chars = sum(len(f.text) for f in call.attachments)
+        call.attachments = compact_attachments(call.attachments, call.kind, call.prompt)
+        after_chars = sum(len(f.text) for f in call.attachments)
+        if after_chars < before_chars and (run.id, "context:" + call.kind) not in self._trim_noted:
+            self._trim_noted.add((run.id, "context:" + call.kind))
+            self._event(run, "context_compacted", f"Selected {after_chars:,} of {before_chars:,} file-preview characters "
+                        f"for {call.kind.replace('_', ' ')}; original files remain stored. Omitted content is not verified.", provider)
         original_callback = call.on_text
         info = seat(provider)
         model_max = info.max_output if info else 32_000
         # Half the model's reply limit for the answer leaves the other half for its thinking.
         call.max_output_tokens = max(500, min(call.max_output_tokens, self._out_cap(run), model_max // 2))
+        if call.kind == "analysis":
+            call.max_output_tokens = min(call.max_output_tokens, 12_000 if run.eris else 8_000)
         if run.eris:
             call.rules = eris.RULES  # every model, on every step, follows the Eris guidebook
+        token_limit = self.settings.eris_max_tokens_per_run if run.eris else self.settings.max_tokens_per_run
+        if token_limit:
+            remaining = max(0, token_limit - run.usage.total_tokens - self._token_reservations.get(run.id, 0))
+            call.prompt += (f"\n\nController resource context: about {remaining:,} aggregate tokens remain across the team. "
+                            "This is a ceiling, not a target to spend. Reuse established facts; focus on unresolved requirements "
+                            "and concrete checks. Return the requested artifact when complete. Do not repeat analyses or "
+                            "claim that omitted file content was inspected. Preserve all material uncertainty.")
         base_timeout = 1200 if (call.attachments or run.eris or call.max_output_tokens > 8000) else 600
         last: Exception | None = None
         again = shrunk = roomier = 0
@@ -852,12 +889,7 @@ class Controller:
                 stop = result.stop_reason.lower()
                 if ("max" in stop and "token" in stop) or "length" in stop:
                     # A nonempty prefix is still incomplete, especially for code and JSON.
-                    run.usage.input_tokens += result.input_tokens
-                    run.usage.output_tokens += result.output_tokens
-                    bp = run.usage.by_provider.setdefault(provider, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
-                    bp["calls"] += 1
-                    bp["input_tokens"] += result.input_tokens
-                    bp["output_tokens"] += result.output_tokens
+                    self._record_usage(run, call.kind, result)
                     usage_recorded = True
                     raise ProviderError(provider, "the response was truncated by its output limit", retryable=True)
                 complete = True
@@ -913,14 +945,8 @@ class Controller:
                     self._keep_partial(run, provider, call, "".join(chunks) or (result.text if result else ""),
                                        failed_reason, reserve, usage_recorded, result.model if result else "")
                 self._token_reservations[run.id] = max(0, self._token_reservations.get(run.id, 0) - reserve)
-            u = run.usage
             policy.observe(run, call.kind, time.monotonic() - started)
-            u.input_tokens += result.input_tokens
-            u.output_tokens += result.output_tokens
-            bp = u.by_provider.setdefault(provider, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
-            bp["calls"] += 1
-            bp["input_tokens"] += result.input_tokens
-            bp["output_tokens"] += result.output_tokens
+            self._record_usage(run, call.kind, result)
             self._record(run, call, result)
             self.registry.sync(provider)  # the route that answered may have changed
             return result
@@ -971,7 +997,8 @@ class Controller:
     def _estimate(run: Run, files: list[StoredFile]) -> int:
         """Rough size of the run's input in tokens, for choosing models whose context window holds it."""
         texts = sum(fitting.tokens(f.text) for f in files if f.text)
-        pdfs = sum(f.size // fitting.PDF_BYTES_PER_TOKEN for f in files if f.kind == "pdf")
+        pdfs = sum(f.size // fitting.PDF_BYTES_PER_TOKEN for f in files
+                   if f.kind == "pdf" and f.data and len(f.data) == f.size)
         return fitting.tokens(run.request + run.materials) + texts + pdfs
 
     def _note_team(self, run: Run, input_tokens: int) -> None:

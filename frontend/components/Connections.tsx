@@ -3,6 +3,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import {
   api,
+  fileSize,
   ProviderStatus,
   RouteStatus,
   RunLimits,
@@ -677,7 +678,7 @@ export default function Connections({
                   ? limits.max_tokens_per_run.toLocaleString()
                   : "No cap"}
               </b>
-              <span>tokens per run</span>
+              <span>total tokens across all calls per run</span>
             </div>
             <div>
               <b>
@@ -685,12 +686,15 @@ export default function Connections({
                   ? limits.eris_max_tokens_per_run.toLocaleString()
                   : "No cap"}
               </b>
-              <span>tokens per Eris run</span>
+              <span>total tokens across all calls per Eris run</span>
             </div>
             <div>
               <b>{limits.max_output_tokens_per_call.toLocaleString()}</b>
-              <span>output tokens per call</span>
+              <span>output ceiling per call; model-specific limits apply</span>
             </div>
+            {!!limits.max_run_bytes && <div><b>{fileSize(limits.max_run_bytes)}</b><span>combined original file size per session</span></div>}
+            {!!limits.max_files_per_run && <div><b>{limits.max_files_per_run}</b><span>files per session</span></div>}
+            {limits.resumable_uploads !== undefined && <div><b>{limits.resumable_uploads ? "Resumable" : "Direct"}</b><span>{limits.resumable_uploads ? "chunked cloud uploads with retry" : `${fileSize(limits.raw_upload_max_bytes ?? 25 * 1024 ** 2)} per-file upload limit`}</span></div>}
             <div>
               <b>{limits.max_tasks_per_plan}</b>
               <span>tasks per plan</span>
@@ -708,6 +712,7 @@ export default function Connections({
               <span>project record</span>
             </div>
           </div>
+          <p className="muted small">A session token allowance is shared across repeated calls. It is separate from a model’s per-request context window. Cached input still counts toward the allowance. Original files stay in storage; focused previews and compact reports reduce repeated input. File coverage and token breakdowns are available in each session.</p>
         </>
       )}
 

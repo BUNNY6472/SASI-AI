@@ -6,14 +6,16 @@ import hmac
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeTimedSerializer
+from pydantic import BaseModel, Field
 
 from . import extract
 from . import files as files_mod
@@ -35,6 +37,29 @@ COOKIE = "sasi_session"
 SESSION_MAX_AGE = 7 * 24 * 3600
 OPEN_PATHS = {"/api/health", "/api/login", "/api/session", "/api/logout"}
 _EXTRACTION_WORKERS: set[asyncio.Task] = set()
+
+
+class BeginUpload(BaseModel):
+    name: str = Field(min_length=1, max_length=500)
+    mime: str = Field(default="application/octet-stream", max_length=150)
+    size: int = Field(strict=True, ge=1, le=files_mod.MAX_FILE_BYTES)
+
+
+def download_range(value: str | None, size: int) -> tuple[int, int, bool]:
+    if not value:
+        return 0, size - 1, False
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", value.strip())
+    if not match or not any(match.groups()):
+        raise HTTPException(416, "Only one valid byte range is supported.", headers={"Content-Range": f"bytes */{size}"})
+    first, last = match.groups()
+    if first:
+        start, end = int(first), min(size - 1, int(last)) if last else size - 1
+    else:
+        suffix = int(last)
+        start, end = max(0, size - suffix), size - 1
+    if start > end or start >= size or (not first and int(last) == 0):
+        raise HTTPException(416, "The requested range is outside this file.", headers={"Content-Range": f"bytes */{size}"})
+    return start, end, True
 
 
 async def _prepare_upload(slots: asyncio.Semaphore, name: str, mime: str, data: bytes,
@@ -77,19 +102,24 @@ async def _prepare_upload(slots: asyncio.Semaphore, name: str, mime: str, data: 
 
 
 def build_store(settings: Settings):
-    """Run store and file store. On Cloud Run both live in BigQuery."""
+    """Cloud attachments use private objects; the legacy store remains readable."""
     if settings.storage_backend == "bigquery":
         from .store.bigquery import BigQuery, BigQueryFileStore, BigQueryStore
 
         db = BigQuery(settings.gcp_project, settings.bigquery_dataset)
-        return BigQueryStore(settings.gcp_project, settings.bigquery_dataset, db), BigQueryFileStore(db)
-    if settings.storage_backend == "sqlite":
+        stores = BigQueryStore(settings.gcp_project, settings.bigquery_dataset, db), BigQueryFileStore(db)
+    elif settings.storage_backend == "sqlite":
         from .store.sqlite import SQLiteDatabase, SQLiteFileStore, SQLiteStore
         db = SQLiteDatabase(settings.sqlite_path)
-        return SQLiteStore(db), SQLiteFileStore(db)
-    if settings.storage_backend != "memory":
+        stores = SQLiteStore(db), SQLiteFileStore(db)
+    elif settings.storage_backend != "memory":
         raise ValueError("Unknown storage backend")
-    return MemoryStore(), FileStore()
+    else:
+        stores = MemoryStore(), FileStore()
+    if settings.upload_bucket:
+        from .store.objects import ObjectFileStore
+        return stores[0], ObjectFileStore(settings.upload_bucket, settings.gcp_project, stores[1])
+    return stores
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -106,6 +136,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     controller = Controller(settings, registry, store, history, file_store)
     admission = asyncio.Lock()
     extraction_slots = asyncio.Semaphore(2)
+    raw_upload_slots = asyncio.Semaphore(2)
     signer = URLSafeTimedSerializer(settings.session_secret, salt="sasi-session")
 
     @asynccontextmanager
@@ -122,11 +153,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     if a.review and a.review.verdict in ("pass", "revise", "block"):
                         history.record(a.provider, run.profile, a.review.verdict == "pass")
         refresh_task = asyncio.create_task(registry.refresh())
+        async def cleanup_uploads():
+            while True:
+                try:
+                    await file_store.cleanup()
+                except Exception as error:
+                    log.warning("Upload cleanup will retry (%s).", type(error).__name__)
+                await asyncio.sleep(900)
+        upload_cleanup_task = asyncio.create_task(cleanup_uploads())
         try:
             yield
         finally:
             refresh_task.cancel()
-            await asyncio.gather(refresh_task, return_exceptions=True)
+            upload_cleanup_task.cancel()
+            await asyncio.gather(refresh_task, upload_cleanup_task, return_exceptions=True)
             if hasattr(controller, "shutdown"):
                 await controller.shutdown()
 
@@ -136,6 +176,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.controller = controller
     app.state.store = store
     app.state.key_store = key_store
+
+    @app.exception_handler(FileRejected)
+    async def file_rejected(_request, error: FileRejected):
+        return JSONResponse({"detail": str(error)}, status_code=400)
 
     def authed(request: Request) -> bool:
         if not settings.app_access_code:
@@ -318,7 +362,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "max_revisions_per_task": s.max_revisions_per_task,
             "max_concurrent_runs": s.max_concurrent_runs,
             "storage": s.storage_backend,
-            "max_file_mb": files_mod.MAX_FILE_BYTES // (1024 * 1024),
+            "max_file_mb": file_store.max_file_bytes // (1024 * 1024),
+            "max_file_bytes": file_store.max_file_bytes,
+            "max_run_bytes": file_store.max_run_bytes,
+            "raw_upload_max_bytes": files_mod.RAW_UPLOAD_MAX_BYTES,
+            "resumable_uploads": file_store.resumable_uploads,
+            "preview_max_bytes": files_mod.PREVIEW_BYTES,
             "max_files_per_run": files_mod.MAX_FILES_PER_RUN,
         }
 
@@ -336,49 +385,129 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # ------------------------------------------------------------------ files
 
-    @app.post("/api/files")
-    async def upload_file(request: Request):
+    @app.get("/api/files/uploads")
+    async def list_uploads():
+        if not file_store.resumable_uploads:
+            return []
+        try:
+            return await file_store.list_uploads()
+        except Exception as error:
+            log.warning("Could not list staged uploads (%s).", type(error).__name__)
+            raise HTTPException(503, "Saved uploads are temporarily unavailable. Try again.") from error
+
+    @app.post("/api/files/uploads")
+    async def initiate_upload(body: BeginUpload, request: Request):
+        if not file_store.resumable_uploads:
+            raise HTTPException(503, "Large uploads require the private cloud upload bucket to be configured.")
+        origin = request.headers.get("origin") or str(request.base_url).rstrip("/")
+        parsed = urlsplit(origin)
+        if parsed.netloc != request.url.netloc or parsed.scheme not in ("http", "https") or parsed.path:
+            raise HTTPException(403, "Upload sessions must be created from this SASI website.")
+        try:
+            return await file_store.initiate(body.name, body.mime, body.size, origin)
+        except FileRejected as error:
+            raise HTTPException(400, str(error)) from error
+        except Exception as error:
+            log.warning("Could not start upload (%s).", type(error).__name__)
+            raise HTTPException(503, "Cloud upload is temporarily unavailable. Try again.") from error
+
+    @app.post("/api/files/uploads/{file_id}/complete")
+    async def complete_upload(file_id: str):
+        if not file_store.resumable_uploads:
+            raise HTTPException(503, "Cloud uploads are not configured.")
+        try:
+            return (await file_store.complete(file_id)).ref()
+        except FileRejected as error:
+            raise HTTPException(400, str(error)) from error
+        except Exception as error:
+            log.warning("Could not finish upload (%s).", type(error).__name__)
+            raise HTTPException(503, "The original upload may be saved, but processing did not finish. Retry finishing it.") from error
+
+    async def _upload_file(request: Request):
         """Upload one file as the raw request body. The name comes in the X-File-Name header."""
         name = unquote(request.headers.get("x-file-name", "file"))
         try:
             declared = int(request.headers.get("content-length") or 0)
         except ValueError:
             raise HTTPException(400, "Invalid content length") from None
-        if declared > files_mod.MAX_FILE_BYTES:
-            raise HTTPException(413, f"'{name}' is larger than {files_mod.MAX_FILE_BYTES // (1024 * 1024)} MB.")
+        if declared > files_mod.RAW_UPLOAD_MAX_BYTES:
+            raise HTTPException(413, "Files above 25 MiB require a resumable cloud upload.")
         chunks, size = [], 0
         async for chunk in request.stream():
             size += len(chunk)
-            if size > files_mod.MAX_FILE_BYTES:
-                raise HTTPException(413, f"'{name}' is larger than {files_mod.MAX_FILE_BYTES // (1024 * 1024)} MB.")
+            if size > files_mod.RAW_UPLOAD_MAX_BYTES:
+                raise HTTPException(413, "Files above 25 MiB require a resumable cloud upload.")
             chunks.append(chunk)
         try:
             f = await _prepare_upload(extraction_slots, name, request.headers.get("content-type", ""), b"".join(chunks))
-            file_store.stage(f)
+            f = await file_store.stage_async(f)
         except TimeoutError:
             raise HTTPException(422, "File processing exceeded its time limit. Try a smaller file.") from None
         except FileRejected as e:
             raise HTTPException(400, str(e)) from e
         return f.ref()
 
+    @app.post("/api/files")
+    async def upload_file(request: Request):
+        # Bound body buffering as well as parsing; simultaneous small uploads
+        # must not exhaust the Cloud Run process before acquiring a parser slot.
+        try:
+            async with asyncio.timeout(300):
+                async with raw_upload_slots:
+                    return await _upload_file(request)
+        except TimeoutError:
+            raise HTTPException(408, "Upload timed out. Please retry.") from None
+
     @app.delete("/api/files/{file_id}")
     async def remove_staged_file(file_id: str):
-        file_store.unstage(file_id)
+        try:
+            await file_store.unstage_async(file_id)
+        except FileRejected as error:
+            raise HTTPException(400, str(error)) from error
+        except Exception as error:
+            log.warning("Upload cleanup postponed (%s).", type(error).__name__)
+            raise HTTPException(503, "Cloud cleanup will retry. Try removing the upload again.") from error
         return {"ok": True}
 
     @app.get("/api/runs/{run_id}/files/{file_id}")
-    async def read_file(run_id: str, file_id: str):
+    async def read_file(run_id: str, file_id: str, request: Request):
         get_run(run_id)
         f = await file_store.get_one(run_id, file_id)
         if not f:
             raise HTTPException(404, "File not found")
         inline = f.kind in ("image", "video", "audio", "pdf")
+        start, end, partial = download_range(request.headers.get("range"), f.size)
+        headers = {"Content-Disposition": f"{'inline' if inline else 'attachment'}; filename*=UTF-8''{quote(f.name)}",
+                   "Content-Security-Policy": "sandbox; default-src 'none'; img-src 'self'; media-src 'self'",
+                   "Accept-Ranges": "bytes", "Content-Length": str(end - start + 1)}
+        if partial:
+            headers["Content-Range"] = f"bytes {start}-{end}/{f.size}"
+        if f.object_uri:
+            # Uvicorn must use chunked transfer for large HTTP/1 responses to
+            # bypass Cloud Run's 32 MiB non-streaming response limit.
+            if end - start + 1 > files_mod.RAW_UPLOAD_MAX_BYTES:
+                headers.pop("Content-Length", None)
+            return StreamingResponse(file_store.stream(f, start, end), media_type=f.mime if inline else "application/octet-stream",
+                                     status_code=206 if partial else 200, headers=headers)
         media = f.mime if inline else "text/plain; charset=utf-8" if extract.looks_like_text(f.data) else "application/octet-stream"
-        return Response(f.data, media_type=media, headers={
-            "Content-Disposition": f"{'inline' if inline else 'attachment'}; filename*=UTF-8''{quote(f.name)}",
-            "Content-Security-Policy": "sandbox; default-src 'none'; img-src 'self'; media-src 'self'",
-            "Cache-Control": "private, max-age=3600",
-        })
+        return Response(f.data[start:end + 1], media_type=media, status_code=206 if partial else 200, headers=headers)
+
+    @app.get("/api/runs/{run_id}/files/{file_id}/preview")
+    async def read_file_preview(run_id: str, file_id: str, offset: int = 0, max_bytes: int = 262144):
+        get_run(run_id)
+        f = await file_store.get_one(run_id, file_id)
+        if not f:
+            raise HTTPException(404, "File not found")
+        if offset < 0 or offset >= f.size or not 1 <= max_bytes <= 262144:
+            raise HTTPException(400, "Choose a valid byte offset and a preview of 1 to 262144 bytes.")
+        end = min(f.size - 1, offset + max_bytes - 1)
+        data = await file_store.read_range(f, offset, end) if f.object_uri else f.data[offset:end + 1]
+        readable = f.kind == "text" and extract.looks_like_text(data)
+        return {"id": f.id, "name": f.name, "size": f.size, "offset": offset, "bytes": len(data),
+                "next_offset": end + 1 if end + 1 < f.size else None,
+                "text": data.decode("utf-8", errors="replace") if readable else None,
+                "coverage_note": ("Bounded original byte range only; partial lines and UTF-8 characters may be cut at its edges."
+                                  if readable else "Binary contents are not rendered as text. Download the original to inspect it.")}
 
     # ------------------------------------------------------------------ runs
 
@@ -401,7 +530,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if controller.active_count() >= settings.max_concurrent_runs:
             raise HTTPException(429, f"Up to {settings.max_concurrent_runs} runs can be active at once. Wait for one to finish.")
         try:
-            files = file_store.take(body.file_ids)
+            files = await file_store.take_async(body.file_ids)
         except FileRejected as e:
             raise HTTPException(400, str(e)) from e
         eris = body.eris or body.profile == "eris"
@@ -419,16 +548,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await file_store.attach(run.id, files)
         except Exception as e:  # noqa: BLE001
             log.warning("could not save files for run %s: %s", run.id, e)
-            for f in files:
-                file_store.stage(f)
+            if hasattr(file_store, "rollback_attach"):
+                await file_store.rollback_attach(run.id, files)
+            else:
+                for f in files:
+                    await file_store.stage_async(f)
             raise HTTPException(500, "The files could not be saved. Try again.") from e
         try:
             await controller.start(run)
         except Exception as e:
             run.status = "failed"
             run.error = "The initial checkpoint could not be saved. No model work was started."
-            for f in files:
-                file_store.stage(f)
+            if hasattr(file_store, "rollback_attach"):
+                await file_store.rollback_attach(run.id, files)
+            else:
+                for f in files:
+                    await file_store.stage_async(f)
             log.warning("could not start run %s: %s", run.id, type(e).__name__)
             raise HTTPException(503, run.error) from e
         return run.model_dump(mode="json")

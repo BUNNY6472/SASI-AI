@@ -73,6 +73,16 @@ if [ -n "$ME" ]; then
     echo "  roles/iam.serviceAccountUser on sasi-builder -> $ME" || true
 fi
 
+echo "== Private original-file upload bucket"
+UPLOAD_BUCKET="gs://${PROJECT_ID}-uploads"
+if ! gcloud storage buckets describe "$UPLOAD_BUCKET" >/dev/null 2>&1; then
+  gcloud storage buckets create "$UPLOAD_BUCKET" --location "$REGION" \
+    --uniform-bucket-level-access --public-access-prevention --soft-delete-duration=0
+fi
+gcloud storage buckets update "$UPLOAD_BUCKET" --cors-file "$(dirname "$0")/upload-cors.json" >/dev/null
+gcloud storage buckets add-iam-policy-binding "$UPLOAD_BUCKET" \
+  --member "serviceAccount:$RUNTIME_SA" --role roles/storage.objectAdmin >/dev/null
+
 echo "== Build source bucket"
 BUILD_BUCKET="gs://${PROJECT_ID}-sasi-build"
 if ! gcloud storage buckets describe "$BUILD_BUCKET" >/dev/null 2>&1; then

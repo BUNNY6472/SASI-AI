@@ -686,6 +686,97 @@ summary {
   height: 2px;
   background: var(--teal);
 }
+.upload-list {
+  display: grid;
+  gap: 8px;
+}
+.upload-item {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  gap: 10px;
+  padding: 12px;
+  align-items: flex-start;
+}
+.upload-item > svg { flex-shrink: 0; margin-top: 3px; }
+.upload-file-info { flex: 1; min-width: 0; display: grid; gap: 3px; }
+.upload-file-info .attach-name { max-width: none; font-size: 12px; }
+.upload-file-info small, .upload-detail { font-size: 11px; line-height: 1.5; }
+.upload-detail { color: #65745d; overflow-wrap: anywhere; }
+.upload-detail.error { color: var(--danger); }
+.upload-item .attach-x { flex-shrink: 0; margin-top: -4px; }
+.upload-retry { flex-shrink: 0; }
+.upload-policy {
+  display: grid;
+  gap: 5px;
+  padding: 0 22px 15px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: #718063;
+}
+.upload-policy > span:first-child { color: #53664c; }
+.token-budget-note {
+  font-size: 11px;
+  line-height: 1.7;
+  color: #64765b;
+  padding: 0 22px;
+  margin: 5px 0 12px;
+}
+.file-coverage {
+  margin: 0 0 20px;
+  border: 1px solid #dce4d5;
+  background: #f4f7ef;
+  border-radius: 8px;
+  padding: 12px 16px;
+  font-size: 12px;
+  color: #52694b;
+}
+.file-coverage.has-partial { background: #faf6ec; border-color: #e7ddbf; color: #7b6336; }
+.file-coverage summary { cursor: pointer; font-weight: 600; line-height: 1.7; }
+.file-coverage summary span { font-weight: 400; margin-left: 8px; }
+.file-coverage > p { margin: 12px 0; line-height: 1.7; }
+.file-coverage ul { list-style: none; padding: 0; margin: 0; }
+.file-coverage li { border-top: 1px solid #d7dfce; padding: 12px 0; }
+.file-coverage li:last-child { padding-bottom: 0; }
+.file-coverage li > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 14px; }
+.file-coverage li strong { overflow-wrap: anywhere; }
+.file-coverage li p { margin: 5px 0; line-height: 1.65; }
+.file-coverage li small { font-size: 11px; }
+.usage-details { margin: 0 0 22px; border-radius: 8px; overflow: hidden; }
+.usage-details > summary {
+  cursor: pointer;
+  padding: 13px 17px;
+  color: #52664a;
+  font-size: 12px;
+}
+.usage-details > summary > strong { float: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+.usage-details > summary small { font-size: 11px; font-weight: 400; }
+.usage-details-body { border-top: 1px solid var(--line); padding: 0 17px 16px; }
+.usage-details-body > p { font-size: 12px; line-height: 1.7; color: #63735a; }
+.usage-counters { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px 12px; margin: 20px 0; }
+.usage-counters > div { min-width: 0; }
+.usage-counters dt { font-size: 11px; color: #6e7d63; }
+.usage-counters dd { font-size: 19px; color: #3f5940; margin: 4px 0 0; font-variant-numeric: tabular-nums; }
+.usage-table-scroll { max-width: 100%; overflow-x: auto; margin-top: 18px; }
+.usage-table { width: 100%; border-collapse: collapse; text-align: right; font-size: 11px; font-variant-numeric: tabular-nums; }
+.usage-table caption { text-align: left; font-size: 12px; font-weight: 600; color: #52664a; padding-bottom: 9px; }
+.usage-table th, .usage-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.usage-table th:first-child { padding-left: 0; text-align: left; }
+.usage-table tbody th { font-weight: 500; }
+.usage-table thead th { font-weight: 500; color: #78876a; }
+@media (max-width: 680px) {
+  .upload-policy { padding: 0 17px 14px; font-size: 10px; }
+  .token-budget-note { padding: 0 16px; font-size: 10px; }
+  .upload-item { gap: 7px; padding: 10px; }
+  .upload-item .upload-retry { padding: 6px; }
+  .file-coverage { padding: 11px 13px; }
+  .file-coverage summary span { display: block; margin-left: 0; }
+  .usage-details > summary { padding: 13px; }
+  .usage-details > summary > strong { float: none; display: block; padding: 5px 0 0 15px; }
+  .usage-details-body { padding: 0 13px 14px; }
+  .usage-counters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .usage-counters dd { font-size: 17px; }
+}
 .team-line {
   display: flex;
   align-items: center;

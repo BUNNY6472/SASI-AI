@@ -87,7 +87,9 @@ class GeminiAdapter:
                 parts.append(types.Part.from_uri(file_uri=await self._upload(f), mime_type=f.mime))
             else:
                 parts.append(types.Part.from_bytes(data=f.data, mime_type=f.mime))
-        parts.append(types.Part.from_text(text=extra + call.prompt))
+        if extra:
+            parts.append(types.Part.from_text(text=extra))
+        parts.append(types.Part.from_text(text=call.prompt))
         return [types.Content(role="user", parts=parts)]
 
     async def generate(self, call: ModelCall) -> ModelResult:
@@ -100,7 +102,9 @@ class GeminiAdapter:
             contents = await self._contents(call)
             if call.on_text:
                 chunks: list[str] = []
-                last = None
+                last_usage = None
+                version = model
+                finish = ""
                 async for chunk in await self._client.aio.models.generate_content_stream(
                         model=model, contents=contents, config=config):
                     piece = "".join(p.text or "" for c in (chunk.candidates or [])[:1]
@@ -108,11 +112,14 @@ class GeminiAdapter:
                     if piece:
                         chunks.append(piece)
                         await call.on_text(piece)
-                    last = chunk
+                    if chunk.usage_metadata is not None:
+                        last_usage = chunk.usage_metadata
+                    if chunk.model_version:
+                        version = chunk.model_version
+                    if chunk.candidates and chunk.candidates[0].finish_reason:
+                        finish = str(chunk.candidates[0].finish_reason)
                 text = "".join(chunks)
-                usage = last.usage_metadata if last else None
-                version = (last.model_version if last else None) or model
-                finish = str(last.candidates[0].finish_reason) if last and last.candidates else ""
+                usage = last_usage
             else:
                 resp = await self._client.aio.models.generate_content(model=model, contents=contents, config=config)
                 text = resp.text or ""
@@ -125,12 +132,23 @@ class GeminiAdapter:
 
         if not text.strip():
             raise no_text(self.provider, finish)
+        # Some transports end with a metadata-free chunk. Never turn a missing
+        # usage report into a zero-cost successful call.
+        from .catalog import reads
+        from .fit import measure
+        fallback_input = measure(call, reads(self.provider)) if usage is None else 0
         return ModelResult(
             provider=self.provider,
             model=version,
             text=text,
-            input_tokens=(usage.prompt_token_count or 0) if usage else 0,
-            output_tokens=((usage.candidates_token_count or 0) + (getattr(usage, "thoughts_token_count", 0) or 0)) if usage else 0,
+            input_tokens=(usage.prompt_token_count or 0) if usage else fallback_input,
+            output_tokens=((usage.candidates_token_count or 0) + (getattr(usage, "thoughts_token_count", 0) or 0)) if usage else reply_room(call, MAX_OUTPUT),
+            uncached_input_tokens=max(0, (usage.prompt_token_count or 0)
+                                      - (getattr(usage, "cached_content_token_count", 0) or 0)) if usage else 0,
+            cache_read_input_tokens=(getattr(usage, "cached_content_token_count", 0) or 0) if usage else 0,
+            thinking_tokens=(getattr(usage, "thoughts_token_count", 0) or 0) if usage else 0,
+            usage_details_available=usage is not None,
+            usage_estimated=usage is None,
             stop_reason=finish,
         )
 

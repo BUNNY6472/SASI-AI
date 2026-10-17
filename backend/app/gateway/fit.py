@@ -11,7 +11,7 @@ from __future__ import annotations
 import dataclasses
 import re
 
-from .base import ModelCall
+from .base import ModelCall, split_attachments
 
 CHARS_PER_TOKEN = 3.0
 MARGIN = 4_000  # tokens kept free for the provider's own wrapping and miscounts
@@ -26,7 +26,8 @@ def tokens(text: str) -> int:
 
 def _media_tokens(call: ModelCall, reads: set[str]) -> int:
     total = 0
-    for f in call.attachments:
+    media, _ = split_attachments(call, "", can_read=reads)
+    for f in media:
         if f.kind == "image" and "image" in reads:
             total += IMAGE_TOKENS
         elif f.kind == "pdf" and "pdf" in reads:
@@ -35,8 +36,8 @@ def _media_tokens(call: ModelCall, reads: set[str]) -> int:
 
 
 def measure(call: ModelCall, reads: set[str]) -> int:
-    texts = sum(tokens(f.text) for f in call.attachments if f.kind in ("text", "other") and f.text)
-    return tokens(call.full_system) + tokens(call.prompt) + texts + _media_tokens(call, reads)
+    _, text = split_attachments(call, "", can_read=reads)
+    return tokens(call.full_system) + tokens(call.prompt) + tokens(text) + _media_tokens(call, reads)
 
 
 def _cut(text: str, keep_chars: int, what: str) -> str:
@@ -46,7 +47,7 @@ def _cut(text: str, keep_chars: int, what: str) -> str:
     tail = keep_chars - head
     dropped = len(text) - head - tail
     return (f"{text[:head]}\n\n[... {dropped:,} characters of {what} left out here so it fits this model's context window. "
-            "Models with larger context windows read all of it; rely on their analyses for this part ...]\n\n"
+            "Omitted content was not included in this call; do not claim it was verified ...]\n\n"
             + (text[-tail:] if tail else ""))
 
 
@@ -75,7 +76,7 @@ def fit(call: ModelCall, context: int, reads: set[str], reply: int | None = None
             notes.append(f.name)
         call.attachments = [new_files[f.id] for f in call.attachments]
     # 2. Then the middle of the prompt, where shared material sits; the request and the instructions stay.
-    if over > 0:
+    if over > 0 and call.kind not in {"review", "plan_review", "final_eval"}:
         keep = max(4_000, tokens(call.prompt) - over - NOTE_TOKENS)
         cut = _cut(call.prompt, int(keep * CHARS_PER_TOKEN), "the shared material")
         if cut != call.prompt:

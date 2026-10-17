@@ -1,0 +1,8 @@
+[
+  {
+    "origin": ["https://sasi-qy3o5iaviq-uc.a.run.app"],
+    "method": ["PUT", "POST", "DELETE", "OPTIONS"],
+    "responseHeader": ["Content-Type", "Content-Range", "Range", "ETag", "x-goog-generation"],
+    "maxAgeSeconds": 3600
+  }
+]

@@ -4,6 +4,19 @@ SASI means **Sasidhar’s Artificial Super Intelligence**. This release improves
 
 ## Implemented
 
+### Token efficiency and large uploads — 18 October 2026
+
+- Both general and Eris runs have a 5,000,000 aggregate-token ceiling (50 lakh). The 120-minute inclusive runtime cap and trial-only access policy remain enforced. Deep mode can request up to 64,000 answer tokens plus reasoning, still bounded by the selected provider's output/context capacity. Adaptive mode retains smaller writing allowances and stage-sized reviews.
+- CSV/JSON datasets are represented by bounded statistics and examples; source attachments are selected within 24–48k-character stage budgets. Original bytes remain intact. Coverage, sampling, selected source ranges and omitted content are explicit. Code artifacts under review are never silently shortened to obtain a passing review.
+- Adaptive uses at most two independent analyses with task/final verification; broad all-to-all comparison remains available in Deep. Calls receive remaining-budget context and may finish immediately when their work is done. Existing objective checks, revision limits and resumable accepted work remain.
+- Claude's shared Eris rules use a one-hour cache; repeated file prefixes use the lower-premium five-minute cache. Gemini implicit cache reads are counted. Cache hits are measured, not promised. Accounting separately retains cache reads/writes, uncached input, reported thinking, stage totals and estimated usage. Missing provider usage is conservatively charged instead of recorded as zero; historical unknown breakdowns remain unknown.
+- With the private upload bucket configured, direct resumable uploads accept up to 20 files and 2 GiB combined. GCS generation preconditions protect reservations and original ownership. Refresh recovery, retry offsets, cancellation, expiry cleanup and authenticated range downloads are supported. Original files are not stored as giant BigQuery rows or loaded into one API request.
+- Text inspection is bounded to a 2 MiB prefix with additional format-specific safety limits. Eligible complete media is bounded to 8 MiB/file and 64 MiB resident/run. A 2 GiB upload does **not** mean a model read every byte. Training and arbitrary generated-code execution remain outside the API process.
+
+Validation: an offline 5,000-row CSV fixture reduced dispatched source context from at least 150,000 to 1,769 characters. This is not a measured billing or quality benchmark. A real 17,825,801-byte GCS upload passed chunk transfer, resume-offset probing, original-range byte comparison, staged refresh recovery, 2 GiB reservation/overflow checks and cleanup without any model calls. Automated tests cover upload races, auth, extraction coverage, accounting, provider ceilings and prior workflow behavior.
+
+Research basis: [budget-aware agent planning and verification](https://arxiv.org/html/2511.17006v2), [matched-budget single/multi-agent evaluation](https://arxiv.org/abs/2604.02460), [Claude prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching), and [Google resumable uploads](https://cloud.google.com/storage/docs/resumable-uploads). The training-based AnySearch technique is not represented as an implemented API feature.
+
 1. **Replace mandatory comparison with effort modes.** Quick starts with one analyst; Adaptive increases breadth for complex/research work; Deep uses broader comparison. Observed call durations update the reserve for synthesis and review. Claude effort varies by stage and remaining time. A bounded additional investigation can address final-review gaps.
 2. **Make review gates trustworthy.** Invalid plans/reviews cannot silently pass. String booleans and incomplete responses are rejected. Reassignments retain the previous draft and reviewer feedback. Original criteria, relevant inputs and source evidence reach reviewers.
 3. **Bind assessments to exact output.** Each final version has a SHA-256. Old reviews cannot validate a changed answer. The latest review round is authoritative for identical bytes; old rounds remain history. Current deterministic failures override positive peer opinions.
@@ -19,13 +32,13 @@ SASI means **Sasidhar’s Artificial Super Intelligence**. This release improves
 
 ## Requested resource limits
 
-The user requested a threefold increase over the initial upgrade defaults:
+The initial threefold increase was superseded by the requested 50-lakh aggregate token limit:
 
 | Limit | Initial upgrade | Current default |
 |---|---:|---:|
 | Model calls per run | 100 | **300** |
-| Tokens per normal run | 800,000 | **2,400,000** |
-| Tokens per Eris run | 1,200,000 | **3,600,000** |
+| Tokens per normal run | 800,000 | **5,000,000** |
+| Tokens per Eris run | 1,200,000 | **5,000,000** |
 
 These are maximums, not targets. The selected 20–120 minute research target governs admission of new work, while active calls and one final synthesis may finish after a shorter target. Total active runtime, including final assembly, never receives an allowance beyond 120 minutes. Explicit cancellation and resource/trial guards remain in force. Existing environment overrides take precedence within validated timing bounds, so check `/api/limits` after deployment. Model generations reserve estimated tokens before parallel dispatch. Grounded-search fallback attempts and available usage from rejected research responses are counted. Provider-side retries, uncertain usage after cancellation and separate search charges prevent these guards from being an exact monetary cap.
 

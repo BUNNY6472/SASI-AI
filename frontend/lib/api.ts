@@ -84,6 +84,38 @@ export interface FileRef {
   mime: string;
   kind: "image" | "video" | "audio" | "pdf" | "text" | "other";
   size: number;
+  preview_complete?: boolean;
+  coverage_note?: string;
+  preview_bytes?: number;
+  storage?: "cloud" | "local";
+}
+
+export interface TokenUsage {
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  uncached_input_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_write_input_tokens?: number;
+  thinking_tokens?: number;
+  estimated_tokens?: number;
+  unclassified_input_tokens?: number;
+  detailed_calls?: number;
+  usage_details_available?: boolean;
+}
+
+export interface StagedUpload {
+  id: string;
+  name: string;
+  size: number;
+  state: "pending" | "ready";
+  expires_at: number;
+  file?: FileRef;
+}
+
+export interface RunUsage extends TokenUsage {
+  by_provider: Record<string, TokenUsage>;
+  by_stage?: Record<string, Partial<TokenUsage>>;
 }
 
 export interface Opinion {
@@ -189,15 +221,7 @@ export interface Run {
     fixes: number;
     best_approach: string | null;
   } | null;
-  usage: {
-    calls: number;
-    input_tokens: number;
-    output_tokens: number;
-    by_provider: Record<
-      string,
-      { calls: number; input_tokens: number; output_tokens: number }
-    >;
-  };
+  usage: RunUsage;
   events: RunEvent[];
   error: string | null;
   /** The code file in the final result (solution.py on Project Eris runs), when there is one. */
@@ -294,6 +318,11 @@ export interface RunLimits {
   max_revisions_per_task: number;
   max_concurrent_runs: number;
   storage: string;
+  max_file_bytes?: number;
+  max_run_bytes?: number;
+  raw_upload_max_bytes?: number;
+  max_files_per_run?: number;
+  resumable_uploads?: boolean;
 }
 
 export interface ProviderStatus {
@@ -365,50 +394,11 @@ export class ApiError extends Error {
   }
 }
 
-/** Upload one file with progress. Returns its reference for the run. */
-export function uploadFile(
-  file: File,
-  onProgress: (pct: number) => void,
-): Promise<FileRef> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/files");
-    xhr.withCredentials = true;
-    xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
-    xhr.setRequestHeader(
-      "Content-Type",
-      file.type || "application/octet-stream",
-    );
-    xhr.upload.onprogress = (e) =>
-      e.lengthComputable && onProgress(Math.round((e.loaded / e.total) * 100));
-    xhr.onload = () => {
-      let body: { detail?: string } & Partial<FileRef> = {};
-      try {
-        body = JSON.parse(xhr.responseText);
-      } catch {
-        /* not JSON */
-      }
-      if (xhr.status >= 200 && xhr.status < 300) resolve(body as FileRef);
-      else
-        reject(
-          new Error(
-            typeof body.detail === "string"
-              ? body.detail
-              : xhr.status === 413
-                ? "File is too large."
-                : `Upload failed (${xhr.status})`,
-          ),
-        );
-    };
-    xhr.onerror = () =>
-      reject(new Error("Upload failed. Check your connection."));
-    xhr.send(file);
-  });
-}
-
 export function fileSize(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  if (n >= 1024 * 1024 * 1024)
+    return `${(n / (1024 * 1024 * 1024)).toFixed(2).replace(/\.00$/, "")} GiB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 

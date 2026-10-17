@@ -40,9 +40,12 @@ class ModelCall:
 
 
 def reply_room(call: ModelCall, model_max: int) -> int:
-    """Tokens a model may use for one reply. Thinking models spend part of it reasoning before they write,
-    so the answer allowance gets the same again on top (at least 8,000), within the model's own maximum."""
-    return max(1_000, min(model_max, call.max_output_tokens + max(8_000, call.max_output_tokens)))
+    """Stage-sized room for reasoning and an answer, bounded by the provider's actual limit."""
+    if call.kind in {"review", "plan_review", "final_eval", "cross_check", "plan"}:
+        thinking = 2_000 if call.reasoning_effort == "low" else 4_000
+    else:
+        thinking = max(4_000, call.max_output_tokens)
+    return max(1_000, min(model_max, call.max_output_tokens + thinking))
 
 
 def no_text(provider: str, stop_reason: str) -> "ProviderError":
@@ -63,7 +66,10 @@ def split_attachments(call: ModelCall, provider: str, can_read: set[str] | None 
 
     media, notes = [], []
     for f in call.attachments:
-        if f.kind == "other":
+        if f.kind not in {"text", "other"} and (not f.data or len(f.data) != f.size):
+            notes.append(f"[{f.name}: original file is stored, but its full media bytes are not available in this request. "
+                         "Do not claim to have viewed it. " + (getattr(f, "coverage_note", "") or f.text) + "]")
+        elif f.kind == "other":
             notes.append(f"[{f.name} ({f.mime}, {f.size / 1024:.0f} KB) is attached, but it is a binary format no model can open. "
                          + (f.text or "Mention it if it matters.") + "]")
         elif f.kind == "text":
@@ -89,6 +95,12 @@ class ModelResult:
     stop_reason: str = ""
     simulated: bool = False
     via: str = ""  # "vertex" (Google Cloud) or "key" (the provider's API key); empty when not known
+    uncached_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_write_input_tokens: int = 0
+    thinking_tokens: int = 0
+    usage_details_available: bool = False
+    usage_estimated: bool = False
 
     @property
     def total_tokens(self) -> int:

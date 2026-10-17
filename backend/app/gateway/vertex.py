@@ -158,7 +158,9 @@ class VertexGeminiAdapter(GeminiAdapter):
                 notes.append(f"[{f.name} is too large to send to Gemini through Google Cloud with the other files. "
                              "Use the other models' analyses of it.]")
         note = ("\n\n".join(notes) + "\n\n") if notes else ""
-        parts.append(types.Part.from_text(text=note + extra + call.prompt))
+        if note or extra:
+            parts.append(types.Part.from_text(text=note + extra))
+        parts.append(types.Part.from_text(text=call.prompt))
         return [types.Content(role="user", parts=parts)]
 
 
@@ -303,4 +305,4 @@ class VertexOpenModelAdapter:
             tokens_in = (len(call.full_system) + len(extra) + len(call.prompt)) // 4
             tokens_out = len(text) // 4
         return ModelResult(provider=self.provider, model=served, text=text, input_tokens=tokens_in,
-                           output_tokens=tokens_out, stop_reason=finish)
+                           output_tokens=tokens_out, stop_reason=finish, usage_estimated=usage is None)

@@ -45,7 +45,12 @@ class ClaudeAdapter:
             elif f.kind == "pdf":
                 content.append({"type": "document", "title": f.name,
                                 "source": {"type": "base64", "media_type": "application/pdf", "data": f.b64}})
-        content.append({"type": "text", "text": extra + call.prompt})
+        if extra:
+            # Files precede changing task instructions. The cache remains local
+            # to this provider/model and only exact matching prefixes can hit.
+            content.append({"type": "text", "text": extra,
+                            "cache_control": {"type": "ephemeral"}})
+        content.append({"type": "text", "text": call.prompt})
         return content
 
     @staticmethod
@@ -53,7 +58,7 @@ class ClaudeAdapter:
         if not call.rules:
             return call.system
         # Mark the shared rules for caching: every call in the run repeats them.
-        return [{"type": "text", "text": call.rules, "cache_control": {"type": "ephemeral"}},
+        return [{"type": "text", "text": call.rules, "cache_control": {"type": "ephemeral", "ttl": "1h"}},
                 {"type": "text", "text": call.system}]
 
     def _kwargs(self, call: ModelCall, model: str) -> dict:
@@ -106,5 +111,9 @@ class ClaudeAdapter:
             input_tokens=(resp.usage.input_tokens or 0) + (getattr(resp.usage, "cache_creation_input_tokens", 0) or 0)
             + (getattr(resp.usage, "cache_read_input_tokens", 0) or 0),
             output_tokens=resp.usage.output_tokens or 0,
+            uncached_input_tokens=resp.usage.input_tokens or 0,
+            cache_read_input_tokens=getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
+            cache_write_input_tokens=getattr(resp.usage, "cache_creation_input_tokens", 0) or 0,
+            usage_details_available=True,
             stop_reason=resp.stop_reason or "",
         )

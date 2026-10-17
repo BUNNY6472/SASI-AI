@@ -72,3 +72,19 @@ def test_eris_deliverable_requirements_and_unreviewed_work_caveats_remain():
     assert "exactly ONE complete solution.py" in prompt and "## Dry run" in prompt and "## Eris rule check" in prompt
     assert "do not claim independent verification" in prompt
     assert "Never conceal material uncertainty" in system
+
+
+def test_attachment_previews_and_agreement_are_not_presented_as_verification():
+    system, prompt = prompts.analysis_prompt("Analyze this cohort", "", "cohort.csv", get_profile("research"))
+    assert "preview is not a full dataset inspection" in system
+    assert "never invent full-file statistics" in system
+    assert "sampling scope" in prompt and "needs full-data validation" in prompt
+    assert "do not copy raw tables" in prompt
+
+
+def test_shared_findings_preserve_concluding_uncertainty_and_mark_omissions():
+    text = "Opening finding. " + "Long detailed analysis. " * 500 + "CONCLUSION: validation remains unexecuted."
+    excerpt = prompts._findings_excerpt(text, 1000)
+    assert len(excerpt) <= 1000
+    assert excerpt.startswith("Opening finding") and excerpt.endswith("validation remains unexecuted.")
+    assert "omitted from shared context" in excerpt

@@ -15,6 +15,8 @@ import Markdown from "./Markdown";
 import { OriginalRequest, RunQuestion } from "./RunRequest";
 import { ActiveCalls, RunClock } from "./RunTiming";
 import IncompleteWork from "./IncompleteWork";
+import UsageDetails from "./UsageDetails";
+import FileCoverage from "./FileCoverage";
 import { AgentChip, StatusBadge, fmt } from "./ui";
 
 const LIVE = new Set([
@@ -321,7 +323,7 @@ export default function RunView({
               rel="noreferrer"
               title={f.name}
             >
-              {f.kind === "image" ? (
+              {f.kind === "image" && f.size <= 2 * 1024 ** 2 ? (
                 <img src={`/api/runs/${run.id}/files/${f.id}`} alt="" />
               ) : (
                 <span className="file-kind">
@@ -336,6 +338,8 @@ export default function RunView({
           ))}
         </div>
       )}
+
+      <FileCoverage files={run.files} />
 
       {(run.team?.length || 0) > 0 && (
         <div
@@ -396,6 +400,7 @@ export default function RunView({
       </div>
 
       <ActiveCalls run={run} />
+      <UsageDetails usage={run.usage} />
 
       <div className="tabs">
         <button
@@ -685,18 +690,6 @@ export default function RunView({
                     <AgentChip id={t.reviewer} />
                   </span>
                   <small className="muted">{t.assurance || t.status}</small>
-                </li>
-              ))}
-            </ul>
-            <h3>Usage</h3>
-            <ul className="who">
-              {Object.entries(run.usage.by_provider).map(([p, u]) => (
-                <li key={p}>
-                  <AgentChip id={p} />
-                  <small>
-                    {u.calls} calls · {fmt(u.input_tokens)} in ·{" "}
-                    {fmt(u.output_tokens)} out
-                  </small>
                 </li>
               ))}
             </ul>

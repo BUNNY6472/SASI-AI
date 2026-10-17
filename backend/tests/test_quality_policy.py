@@ -156,7 +156,8 @@ def test_policy_allocates_work_and_preserves_explicit_legacy_settings():
     simple = Run(request="Write a short thank-you note")
     assert policy.allocate(simple, 4, 6).analysts == 1
     research = Run(request="Research the evidence", profile="research")
-    assert policy.allocate(research, 4, 6).analysts == 3
+    assert policy.allocate(research, 4, 6).analysts == 2
+    assert not policy.allocate(research, 4, 6).cross_check
     assert policy.allocate(research.model_copy(update={"mode": "quick"}), 4, 6).analysts == 1
     assert policy.allocate(simple.model_copy(update={"mode": "deep"}), 4, 6).analysts == 4
     assert policy.allocate(simple.model_copy(update={"compare_all": True}), 4, 6).cross_check
@@ -224,7 +225,7 @@ def test_resume_does_not_grant_extra_time_beyond_requested_deadline():
 
 def test_inflight_token_reservations_prevent_parallel_oversubscription():
     async def scenario():
-        c = controller(max_tokens_per_run=15_000)
+        c = controller(max_tokens_per_run=9_000)
         started, release = asyncio.Event(), asyncio.Event()
 
         async def reply(call):

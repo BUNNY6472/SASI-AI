@@ -54,11 +54,11 @@ class Settings(BaseSettings):
     model_phase_grace_minutes: float = Field(default=5, ge=1, le=15)
     # Optional caps; 0 means no cap.
     max_model_calls_per_run: int = 300
-    max_tokens_per_run: int = 2_400_000
-    eris_max_tokens_per_run: int = 3_600_000
+    max_tokens_per_run: int = 5_000_000
+    eris_max_tokens_per_run: int = 5_000_000
     # Longest answer one call may write (thinking gets extra room on top). Eris runs write whole training scripts.
-    max_output_tokens_per_call: int = 16_000
-    eris_max_output_tokens_per_call: int = 32_000
+    max_output_tokens_per_call: int = 64_000
+    eris_max_output_tokens_per_call: int = 64_000
     max_tasks_per_plan: int = 6
     max_revisions_per_task: int = 2
     max_final_fix_rounds: int = 2  # the other models test the final result; the integrator fixes what they find
@@ -75,6 +75,8 @@ class Settings(BaseSettings):
     gcp_project: str = ""
     bigquery_dataset: str = "sasi_data"
     sqlite_path: str = "data/sasi.db"
+    # Private original-file storage; browser uploads bypass Cloud Run body/memory limits.
+    upload_bucket: str = ""
 
     # Static frontend directory (built Next.js export).
     static_dir: str = "static"

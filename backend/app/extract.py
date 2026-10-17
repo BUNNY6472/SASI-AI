@@ -12,8 +12,10 @@ import gzip
 import html
 import io
 import json
+import math
 import re
 import zipfile
+from collections import Counter
 from contextlib import contextmanager
 from itertools import islice
 
@@ -28,6 +30,9 @@ MAX_COLUMNS = 80
 MAX_CELLS = 100_000
 MAX_CELL_CHARS = 2000
 SAMPLE_ROWS = 200
+DATA_REPORT_LIMIT = 24_000
+EXAMPLE_ROWS = 6
+DATA_REPORT_MARKER = "SASI dataset report"
 
 
 class ExtractionLimit(ValueError):
@@ -84,7 +89,12 @@ def clip(text: str, limit: int = TEXT_LIMIT) -> str:
     return text[:limit] + f"\n[... truncated: showing {limit:,} of {len(text):,} characters]"
 
 
-def decode(data: bytes) -> str:
+def decode(data: bytes, *, complete: bool = True) -> str:
+    if not complete:
+        # A byte-range may end inside a Unicode character. Do not reinterpret an
+        # otherwise UTF-8/UTF-16 prefix as Latin-1 because of its final bytes.
+        enc = "utf-16" if data[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+        return data.decode(enc, errors="replace")
     for enc in ("utf-8-sig", "utf-16") if data[:2] in (b"\xff\xfe", b"\xfe\xff") else ("utf-8-sig",):
         try:
             return data.decode(enc)
@@ -117,41 +127,92 @@ def looks_like_text(data: bytes) -> bool:
 
 def _num(v: str) -> float | None:
     try:
-        return float(v.replace(",", "")) if v.strip() else None
+        n = float(v.replace(",", "")) if v.strip() else None
+        return n if n is not None and math.isfinite(n) else None
     except ValueError:
         return None
 
 
 def profile_rows(header: list[str], body: list[list]) -> str:
     """Per-column profile of a table: type, count, min, max, mean, distinct values."""
-    lines = [f"Rows: {len(body)} (plus header). Columns: {len(header)}."]
+    lines = [f"Rows profiled: {len(body)} (plus header). Columns profiled: {len(header)}."]
     for i, col in enumerate(header[:80]):
         vals = ["" if i >= len(r) or r[i] is None else _cell(r[i]) for r in body]
         filled = [v for v in vals if v.strip()]
         nums = [n for n in (_num(v) for v in filled) if n is not None]
         if filled and len(nums) >= 0.9 * len(filled):
-            mean = sum(nums) / len(nums)
-            lines.append(f"- {col}: numeric, {len(filled)} values, min {min(nums):g}, max {max(nums):g}, mean {mean:.4g}, empty {len(vals) - len(filled)}")
+            mean = sum(n / len(nums) for n in nums)
+            ordered = sorted(nums)
+            quantiles = "/".join(f"{ordered[int((len(ordered) - 1) * q)]:.4g}" for q in (0.1, 0.5, 0.9))
+            lines.append(f"- {str(col)[:100]}: numeric, {len(nums)} finite values, min {min(nums):g}, max {max(nums):g}, mean {mean:.4g}, p10/p50/p90 {quantiles}, empty {len(vals) - len(filled)}, other/nonfinite {len(filled) - len(nums)}")
         else:
-            distinct = sorted(set(filled))
-            sample = ", ".join(v[:40] for v in distinct[:5])
-            lines.append(f"- {col}: text, {len(filled)} values, {len(distinct)} distinct (e.g. {sample[:160]}), empty {len(vals) - len(filled)}")
+            counts = Counter(filled)
+            common = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:5]
+            sample = ", ".join(f"{json.dumps(v[:32], ensure_ascii=False)}:{count}" for v, count in common)
+            lines.append(f"- {str(col)[:100]}: text/mixed, {len(filled)} values, {len(counts)} distinct in inspected rows; top value counts {sample[:220]}; empty {len(vals) - len(filled)}")
     if len(header) > 80:
         lines.append(f"- ... and {len(header) - 80} more columns")
     return "\n".join(lines)
 
 
-def profile_table(text: str, delimiter: str) -> str:
-    try:
-        source = csv.reader(io.StringIO(text), delimiter=delimiter)
-        header = next(source, [])
-        limit = min(MAX_TABLE_ROWS, MAX_CELLS // max(1, min(len(header), MAX_COLUMNS)))
-        rows = [[_cell(v) for v in row[:MAX_COLUMNS]] for row in islice(source, limit)]
-    except csv.Error:
-        return ""
+def _example_rows(header: list, rows: list[list], *, limit: int = 4000) -> str:
+    """Deterministic spread across inspected rows, not an IID or full-data sample."""
     if not rows:
-        return ""
-    return f"Preview profile: at most {limit:,} rows and {MAX_COLUMNS} columns; may omit data.\n" + profile_rows(header[:MAX_COLUMNS], rows)
+        return "No data rows in the inspected prefix."
+    indices = sorted({round(i * (len(rows) - 1) / max(1, min(EXAMPLE_ROWS, len(rows)) - 1))
+                      for i in range(min(EXAMPLE_ROWS, len(rows)))})
+    parts = ["Deterministic example rows from the inspected prefix (not a random sample). "
+             "Cell excerpts are limited to 160 characters:"]
+    parts.append(_rows_to_csv([str(h)[:100] for h in header], []))
+    for index in indices:
+        values = [str(v)[:160] for v in rows[index]]
+        parts.append(f"[data row {index + 1}] " + _rows_to_csv([], [values]).lstrip("\r\n"))
+    return clip("\n".join(parts), limit)
+
+
+def profile_table(text: str, delimiter: str, *, complete: bool = True) -> str:
+    """Bounded CSV report; never repeat the raw table in every model request.
+
+    csv.reader understands quoted newlines. If a byte prefix ends inside an
+    unquoted record, omit its unfinished physical line; strict parsing likewise
+    excludes an unfinished quoted logical record instead of inventing a row.
+    """
+    if not complete and text and not text.endswith(("\n", "\r")):
+        text = text[:max(text.rfind("\n"), text.rfind("\r")) + 1]
+    rows: list[list[str]] = []
+    exhausted = False
+    parse_error = ""
+    extra_columns = False
+    clipped_cells = False
+    try:
+        source = csv.reader(io.StringIO(text), delimiter=delimiter, strict=True)
+        header = next(source, [])
+        if not header:
+            return f"{DATA_REPORT_MARKER}: CSV preview has no complete header. Original data is retained; no table was inspected."
+        limit = min(MAX_TABLE_ROWS, MAX_CELLS // max(1, min(len(header), MAX_COLUMNS)))
+        for row in islice(source, limit):
+            extra_columns |= len(row) != len(header)
+            clipped_cells |= any(len(v) > MAX_CELL_CHARS for v in row[:MAX_COLUMNS])
+            rows.append([_cell(v) for v in row[:MAX_COLUMNS]])
+        exhausted = next(source, None) is None
+    except csv.Error as exc:
+        parse_error = f" CSV parsing stopped before an incomplete or invalid record ({str(exc)[:120]})."
+        if "header" not in locals():
+            return f"{DATA_REPORT_MARKER}: CSV header could not be parsed.{parse_error} Original data is retained."
+    all_rows = complete and exhausted and not parse_error
+    coverage = ("All data rows in the supplied file were inspected within the preview limits."
+                if all_rows else "Statistics cover only the inspected bounded sample/prefix; may omit data, including late outliers.")
+    schema = (f" Header columns: {len(header)}; profiled first {min(len(header), MAX_COLUMNS)}."
+              + (" Additional columns are omitted." if len(header) > MAX_COLUMNS else ""))
+    warnings = ((" Some rows have a different number of fields from the header." if extra_columns else "")
+                + (" Some cells are clipped; categorical distinct counts may merge long values." if clipped_cells else "")
+                + (" Duplicate column names exist; identify columns by position." if len(set(header)) < len(header) else "")
+                + parse_error)
+    report = (f"{DATA_REPORT_MARKER}: CSV/TSV\nCoverage: {coverage}{schema}{warnings}\n"
+              "Blank fields are counted as empty; other missing-value markers remain text. "
+              "Full-data validation requires the original file, not this report.\n"
+              + profile_rows(header[:MAX_COLUMNS], rows) + "\n\n" + _example_rows(header[:MAX_COLUMNS], rows))
+    return clip(report, DATA_REPORT_LIMIT)
 
 
 def _rows_to_csv(header: list, rows: list[list]) -> str:
@@ -201,10 +262,8 @@ def parquet_text(data: bytes) -> str:
         except Exception:  # noqa: BLE001 - a profile line is best effort
             pass
         lines.append(info)
-    head = table.slice(0, SAMPLE_ROWS)
-    rows = [[_cell(v) for v in r.values()] for r in head.to_pylist()]
-    sample = _rows_to_csv(table.column_names, rows)
-    return "\n".join(lines) + f"\n\nFirst {min(SAMPLE_ROWS, table.num_rows)} rows (CSV):\n{sample}"
+    rows = [[_cell(v) for v in r.values()] for r in table.to_pylist()]
+    return clip("\n".join(lines) + "\n\n" + _example_rows(table.column_names, rows), DATA_REPORT_LIMIT)
 
 
 def _cell(v) -> str:
@@ -235,8 +294,8 @@ def excel_text(data: bytes) -> str:
                 continue
             header, body = rows[0], rows[1:]
             parts.append(clip(f"\n## Sheet '{ws.title}'\nPreview: first {limit} physical rows, {columns} columns; formulas use cached values.\n"
-                              f"{profile_rows([str(h) for h in header], body)}\n\nFirst rows (CSV):\n"
-                              + _rows_to_csv(header, body[:SAMPLE_ROWS]), TEXT_LIMIT // 10))
+                              f"{profile_rows([str(h) for h in header], body)}\n\n"
+                              + _example_rows(header, body), TEXT_LIMIT // 10))
     finally:
         wb.close()
     parts.append("Only the first 10 sheets are inspected. Preview statistics may omit data; formulas were not recalculated.")
@@ -274,14 +333,19 @@ def pptx_text(data: bytes) -> str:
     return clip("\n".join(out))
 
 
-def json_text(text: str, name: str) -> str:
-    """Describe the structure of a JSON or JSON Lines file, then include it."""
+def json_text(text: str, name: str, *, complete: bool = True) -> str:
+    """Retain small configuration documents; summarize large structured datasets."""
     ext = ext_of(name)
+    doc = None
     try:
         if ext in (".jsonl", ".ndjson"):
-            items = [json.loads(line) for line in text.splitlines()[:5000] if line.strip()]
-            shape = f"JSON Lines: {len(text.splitlines()):,} lines."
+            lines = text.splitlines()
+            if not complete and text and not text.endswith(("\n", "\r")):
+                lines = lines[:-1]
+            items = [json.loads(line) for line in lines[:5000] if line.strip()]
+            shape = f"JSON Lines: {len(items):,} records parsed from the supplied prefix."
             sample = items
+            all_rows = complete and len(lines) <= 5000
         else:
             doc = json.loads(text)
             if ext == ".ipynb" and isinstance(doc, dict):
@@ -289,6 +353,7 @@ def json_text(text: str, name: str) -> str:
                 src = "\n\n".join(f"[{c.get('cell_type')}]\n" + "".join(c.get("source") or []) for c in cells)
                 return f"Jupyter notebook with {len(cells)} cells.\n\n{src}"
             shape = f"JSON {type(doc).__name__}"
+            all_rows = complete
             if isinstance(doc, list):
                 shape += f" with {len(doc):,} items."
                 sample = doc
@@ -297,13 +362,33 @@ def json_text(text: str, name: str) -> str:
                 sample = next((v for v in doc.values() if isinstance(v, list) and v and isinstance(v[0], dict)), [])
             else:
                 sample = []
+        # Configuration, short scalar arrays and exact test fixtures remain intact.
+        if len(text) <= 12_000 and complete:
+            return f"{shape}\n\nComplete content:\n{text}"
+        all_rows &= len(sample) <= 2000
         objs = [o for o in sample[:2000] if isinstance(o, dict)]
+        detail = ""
         if objs:
             keys = list(dict.fromkeys(k for o in objs for k in o))[:80]
-            shape += "\n" + profile_rows(keys, [[o.get(k) for k in keys] for o in objs])
-        return f"{shape}\n\nContent:\n{text}"
+            rows = [[o.get(k) for k in keys] for o in objs]
+            detail = profile_rows(keys, rows) + "\n\n" + _example_rows(keys, [[_cell(v) for v in r] for r in rows])
+        else:
+            detail = "Selected structural examples (omissions are not verified):\n" + clip(
+                json.dumps(sample[:EXAMPLE_ROWS] if sample else doc, ensure_ascii=False, default=str), 6000)
+        if ext not in (".jsonl", ".ndjson") and isinstance(doc, dict):
+            # Do not lose scalar metadata, split names or the sizes of other arrays
+            # merely because only one tabular array is profiled above.
+            schema = {str(k)[:100]: (f"array with {len(v)} items" if isinstance(v, list)
+                                   else f"object with {len(v)} keys" if isinstance(v, dict)
+                                   else str(v)[:240]) for k, v in list(doc.items())[:80]}
+            detail = "Top-level structure:\n" + json.dumps(schema, ensure_ascii=False) + "\n" + detail
+        coverage = ("Input was completely parsed; statistics cover only the selected tabular array and columns."
+                    if all_rows else "Only a bounded prefix/sample is profiled; may omit records, arrays and late outliers.")
+        return clip(f"{DATA_REPORT_MARKER}: {shape}\nCoverage: {coverage}\n{detail}\n"
+                    "The original file is retained. Validate any whole-dataset claim against it.", DATA_REPORT_LIMIT)
     except (json.JSONDecodeError, RecursionError, ValueError):
-        return text
+        return (f"Structured preview is incomplete or could not be parsed as {ext.lstrip('.').upper()}; "
+                "no complete-data statistics are available. Text excerpt only:\n" + clip(text, 12_000))
 
 
 def zip_text(data: bytes, depth: int = 0) -> str:
@@ -333,11 +418,18 @@ def zip_text(data: bytes, depth: int = 0) -> str:
 # ---------------------------------------------------------------- entry point
 
 
-def to_text(name: str, data: bytes, depth: int = 0) -> tuple[str, bool]:
+def to_text(name: str, data: bytes, depth: int = 0, *, complete: bool = True,
+            total_bytes: int | None = None) -> tuple[str, bool]:
     """Return (text for the models, readable). readable=False means the file is binary we cannot convert."""
     if depth > 2:
         raise ExtractionLimit("Nested archive depth exceeds the preview limit")
     ext = ext_of(name)
+    total_bytes = max(len(data), total_bytes or 0)
+    complete = complete and total_bytes == len(data)
+    if not complete and (ext in (".parquet", ".pq", ".zip", ".gz", ".docx", ".pptx") or ext in EXCEL or data[:4] == b"PAR1"):
+        return (f"Only the first {len(data):,} of {total_bytes:,} bytes are available to the bounded preview. "
+                f"The {ext or 'binary'} format requires a complete file or a format-aware data reader; its contents "
+                "were not inspected. The original object is retained for download and separate analysis.", False)
     if ext in (".parquet", ".pq") or data[:4] == b"PAR1":
         return parquet_text(data), True
     if ext in EXCEL:
@@ -355,13 +447,15 @@ def to_text(name: str, data: bytes, depth: int = 0) -> tuple[str, bool]:
             raise ExtractionLimit("Gzip expands beyond the 8 MiB preview limit")
         return to_text(name[:-3], inner, depth + 1)
     if ext in TEXT_EXT or looks_like_text(data):
-        text = decode(data[:MAX_TEXT_BYTES])
-        note = f"\n[Preview reads only the first {MAX_TEXT_BYTES:,} of {len(data):,} bytes.]" if len(data) > MAX_TEXT_BYTES else ""
+        text_complete = complete and len(data) <= MAX_TEXT_BYTES
+        text = decode(data[:MAX_TEXT_BYTES], complete=text_complete)
+        read_bytes = min(len(data), MAX_TEXT_BYTES)
+        note = f"\n[Preview reads only the first {read_bytes:,} of {total_bytes:,} bytes.]" if not text_complete else ""
         if ext in (".json", ".jsonl", ".ndjson", ".geojson", ".ipynb"):
-            return clip(json_text(text, name)) + note, True
+            return clip(json_text(text, name, complete=text_complete)) + note, True
         if ext in (".csv", ".tsv"):
-            profile = profile_table(text, "\t" if ext == ".tsv" else ",")
+            profile = profile_table(text, "\t" if ext == ".tsv" else ",", complete=text_complete)
             if profile:
-                return clip(f"Data preview (bounded sample):\n{profile}\n\n{text}") + note, True
+                return profile + note, True
         return clip(text) + note, True
     return "", False

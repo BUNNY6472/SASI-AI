@@ -3,13 +3,15 @@
 import { DragEvent, FormEvent, useEffect, useRef, useState } from "react";
 import {
   api,
+  FileRef,
   fileSize,
   ProviderStatus,
   Run,
   RunLimits,
   RunSummary,
-  uploadFile,
+  StagedUpload,
 } from "@/lib/api";
+import { DEFAULT_FILE_COUNT, DEFAULT_RUN_FILE_BYTES, uploadFile, UploadStatus, validateAttachment } from "@/lib/uploads";
 import { AgentChip, StatusBadge, fmt, timeAgo } from "./ui";
 import Icon from "./Icon";
 import { researchTitle } from "@/lib/research-title";
@@ -19,8 +21,11 @@ interface Attachment {
   name: string;
   size: number;
   progress: number;
+  status: UploadStatus | "queued" | "ready" | "failed";
   id?: string;
+  stagedId?: string;
   error?: string;
+  ref?: FileRef;
 }
 const EXAMPLES = [
   {
@@ -81,22 +86,63 @@ export default function Workspace({
   const [minutes, setMinutes] = useState(120);
   const [limits, setLimits] = useState<RunLimits | null>(null);
   const [files, setFiles] = useState<Attachment[]>([]);
+  const [inventoryLoading, setInventoryLoading] = useState(true);
+  const [inventoryUnavailable, setInventoryUnavailable] = useState(false);
   const [dragging, setDragging] = useState(false);
   const picker = useRef<HTMLInputElement>(null);
   const question = useRef<HTMLTextAreaElement>(null);
   const form = useRef<HTMLFormElement>(null);
   const removed = useRef(new Set<string>());
+  const fileObjects = useRef(new Map<string, File>());
+  const controllers = useRef(new Map<string, AbortController>());
+  const uploadQueue = useRef<string[]>([]);
+  const filesRef = useRef<Attachment[]>([]);
+  const mounted = useRef(true);
   const uploading = files.some((f) => !f.id && !f.error);
+  const failedUploads = files.some((f) => f.error);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
+    let ignore = false;
     api<RunLimits>("/api/limits")
-      .then(setLimits)
-      .catch(() => {});
+      .then((value) => { if (!ignore) setLimits(value); })
+      .catch(() => { if (!ignore) setError("Upload limits could not be loaded. Refresh the page to retry."); });
     try {
       setEris(localStorage.getItem("sasi.eris") === "1");
     } catch {}
+    api<StagedUpload[]>("/api/files/uploads")
+      .then((staged) => {
+        if (ignore || !mounted.current) return;
+        updateFiles(() => staged.map((entry) => ({
+          key: `restored-${entry.id}`,
+          name: entry.name,
+          size: entry.size,
+          stagedId: entry.id,
+          id: entry.state === "ready" ? entry.file?.id : undefined,
+          ref: entry.state === "ready" ? entry.file : undefined,
+          progress: entry.state === "ready" ? 100 : 0,
+          status: entry.state === "ready" && entry.file ? "ready" : "failed",
+          error: entry.state === "ready" && entry.file ? undefined : "An earlier upload was interrupted. Remove this entry, then select the file again.",
+        })));
+        setInventoryLoading(false);
+      })
+      .catch(() => {
+        if (!ignore && mounted.current) {
+          setInventoryLoading(false);
+          setInventoryUnavailable(true);
+          setError("Staged files could not be recovered. Refresh the page before attaching more files.");
+        }
+      });
+    return () => { ignore = true; };
+  }, []);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      uploadQueue.current = [];
+      controllers.current.forEach((controller) => controller.abort());
+    };
   }, []);
   function switchEris(on: boolean) {
     setEris(on);
@@ -118,40 +164,74 @@ export default function Workspace({
     return () => clearInterval(t);
   }, []);
 
+  function updateFiles(update: (current: Attachment[]) => Attachment[]) {
+    const next = update(filesRef.current);
+    filesRef.current = next;
+    if (mounted.current) setFiles(next);
+  }
+  function patchFile(key: string, patch: Partial<Attachment>) {
+    updateFiles((current) => current.map((f) => f.key === key ? { ...f, ...patch } : f));
+  }
+  function pumpUploads(uploadLimits: RunLimits) {
+    // Limit concurrent transfers; a large dataset never becomes one in-memory buffer.
+    while (mounted.current && controllers.current.size < 2 && uploadQueue.current.length) {
+      const key = uploadQueue.current.shift()!;
+      const file = fileObjects.current.get(key);
+      if (!file || removed.current.has(key)) continue;
+      const controller = new AbortController();
+      controllers.current.set(key, controller);
+      uploadFile(file, uploadLimits, controller.signal, (state) => patchFile(key, state))
+        .then((ref) => {
+          if (removed.current.has(key) || !mounted.current) {
+            api("/api/files/" + ref.id, { method: "DELETE" }).catch(() => {});
+            return;
+          }
+          patchFile(key, { id: ref.id, ref, status: "ready", progress: 100, error: undefined });
+          fileObjects.current.delete(key);
+        })
+        .catch((err: Error) => {
+          if (!removed.current.has(key) && mounted.current)
+            patchFile(key, { error: err.message, status: "failed" });
+        })
+        .finally(() => {
+          controllers.current.delete(key);
+          pumpUploads(uploadLimits);
+        });
+    }
+  }
   function addFiles(list: FileList | null) {
-    if (!list) return;
-    const room = 10 - files.length;
-    Array.from(list)
-      .slice(0, Math.max(0, room))
-      .forEach((file) => {
-        const key = file.name + "-" + file.size + "-" + Math.random();
-        if (file.size > 25 * 1024 * 1024) {
-          setError(file.name + " is larger than 25 MB.");
-          return;
-        }
-        setFiles((fs) => [
-          ...fs,
-          { key, name: file.name, size: file.size, progress: 0 },
-        ]);
-        const patch = (p: Partial<Attachment>) =>
-          setFiles((fs) => fs.map((f) => (f.key === key ? { ...f, ...p } : f)));
-        uploadFile(file, (progress) => patch({ progress }))
-          .then((ref) => {
-            if (removed.current.has(key)) {
-              api("/api/files/" + ref.id, { method: "DELETE" }).catch(() => {});
-              return;
-            }
-            patch({ id: ref.id, progress: 100 });
-          })
-          .catch((err: Error) => patch({ error: err.message }));
-      });
-    if (list.length > room)
-      setError("You can attach up to 10 files per research session.");
+    if (!list || busy || inventoryLoading || inventoryUnavailable) return;
+    if (!limits) {
+      setError("Upload limits are still loading. Try again shortly.");
+      return;
+    }
+    const errors: string[] = [];
+    for (const file of Array.from(list)) {
+      const problem = validateAttachment(file, filesRef.current.reduce((sum, f) => sum + f.size, 0), filesRef.current.length, limits);
+      if (problem) { errors.push(problem); continue; }
+      const key = crypto.randomUUID();
+      fileObjects.current.set(key, file);
+      updateFiles((current) => [...current, { key, name: file.name, size: file.size, progress: 0, status: "queued" }]);
+      uploadQueue.current.push(key);
+    }
+    setError([...new Set(errors)].join(" "));
+    pumpUploads(limits);
+  }
+  function retryFile(a: Attachment) {
+    if (!limits || busy || controllers.current.has(a.key)) return;
+    patchFile(a.key, { status: "queued", error: undefined, progress: 0 });
+    uploadQueue.current.push(a.key);
+    pumpUploads(limits);
   }
   function removeFile(a: Attachment) {
+    if (busy) return;
     removed.current.add(a.key);
-    setFiles((fs) => fs.filter((f) => f.key !== a.key));
-    if (a.id) api("/api/files/" + a.id, { method: "DELETE" }).catch(() => {});
+    uploadQueue.current = uploadQueue.current.filter((key) => key !== a.key);
+    controllers.current.get(a.key)?.abort();
+    fileObjects.current.delete(a.key);
+    updateFiles((fs) => fs.filter((f) => f.key !== a.key));
+    const storedId = a.id || a.stagedId;
+    if (storedId) api("/api/files/" + storedId, { method: "DELETE" }).catch(() => setError("The stored upload could not be removed. Refresh the page and try again."));
   }
   function onDrop(e: DragEvent) {
     e.preventDefault();
@@ -160,7 +240,7 @@ export default function Workspace({
   }
   async function submit(e: FormEvent) {
     e.preventDefault();
-    if (busy || uploading || needsKeys || request.trim().length < 3) return;
+    if (busy || uploading || inventoryLoading || failedUploads || needsKeys || request.trim().length < 3) return;
     setBusy(true);
     setError("");
     try {
@@ -178,7 +258,8 @@ export default function Workspace({
           file_ids: files.filter((f) => f.id).map((f) => f.id),
         }),
       });
-      setFiles([]);
+      updateFiles(() => []);
+      fileObjects.current.clear();
       open(run.id);
     } catch (err) {
       setError((err as Error).message);
@@ -284,24 +365,30 @@ export default function Workspace({
           </div>
         )}
         {files.length > 0 && (
-          <div className="attachments">
+          <div className="attachments upload-list" aria-label="Attached files">
             {files.map((f) => (
-              <div key={f.key} className={"attach " + (f.error ? "err" : "")}>
+              <div key={f.key} className={"attach upload-item " + (f.error ? "err" : "")}>
                 <Icon name="file" size={16} />
-                <span className="attach-name">{f.name}</span>
-                <small>
-                  {f.error || (f.id ? fileSize(f.size) : f.progress + "%")}
-                </small>
+                <div className="upload-file-info">
+                  <span className="attach-name" title={f.name}>{f.name}</span>
+                  <small>{fileSize(f.size)} · {f.error ? "Upload failed" : f.status === "ready" ? "Stored" : f.status === "queued" ? "Queued" : f.status === "starting" ? "Preparing upload…" : f.status === "finalizing" ? "Preparing preview…" : f.status === "retrying" ? "Connection interrupted · retrying…" : `${f.progress}% uploaded`}</small>
+                  {f.error && <span className="upload-detail error" role="alert">{f.error}</span>}
+                  {f.ref?.coverage_note && <span className="upload-detail">{f.ref.coverage_note}</span>}
+                </div>
                 {!f.id && !f.error && (
-                  <i
-                    className="attach-bar"
+                  <span
+                    className="attach-bar" role="progressbar"
+                    aria-label={"Uploading " + f.name}
+                    aria-valuemin={0} aria-valuemax={100} aria-valuenow={f.progress}
                     style={{ width: f.progress + "%" }}
                   />
                 )}
+                {f.error && fileObjects.current.has(f.key) && <button type="button" className="btn ghost small upload-retry" disabled={busy} onClick={() => retryFile(f)}>Retry</button>}
                 <button
                   type="button"
                   className="attach-x"
-                  aria-label={"Remove " + f.name}
+                  disabled={busy}
+                  aria-label={(f.id || f.error ? "Remove " : "Cancel upload of ") + f.name}
                   onClick={() => removeFile(f)}
                 >
                   ×
@@ -325,6 +412,7 @@ export default function Workspace({
             <button
               type="button"
               className="btn ghost small"
+              disabled={busy || !limits || inventoryLoading || inventoryUnavailable}
               onClick={() => picker.current?.click()}
             >
               <Icon name="clip" size={17} /> Attach files
@@ -340,8 +428,13 @@ export default function Workspace({
             </button>
           </div>
           <span className="small muted file-hint">
-            Or drop files here · 25 MB each
+            Or drop files here
           </span>
+        </div>
+        <div className="upload-policy" aria-live="polite">
+          <span><strong>{fileSize(files.reduce((sum, f) => sum + f.size, 0))}</strong> / {fileSize(limits?.max_run_bytes ?? DEFAULT_RUN_FILE_BYTES)} total · {files.length} / {limits?.max_files_per_run ?? DEFAULT_FILE_COUNT} files</span>
+          <span>{inventoryLoading ? "Recovering staged uploads…" : inventoryUnavailable ? "File recovery is unavailable. Refresh before attaching files." : limits ? limits.resumable_uploads ? "Uploads resume automatically after connection interruptions. Keep this page open." : `Direct uploads: up to ${fileSize(limits.raw_upload_max_bytes ?? 25 * 1024 ** 2)} per file.` : "Checking upload availability…"}</span>
+          <span>Original files are stored. Models receive bounded previews and compact data reports, not every uploaded byte. Check file coverage in the session.</span>
         </div>
         <div className="composer-bottom">
           <div className="mode-picker" role="group" aria-label="Research mode">
@@ -379,10 +472,10 @@ export default function Workspace({
           <button
             className="btn primary start-btn"
             disabled={
-              busy || uploading || needsKeys || request.trim().length < 3
+              busy || uploading || inventoryLoading || failedUploads || needsKeys || request.trim().length < 3
             }
           >
-            {busy ? "Starting…" : uploading ? "Uploading…" : "Start research"}
+            {busy ? "Starting…" : inventoryLoading ? "Loading files…" : uploading ? "Uploading…" : failedUploads ? "Retry or remove failed files" : "Start research"}
             <Icon name="arrow" size={17} />
           </button>
         </div>
@@ -393,6 +486,7 @@ export default function Workspace({
           </span>
           <span className="keyboard-hint">Ctrl / ⌘ ↵</span>
         </div>
+        <p className="token-budget-note"><strong>{(eris ? limits?.eris_max_tokens_per_run : limits?.max_tokens_per_run)?.toLocaleString("en-IN") ?? "50,00,000"} tokens maximum per session.</strong> Shared across model calls, input, cached input and output. Each model has its own per-request context limit. Adaptive research uses focused context and expands work when needed.</p>
         <p id="research-timing-note" className="timing-note">
           <strong>
             {limits?.max_total_run_minutes ?? 120} minutes total active time

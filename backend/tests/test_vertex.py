@@ -84,7 +84,7 @@ def test_claude_on_vertex_finds_a_usable_model_and_sends_no_fallback_beta():
     assert headers["authorization"] == "Bearer token"
     assert body["output_config"] == {"effort": "medium"}
     assert "fallbacks" not in body and "server-side-fallback" not in headers.get("anthropic-beta", "")
-    assert body["system"][0]["cache_control"] == {"type": "ephemeral"}, "the shared rules are still cached"
+    assert body["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}, "long phases can reuse shared rules"
 
 
 def test_claude_reply_with_no_text_is_an_error_not_an_empty_answer():
@@ -191,7 +191,7 @@ def test_open_model_on_vertex_uses_the_openai_compatible_endpoint(monkeypatch):
     url, body, _ = seen[-1]
     assert "/locations/global/" in url, "the location that worked is used"
     assert body["messages"][0] == {"role": "system", "content": "sys"}
-    assert body["max_tokens"] == 12_000, "room to think on top of the answer allowance"
+    assert body["max_tokens"] == 8_000, "stage-sized room to think on top of the answer allowance"
     assert "chart.png" in body["messages"][1]["content"], "a text-only model is told about files it cannot open"
 
 
@@ -366,14 +366,14 @@ def test_gemini_on_vertex_counts_tokens_to_check_and_sends_files_inline():
 
     from app.files import StoredFile
 
-    big = StoredFile(id="v", name="talk.mp4", mime="video/mp4", size=20 * 1024 * 1024, kind="video", data=b"x")
-    small = StoredFile(id="i", name="a.png", mime="image/png", size=1000, kind="image", data=b"img")
+    big = StoredFile(id="v", name="talk.mp4", mime="video/mp4", size=20 * 1024 * 1024, kind="video", data=b"x" * (20 * 1024 * 1024))
+    small = StoredFile(id="i", name="a.png", mime="image/png", size=3, kind="image", data=b"img")
     result = run(adapter.generate(ModelCall(system="sys", prompt="Look", kind="task", attachments=[small, big], timeout_seconds=1530)))
     assert result.text == "Gemini on Vertex" and result.input_tokens == 7
     assert timeouts[-1]["read"] == 1530
     parts = seen[-1][1]["contents"][0]["parts"]
     assert any("inlineData" in p or "inline_data" in p for p in parts), "the small file goes inline"
-    assert "talk.mp4 is too large" in parts[-1]["text"], "Vertex has no Files API, so a large file gets a note"
+    assert any("talk.mp4 is too large" in p.get("text", "") for p in parts), "Vertex has no Files API, so a large file gets a note"
 
 
 # ---------------------------------------------------------------- choosing between Vertex and the API key

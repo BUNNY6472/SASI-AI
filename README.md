@@ -96,8 +96,8 @@ The deployment enforces **`TRIAL_CREDITS_ONLY=true`** for Google Cloud routes: V
 | `MODEL_PHASE_MIN_MINUTES` | 20; minimum working allowance for an admitted workflow model call (completed replies proceed immediately) |
 | `MODEL_PHASE_GRACE_MINUTES` | 5; finishing grace after a call's allowance; active work and final synthesis stay inside the total cap |
 | `MAX_MODEL_CALLS_PER_RUN` | 300 |
-| `MAX_TOKENS_PER_RUN` | 2,400,000 |
-| `ERIS_MAX_TOKENS_PER_RUN` | 3,600,000 |
+| `MAX_TOKENS_PER_RUN` | 5,000,000 |
+| `ERIS_MAX_TOKENS_PER_RUN` | 5,000,000 |
 | `MAX_CONCURRENT_RUNS` | 3 in one process |
 | `MAX_TASKS_PER_PLAN` | 6; Quick restricts this further |
 | `MAX_GAP_TASKS_PER_RUN`, `MAX_REPLANS_PER_RUN` | 1 each |
@@ -112,7 +112,11 @@ The deployment enforces **`TRIAL_CREDITS_ONLY=true`** for Google Cloud routes: V
 
 Zero disables optional token/call caps. Token reservations are estimates and final usage follows provider reporting; these are not exact monetary spending limits. Google Search can add tool charges. Set billing alerts separately.
 
-Uploads: at most ten files, 25 MiB each and 60 MiB total per run. Documents/tables/archives have additional expanded-size, row, column and cell limits. Large tables are explicitly labelled sampled previews; SASI no longer claims a whole-file statistical profile for partial extraction. Images, PDFs, audio and video are sent only to providers able to read them.
+With `UPLOAD_BUCKET` configured, uploads support **2 GiB combined per run**, up to 20 files and 2 GiB per file. The browser uploads bounded chunks directly to private Cloud Storage with retry/resume; Cloud Run never buffers a 2 GiB request. Staged reservations enforce the aggregate limit across browser tabs. Originals are retained separately from bounded previews and are deleted with their run. Legacy BigQuery files remain readable. Without a bucket, local uploads retain a 25 MiB per-file and 60 MiB aggregate limit.
+
+The upload allowance is not a model context window: text previews inspect at most the first 2 MiB and tables have further row/column/cell bounds. CSV/JSON datasets become compact statistical reports and examples instead of repeated raw dumps. Stage-specific excerpts preserve source references and explicitly identify omissions. Large binary/media files are stored for download but are not claimed to have been inspected; eligible complete media is bounded to 8 MiB per file and 64 MiB resident per run. Generated ML scripts can use the complete original datasets when executed separately; SASI does not execute arbitrary training code inside its API process.
+
+Adaptive mode uses at most two independent analyses plus task/final verification; full comparison is available in Deep mode. Claude caches shared Eris rules for one hour and eligible repeated file prefixes for five minutes; Gemini implicit cache usage is recorded. Cache hits depend on exact prefixes and are not guaranteed. Token accounting separates cache reads/writes, uncached input, reported thinking, stage totals and conservative estimates. It does not invent dollar amounts or reinterpret historical totals as uncached billing.
 
 ## Deployment and limits
 

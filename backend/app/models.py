@@ -70,6 +70,41 @@ class Usage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     by_provider: dict[str, dict[str, int]] = {}
+    uncached_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_write_input_tokens: int = 0
+    thinking_tokens: int = 0
+    estimated_tokens: int = 0
+    detailed_calls: int = 0
+    usage_details_available: bool = False
+    by_stage: dict[str, dict[str, int]] = {}
+
+    @computed_field
+    @property
+    def unclassified_input_tokens(self) -> int:
+        return max(0, self.input_tokens - self.uncached_input_tokens
+                   - self.cache_read_input_tokens - self.cache_write_input_tokens)
+
+    def record(self, provider: str, stage: str, input_tokens: int, output_tokens: int, *,
+               uncached_input_tokens: int = 0, cache_read_input_tokens: int = 0,
+               cache_write_input_tokens: int = 0, thinking_tokens: int = 0,
+               detailed: bool = False, estimated: bool = False) -> None:
+        """Calls are admitted separately. Cache and reasoning counters are subsets, never extra usage."""
+        values = {"input_tokens": max(0, input_tokens), "output_tokens": max(0, output_tokens),
+                  "uncached_input_tokens": max(0, uncached_input_tokens),
+                  "cache_read_input_tokens": max(0, cache_read_input_tokens),
+                  "cache_write_input_tokens": max(0, cache_write_input_tokens),
+                  "thinking_tokens": max(0, thinking_tokens),
+                  "estimated_tokens": max(0, input_tokens + output_tokens) if estimated else 0,
+                  "detailed_calls": int(detailed)}
+        for key, value in values.items():
+            setattr(self, key, getattr(self, key) + value)
+        self.usage_details_available = self.usage_details_available or detailed or estimated
+        for group, key in ((self.by_provider, provider), (self.by_stage, stage)):
+            entry = group.setdefault(key, {})
+            entry["calls"] = entry.get("calls", 0) + 1
+            for name, value in values.items():
+                entry[name] = entry.get(name, 0) + value
 
     @property
     def total_tokens(self) -> int:
@@ -142,6 +177,10 @@ class FileRef(BaseModel):
     mime: str
     kind: str  # image | video | audio | pdf | text
     size: int
+    preview_complete: bool = True
+    preview_bytes: int = 0
+    coverage_note: str = ""
+    storage: str = "local"
 
 
 class Opinion(BaseModel):

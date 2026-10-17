@@ -1,0 +1,5 @@
+sample_id,group,value
+sample_a,control,1.2
+sample_b,control,1.4
+sample_c,treatment,2.1
+sample_d,treatment,2.4

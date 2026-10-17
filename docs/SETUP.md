@@ -11,10 +11,10 @@ The current deployment configuration scales to zero, caps instances at one and k
 In Cloud Shell (the `>_` icon at the top of the Google Cloud console):
 
 ```bash
-git clone -b claude/sasi-multi-ai-app-c549ms https://github.com/BUNNY6472/SASI-AI.git && cd SASI-AI && bash deploy/deploy-now.sh
+git clone -b main https://github.com/BUNNY6472/SASI-AI.git && cd SASI-AI && bash deploy/deploy-now.sh
 ```
 
-The repository is private, so Cloud Shell must sign in to GitHub once before `git clone` or `git pull` works. Run `gh auth login` and choose **GitHub.com**, **HTTPS**, **Yes** (authenticate Git) and **Login with a web browser**, then open the link it shows and enter the code. Cloud Shell remembers it.
+For authenticated repository access, sign Cloud Shell in to GitHub. Run `gh auth login` and choose **GitHub.com**, **HTTPS**, **Yes** (authenticate Git) and **Login with a web browser**, then open the link it shows and enter the code. Cloud Shell remembers it.
 
 To redeploy after changes: `cd ~/SASI-AI && git pull && bash deploy/deploy-now.sh`
 
@@ -28,9 +28,13 @@ Google Cloud console → **Billing** → **Budgets & alerts** → **Create budge
 - Amount: ₹20,000
 - Alerts at 50%, 90% and 100%
 
-Alerts only email you; they do not stop spending. By default the app limits each run to 300 model calls and 2,400,000 reported tokens (3,600,000 for Eris), reserves estimated tokens before parallel calls, and stops admitting new research work at the selected time target. Active calls and one final synthesis may extend beyond that target. These are resource guards, not a currency-denominated billing cap. Provider retries, search charges and differences in token accounting can affect the invoice. Cloud Run is capped at one instance with instance-based billing and permits scale-to-zero with the checked-in deployment configuration.
+Alerts only email you; they do not stop spending. By default the app limits each run to 300 model calls and 5,000,000 reported tokens (50 lakh, including Eris), reserves estimated tokens before parallel calls, and stops admitting new research work at the selected time target. Active calls and one final synthesis may extend beyond that target. These are resource guards, not a currency-denominated billing cap. Provider retries, search charges and differences in token accounting can affect the invoice. Cloud Run is capped at one instance with instance-based billing and permits scale-to-zero with the checked-in deployment configuration.
 
 ## 2. Run the setup script in Cloud Shell (5 minutes)
+
+The setup script provisions `${PROJECT_ID}-uploads` as a private bucket with uniform access and public access prevention. Only the runtime service account receives object access on that bucket. `deploy/upload-cors.json` permits resumable transfers from SASI's production origin; update the exact origin if you use a different domain. `UPLOAD_BUCKET` enables the 2 GiB combined attachment limit. Staged files expire after three hours; accepted originals remain until their run is deleted. Storage and transfer can consume trial credits. No GPU or managed model endpoint is provisioned for uploads.
+
+Original storage and model inspection are separate: the app uses bounded previews and statistical reports, not whole-dataset execution. Cloud Storage holds complete bytes; authenticated downloads support ranges. A whole-dataset analysis/training sandbox remains future work.
 
 Open Cloud Shell (the `>_` icon at the top of the console), sign in to GitHub once with `gh auth login` (see above), then:
 

@@ -212,7 +212,9 @@ def test_csv_profile_and_type_checks():
     from app.files import FileRejected, prepare
 
     f = prepare("data.csv", "", b"a,b\n1,x\n3,y\n")
-    assert "Rows: 2" in f.text and "min 1, max 3" in f.text
+    assert "Rows profiled: 2" in f.text and "min 1, max 3" in f.text
+    assert "All data rows in the supplied file were inspected" in f.text
+    assert f.data == b"a,b\n1,x\n3,y\n", "the bounded model report does not replace original data"
     with pytest.raises(FileRejected):
         prepare("empty.csv", "", b"")
     exe = prepare("tool.exe", "application/octet-stream", b"MZ\x00\x01\x02")
@@ -246,7 +248,8 @@ def test_data_and_document_files_become_readable_text():
     assert "Sheet" in f.text and "pen" in f.text and "max 4" in f.text
 
     f = prepare("data.json", "application/json", json.dumps([{"a": 1, "b": "x"}, {"a": 5, "b": "y"}]).encode())
-    assert "2 items" in f.text and "max 5" in f.text
+    assert "2 items" in f.text and "Complete content:" in f.text
+    assert json.loads(f.text.split("Complete content:\n", 1)[1]) == [{"a": 1, "b": "x"}, {"a": 5, "b": "y"}]
 
     dbuf = io.BytesIO()
     with zipfile.ZipFile(dbuf, "w") as z:
@@ -361,7 +364,7 @@ def test_project_eris_mode_gives_every_model_the_guidebook_and_dry_runs_only():
 
         up = client.post("/api/files", content=b"id,feature,target\n1,0.5,1\n2,0.1,0\n",
                          headers={"X-File-Name": "train.csv", "Content-Type": "text/csv"}).json()
-        run = client.post("/api/runs", json={"request": "Build a solution for this tabular Eris challenge", "eris": True,
+        run = client.post("/api/runs", json={"request": "Build a solution for this tabular Eris challenge", "eris": True, "mode": "deep",
                                              "require_plan_approval": False, "file_ids": [up["id"]]}).json()
         assert run["eris"] is True and run["profile"] == "eris"
         run = wait_for(client, run["id"], {"completed", "failed"})

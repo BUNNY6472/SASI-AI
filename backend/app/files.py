@@ -4,9 +4,9 @@ Images, PDFs, video and audio go to the models that can open them directly.
 Data and documents (CSV, JSON, Parquet, Excel, Word, PowerPoint, ZIP, code, text)
 are converted to text in extract.py. Other binary files are kept and described.
 
-Uploads are staged in memory until the run starts, then saved with the run
-(in BigQuery on Cloud Run) so every model reads the same files and a deleted
-run takes its files with it.
+Cloud uploads stream directly to private object storage; only bounded previews
+reach models. The memory/legacy stores retain their small-file fallback. A run
+owns its saved originals and deletes them with the rest of its records.
 """
 from __future__ import annotations
 
@@ -21,9 +21,12 @@ from . import extract
 
 log = logging.getLogger("sasi.files")
 
-MAX_FILE_BYTES = 25 * 1024 * 1024  # Cloud Run caps a request at 32 MiB
-MAX_RUN_BYTES = 60 * 1024 * 1024
-MAX_FILES_PER_RUN = 10
+MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_RUN_BYTES = MAX_FILE_BYTES
+MAX_FILES_PER_RUN = 20
+RAW_UPLOAD_MAX_BYTES = 25 * 1024 * 1024  # never send large uploads through Cloud Run
+LOCAL_RUN_BYTES = 60 * 1024 * 1024
+PREVIEW_BYTES = 2 * 1024 * 1024
 TEXT_LIMIT = 150_000  # characters of a data file that go into a prompt
 STAGE_TTL = 3 * 3600
 
@@ -57,9 +60,16 @@ class StoredFile:
     data: bytes
     text: str = ""  # what goes into a prompt for text files (with a data profile for CSV)
     created_at: float = field(default_factory=time.time)
+    object_uri: str = ""
+    object_generation: str = ""
+    preview_complete: bool = True
+    preview_bytes: int = 0
+    coverage_note: str = ""
 
     def ref(self) -> dict:
-        return {"id": self.id, "name": self.name, "mime": self.mime, "kind": self.kind, "size": self.size}
+        return {"id": self.id, "name": self.name, "mime": self.mime, "kind": self.kind, "size": self.size,
+                "preview_complete": self.preview_complete, "preview_bytes": self.preview_bytes,
+                "coverage_note": self.coverage_note, "storage": "cloud" if self.object_uri else "local"}
 
     @property
     def b64(self) -> str:
@@ -88,15 +98,20 @@ def classify(name: str, mime: str) -> tuple[str, str]:
     return "text", mime
 
 
+def safe_name(name: str) -> str:
+    return "".join(c for c in (name or "file").replace("/", "_").replace("\\", "_") if ord(c) >= 32).strip()[:180] or "file"
+
+
 def prepare(name: str, mime: str, data: bytes) -> StoredFile:
     """Accept any file. Data and documents become text the models read; unknown binary files are kept and described."""
-    name = (name or "file").replace("/", "_").replace("\\", "_").strip()[:180] or "file"
+    name = safe_name(name)
     if not data:
         raise FileRejected(f"'{name}' is empty.")
-    if len(data) > MAX_FILE_BYTES:
-        raise FileRejected(f"'{name}' is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB. Trim or compress it first.")
+    if len(data) > RAW_UPLOAD_MAX_BYTES:
+        raise FileRejected(f"'{name}' requires a resumable cloud upload (raw uploads allow 25 MiB).")
     kind, mime = classify(name, mime)
-    f = StoredFile(id=uuid.uuid4().hex[:16], name=name, mime=mime, kind=kind, size=len(data), data=data)
+    f = StoredFile(id=uuid.uuid4().hex[:16], name=name, mime=mime, kind=kind, size=len(data), data=data,
+                   preview_bytes=len(data))
     if kind != "text":
         return f
     try:
@@ -128,11 +143,28 @@ class FileStore:
         self._staged: dict[str, StoredFile] = {}
         self._runs: dict[str, list[StoredFile]] = {}
 
+    resumable_uploads = False
+    max_file_bytes = RAW_UPLOAD_MAX_BYTES
+    max_run_bytes = LOCAL_RUN_BYTES
+
+    async def stage_async(self, f: StoredFile) -> StoredFile:
+        self.stage(f)
+        return f
+
+    async def unstage_async(self, file_id: str) -> None:
+        self.unstage(file_id)
+
+    async def take_async(self, ids: list[str]) -> list[StoredFile]:
+        return self.take(ids)
+
+    async def cleanup(self) -> None:
+        return None
+
     def stage(self, f: StoredFile) -> None:
         cutoff = time.time() - STAGE_TTL
         for fid in [k for k, v in self._staged.items() if v.created_at < cutoff]:
             self._staged.pop(fid, None)
-        if sum(x.size for x in self._staged.values()) + f.size > 4 * MAX_RUN_BYTES:
+        if sum(x.size for x in self._staged.values()) + f.size > 4 * self.max_run_bytes:
             raise FileRejected("Too many files are waiting to be used. Start a run or remove some files first.")
         self._staged[f.id] = f
 
@@ -145,8 +177,8 @@ class FileStore:
             raise FileRejected("Some attached files expired. Attach them again.")
         if len(files) > MAX_FILES_PER_RUN:
             raise FileRejected(f"Attach at most {MAX_FILES_PER_RUN} files to one run.")
-        if sum(f.size for f in files) > MAX_RUN_BYTES:
-            raise FileRejected(f"Files for one run must total under {MAX_RUN_BYTES // (1024 * 1024)} MB.")
+        if sum(f.size for f in files) > self.max_run_bytes:
+            raise FileRejected(f"Files for one run must total at most {self.max_run_bytes // (1024 * 1024)} MiB.")
         for f in files:
             self._staged.pop(f.id, None)
         return files

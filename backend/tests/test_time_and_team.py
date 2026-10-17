@@ -75,7 +75,7 @@ def test_a_model_that_says_the_input_is_too_long_gets_a_trimmed_input_and_tries_
             if p == "glm" and call.kind == "analysis":
                 sizes.append(fit.measure(call, {"text"}))
                 if len(sizes) == 1:
-                    raise ProviderError("glm", "HTTP 400: This model's maximum context length is 60000 tokens. "
+                    raise ProviderError("glm", "HTTP 400: This model's maximum context length is 30000 tokens. "
                                                "However, you requested 90000 tokens.")
             return await original(call)
 
@@ -83,10 +83,11 @@ def test_a_model_that_says_the_input_is_too_long_gets_a_trimmed_input_and_tries_
         up = client.post("/api/files", content=("a,b\n" + "1,2\n" * 60_000).encode(),
                          headers={"X-File-Name": "data.csv", "Content-Type": "text/csv"}).json()
         run = client.post("/api/runs", json={"request": "Analyse the data", "require_plan_approval": False,
+                                             "mode": "deep", "materials": "reference " * 5000,
                                              "file_ids": [up["id"]]}).json()
         run = wait_for(client, run["id"], {"completed", "failed"})
         assert run["status"] == "completed", run.get("error")
-        assert registry.context("glm") == 60_000, "the model's stated limit is remembered"
+        assert registry.context("glm") == 30_000, "the model's stated limit is remembered"
         assert len(sizes) == 2 and sizes[1] < sizes[0]
         assert any("said the input was too long" in e["message"] for e in run["events"])
         assert next(a for a in run["analyses"] if a["provider"] == "glm")["output"], "GLM's analysis arrived"
@@ -198,7 +199,7 @@ def test_the_clock_pauses_while_the_plan_waits_for_approval():
 def test_time_and_resource_caps_are_bounded_by_default():
     s = Settings(_env_file=None)
     assert s.max_model_calls_per_run == 300
-    assert s.max_tokens_per_run == 2_400_000 and s.eris_max_tokens_per_run == 3_600_000
+    assert s.max_tokens_per_run == 5_000_000 and s.eris_max_tokens_per_run == 5_000_000
     assert s.run_time_limit_minutes == 120 and s.wrap_up_minutes == 5
     assert s.max_total_run_minutes == 120
     with make_client() as client:

@@ -80,6 +80,12 @@ def parse_research(response, model: str, *, max_sources: int = 6) -> ResearchRes
         input_tokens=(getattr(usage, "prompt_token_count", 0) or 0),
         output_tokens=(getattr(usage, "candidates_token_count", 0) or 0)
         + (getattr(usage, "thoughts_token_count", 0) or 0),
+        uncached_input_tokens=max(0, (getattr(usage, "prompt_token_count", 0) or 0)
+                                  - (getattr(usage, "cached_content_token_count", 0) or 0)),
+        cache_read_input_tokens=getattr(usage, "cached_content_token_count", 0) or 0,
+        thinking_tokens=getattr(usage, "thoughts_token_count", 0) or 0,
+        usage_details_available=usage is not None,
+        usage_estimated=usage is None,
     )
     # Preserve usage even when the response must not become source evidence.
     if any(marker in finish.lower() for marker in ("max_tokens", "length", "safety", "recitation")):

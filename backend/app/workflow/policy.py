@@ -35,8 +35,9 @@ def allocate(run: Run, available: int, max_tasks: int) -> Effort:
     if run.mode == "quick":
         return Effort(1, False, min(2, max_tasks), "Quick mode uses one analysis and independent review")
     if complex_request(run):
-        count = min(3 if run.profile == "research" or run.eris else 2, available)
-        return Effort(count, count > 1, max_tasks, "Research or complex requirements benefit from independent approaches")
+        count = min(2, available)
+        return Effort(count, False, max_tasks,
+                      "Two independent approaches, then targeted task and final verification; full debate is reserved for Deep mode")
     return Effort(1, False, min(3, max_tasks), "A focused request starts with one analysis and independent review")
 
 
