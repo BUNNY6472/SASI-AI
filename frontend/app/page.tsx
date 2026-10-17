@@ -6,7 +6,7 @@ import Login from "@/components/Login";
 import RunView from "@/components/RunView";
 import Scene3D from "@/components/Scene3D";
 import Workspace from "@/components/Workspace";
-import { activeProviders, api, ApiError, ProviderStatus, Run } from "@/lib/api";
+import { activeProviders, api, ApiError, ProviderStatus, Run, VertexInfo } from "@/lib/api";
 
 type Route = { view: "home" } | { view: "run"; id: string } | { view: "settings" };
 
@@ -22,6 +22,7 @@ export default function Page() {
   const [auth, setAuth] = useState<"unknown" | "in" | "out">("unknown");
   const [providers, setProviders] = useState<ProviderStatus[]>([]);
   const [needsKeys, setNeedsKeys] = useState(false);
+  const [vertex, setVertex] = useState<VertexInfo | null>(null);
   const [liveRun, setLiveRun] = useState<Run | null>(null);
 
   useEffect(() => {
@@ -33,9 +34,10 @@ export default function Page() {
 
   const loadProviders = useCallback(async (refresh = false) => {
     try {
-      const p = await api<{ providers: ProviderStatus[]; needs_keys: boolean }>(`/api/providers${refresh ? "?refresh=true" : ""}`);
+      const p = await api<{ providers: ProviderStatus[]; needs_keys: boolean; vertex?: VertexInfo }>(`/api/providers${refresh ? "?refresh=true" : ""}`);
       setProviders(p.providers);
       setNeedsKeys(p.needs_keys);
+      setVertex(p.vertex ?? null);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) setAuth("out");
     }
@@ -76,7 +78,7 @@ export default function Page() {
           <main>
             {route.view === "home" && <Workspace open={(id) => go(`/run/${id}`)} needsKeys={needsKeys} providers={providers} />}
             {route.view === "run" && <RunView key={route.id} id={route.id} onRun={setLiveRun} back={() => go("/")} />}
-            {route.view === "settings" && <Connections providers={providers} refresh={() => loadProviders(true)} reload={() => loadProviders(false)} />}
+            {route.view === "settings" && <Connections providers={providers} vertex={vertex} refresh={() => loadProviders(true)} reload={() => loadProviders(false)} />}
           </main>
           <footer className="foot">Results are reviewed by independent models, not guaranteed correct. Check anything important.</footer>
         </div>

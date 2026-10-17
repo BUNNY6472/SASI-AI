@@ -5,11 +5,12 @@
 # What it creates (all free-tier or free-to-exist):
 #   - turns on the needed APIs
 #   - Artifact Registry repo "sasi" that keeps only the 2 newest images (stays under the 0.5 GB free tier)
-#   - service account sasi-runtime   (what the app runs as: BigQuery + reading secrets)
+#   - service account sasi-runtime   (what the app runs as: BigQuery, reading secrets, calling models on Vertex AI)
 #   - service account sasi-deployer  (what GitHub Actions uses to deploy)
 #   - keyless GitHub login (Workload Identity Federation) limited to the BUNNY6472/SASI-AI repo
 #   - secrets APP_ACCESS_CODE and SESSION_SECRET (random values)
-# Model API keys are entered later on the app's Connections page.
+# The app calls Claude, Gemini and OpenAI's models through Vertex AI as sasi-runtime, so it needs no API keys.
+# Vertex AI usage is billed to this project. API keys entered on the Connections page are the other route.
 set -euo pipefail
 
 PROJECT_ID="${PROJECT_ID:-sasi-511906}"
@@ -28,7 +29,7 @@ BUILD_SA="sasi-builder@${PROJECT_ID}.iam.gserviceaccount.com"
 echo "== Enabling APIs"
 gcloud services enable run.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com \
   iamcredentials.googleapis.com iam.googleapis.com sts.googleapis.com bigquery.googleapis.com \
-  cloudbuild.googleapis.com storage.googleapis.com logging.googleapis.com
+  cloudbuild.googleapis.com storage.googleapis.com logging.googleapis.com aiplatform.googleapis.com
 
 echo "== Artifact Registry"
 if ! gcloud artifacts repositories describe sasi --location "$REGION" >/dev/null 2>&1; then
@@ -54,6 +55,7 @@ bind() { gcloud projects add-iam-policy-binding "$PROJECT_ID" --member "serviceA
 bind "$RUNTIME_SA" roles/bigquery.dataEditor
 bind "$RUNTIME_SA" roles/bigquery.jobUser
 bind "$RUNTIME_SA" roles/secretmanager.secretAccessor
+bind "$RUNTIME_SA" roles/aiplatform.user  # call models on Vertex AI (no API keys needed)
 bind "$BUILD_SA" roles/artifactregistry.writer
 bind "$BUILD_SA" roles/logging.logWriter
 bind "$BUILD_SA" roles/storage.objectViewer

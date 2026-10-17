@@ -342,3 +342,12 @@ details summary { cursor: pointer; color: var(--accent-2); font-size: 13px; }
 .opinion-scores { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); color: var(--text-2); }
 .key-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 4px 0 8px; }
 .team-note { margin: 0 0 14px; overflow-wrap: anywhere; }
+.routes { list-style: none; margin: 4px 0 2px; padding: 0; display: grid; gap: 6px; }
+.route { display: grid; gap: 2px; padding: 8px 10px; border-radius: 12px; border: 1px solid var(--border);
+  background: rgba(8, 6, 28, 0.35); overflow-wrap: anywhere; }
+.route > span:first-child { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.route b { font-size: 13px; font-weight: 600; }
+.route em { font-style: normal; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+.route.good { border-color: rgba(61, 220, 151, 0.35); }
+.route.good em { color: var(--ok); }
+.route.bad { border-color: rgba(255, 107, 139, 0.35); }

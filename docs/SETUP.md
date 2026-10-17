@@ -60,11 +60,19 @@ Get the access code to open the app:
 gcloud secrets versions access latest --secret APP_ACCESS_CODE
 ```
 
-The app asks for your API keys until at least one is added.
+The app reaches Claude, ChatGPT and Gemini through Google Cloud Vertex AI, so it works without API keys once the models are enabled (next step).
 
-## 5. Add the API keys in the app
+## 5. Enable the models in Vertex AI Model Garden (one time)
+
+Gemini works straight away. Claude and OpenAI's models are partner models: open [Vertex AI Model Garden](https://console.cloud.google.com/vertex-ai/model-garden) in project `sasi-511906`, open **Claude Opus 5.5** and press **Enable**, then open **gpt-oss-120b** and press **Enable**. Then press **Check again** on the app's Connections page.
+
+Google's free trial can't use partner models such as Claude, and its credit doesn't pay for them; gpt-oss may be treated the same way. Until the billing account is upgraded to a paid one, those show "not working" on Connections and SASI uses their API keys instead, if you saved any. Gemini on Vertex AI is paid from the trial credit.
+
+## 6. API keys (optional)
 
 Open the app, go to **Connections**, and paste each key (Claude, ChatGPT, Gemini). SASI checks each key, stores it in Secret Manager and starts using it straight away. No redeploy is needed. Keys are never shown again; only their last 4 characters are.
+
+A key is the other route for that model. Claude and Gemini use Vertex AI first and the key as the backup; ChatGPT uses its key first, because the OpenAI API has the newest GPT model while Vertex AI only has OpenAI's open-weight gpt-oss.
 
 Where to get keys: Claude at console.anthropic.com, ChatGPT at platform.openai.com, Gemini at aistudio.google.com. Set a monthly spend limit in each provider's console too; those charges are billed by the providers, not by Google Cloud.
 
@@ -77,8 +85,9 @@ Where to get keys: Claude at console.anthropic.com, ChatGPT at platform.openai.c
 | Secret Manager | 5 secrets | 6 active versions |
 | BigQuery | runs, every model's output, attached files | 10 GB storage, 1 TB queries a month |
 | Cloud Build | builds the image when you use deploy-now.sh | 2,500 build-minutes a month |
+| Vertex AI | Claude, Gemini and gpt-oss calls | none: billed per token to the project (Gemini from the trial credit; partner models need a paid account) |
 
-SASI writes to BigQuery with load jobs, which are free. Files count toward the 10 GB of free storage, so delete finished runs you no longer need. Model API usage is the main cost, and it is billed by Anthropic, OpenAI and Google AI Studio.
+SASI writes to BigQuery with load jobs, which are free. Files count toward the 10 GB of free storage, so delete finished runs you no longer need. Model usage is the main cost. Through Vertex AI it is billed to this Google Cloud project, so set a budget alert under Billing > Budgets & alerts. With API keys it is billed by Anthropic, OpenAI and Google AI Studio.
 
 ## Good to know
 

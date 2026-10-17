@@ -27,7 +27,7 @@ from ..models import (TERMINAL, Attempt, Consensus, Event, FinalResult, Judgemen
 from ..store.base import RunStore
 from . import eris, prompts
 from .profiles import AUTO_FIELDS, get_profile
-from ..gateway.registry import is_key_problem
+from ..gateway.routes import VIA, lasting_problem
 from .router import PerformanceHistory, Router
 
 log = logging.getLogger("sasi.controller")
@@ -239,11 +239,13 @@ class Controller:
             bp["input_tokens"] += result.input_tokens
             bp["output_tokens"] += result.output_tokens
             self._record(run, call, result)
+            self.registry.sync(provider)  # the route that answered may have changed
             return result
         self._unhealthy.setdefault(run.id, set()).add(provider)
         reason = str(last or "unknown error")
-        if is_key_problem(reason):
-            self.registry.mark_failed(provider, reason)  # later runs skip it until the key passes a check again
+        self.registry.sync(provider)
+        if lasting_problem(reason):
+            self.registry.mark_failed(provider, reason)  # later runs skip it until it passes a check again
         run.skipped[provider] = f"failed during the run: {reason[:200]}"
         others = [NAMES[p] for p in self.registry.eligible() if p not in self._unhealthy.get(run.id, set())]
         self._event(run, "provider_error", f"{NAMES[provider]} failed and is skipped for the rest of this run: {reason[:200]}. "
@@ -275,6 +277,9 @@ class Controller:
         if not working:
             return
         names = [NAMES[p] for p in working]
+        if self.registry.uses_vertex:  # say how each model is reached: Google Cloud or an API key
+            via = {p: self.registry.status.get(p, {}).get("via") for p in working}
+            names = [f"{NAMES[p]} ({VIA[via[p]]})" if via[p] in VIA else NAMES[p] for p in working]
         msg = "Working with " + (", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else names[0])
         if run.skipped:
             msg += ". Skipped: " + "; ".join(f"{NAMES[p]} ({why})" for p, why in run.skipped.items())

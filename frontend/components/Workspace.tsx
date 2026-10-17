@@ -117,7 +117,7 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
           {providers.map((p) => (
             <span key={p.provider} className="agent-pill">
               <AgentChip id={p.provider} />
-              <small>{p.connected ? (p.ok === false ? "error" : "connected") : "no key"}</small>
+              <small>{p.connected ? (p.ok === false ? "error" : p.via === "vertex" ? "Google Cloud" : "connected") : "no key"}</small>
             </span>
           ))}
         </div>

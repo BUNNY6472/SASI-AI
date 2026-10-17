@@ -57,9 +57,21 @@ A separate switch in the composer, for Project Eris ML challenges. When it is on
 
 SASI never executes code, so nothing is ever run end to end by the app itself.
 
+## Google Cloud Vertex AI (no keys needed)
+
+On Cloud Run, SASI reaches all three models through Vertex AI, signed in as the app's own service account (`sasi-runtime`, role `roles/aiplatform.user`). No API keys are needed, and the usage is billed to the Google Cloud project. `deploy/setup-gcp.sh` turns on the Vertex AI API and grants the role; the deploy sets `VERTEX_AI=true`.
+
+| Seat | Model on Vertex AI | Location | Notes |
+|---|---|---|---|
+| Claude | `claude-opus-5-5` (falls back to `claude-opus-5`) | `global` | Enable Claude once in Vertex AI Model Garden. Server-side refusal fallback is not offered on Vertex; a decline is passed to the API key route when one is saved |
+| Gemini | `gemini-4-argon` | `global` | Vertex has no Files API, so files go inline up to 14 MB per request; larger ones get a note and the other models' analyses |
+| ChatGPT | `openai/gpt-oss-120b-maas` | `us-central1` | Vertex only offers OpenAI's open-weight models, through its OpenAI-compatible Chat Completions endpoint. Text only |
+
+Each model can also have an API key, which is the other route. Claude and Gemini go through Vertex first and use the key as the backup; ChatGPT uses its key first (the OpenAI API has the newest GPT model) and Vertex's gpt-oss as the backup (`KEY_FIRST`, default `chatgpt`). If a route fails before the model has written anything, the other route takes over that call; a route that fails for a lasting reason (no permission, not enabled, no credit) is skipped until the next check. Connections shows both routes for every model and which one is in use. Change the models with `VERTEX_CLAUDE_MODEL`, `VERTEX_GEMINI_MODEL`, `VERTEX_OPENAI_MODEL`, the locations with `VERTEX_LOCATION` and `VERTEX_OPENAI_LOCATION`, for example `EXTRA_ENV="VERTEX_CLAUDE_MODEL=claude-fable-5-1" bash deploy/deploy-now.sh`.
+
 ## API keys
 
-Keys are pasted on the app's **Connections** page. The backend checks each key against the provider, stores it in Google Secret Manager (or memory when running locally), and starts using it immediately. Keys are never returned to the browser or logged; only the last 4 characters are shown. To change a key, paste the new one and press **Replace key**; the old one is destroyed. **Remove** (or **Remove all keys**) stops SASI using a key at once and writes a removal marker in Secret Manager, which needs the same permission as saving, then destroys the old versions. Runs need at least one key. With one key, that model also reviews its own work and results are labelled *self-reviewed*; with all three, every step is checked by a different model.
+Keys are pasted on the app's **Connections** page. The backend checks each key against the provider, stores it in Google Secret Manager (or memory when running locally), and starts using it immediately. Keys are never returned to the browser or logged; only the last 4 characters are shown. To change a key, paste the new one and press **Replace key**; the old one is destroyed. **Remove** (or **Remove all keys**) stops SASI using a key at once and writes a removal marker in Secret Manager, which needs the same permission as saving, then destroys the old versions. Without Vertex AI, runs need at least one key. With one model, that model also reviews its own work and results are labelled *self-reviewed*; with all three, every step is checked by a different model.
 
 Simulated agents exist only for the automated tests (`ALLOW_SIMULATED=true`).
 
@@ -70,7 +82,8 @@ backend/app/
   main.py                 API, access-code sign-in, live updates (server-sent events), serves the web app
   config.py               settings and budget limits (all from environment)
   models.py               run, plan, task, review, usage records
-  gateway/                model access: one adapter per provider + simulated agents + model registry
+  gateway/                model access: one adapter per provider, the Vertex AI adapters (vertex.py),
+                          the two routes per model (routes.py), simulated agents and the model registry
   workflow/controller.py  the workflow controller (stages, gates, retries, checkpoints)
   workflow/router.py      chooses who does and who checks each task, from review history, and says why
   workflow/profiles.py    field profiles: software, research, general, and Project Eris
@@ -89,7 +102,7 @@ The document calls its stack "replaceable choices". To start inside the free tie
 
 - **Project record:** BigQuery (`sasi_data.run_checkpoints`, created automatically) instead of PostgreSQL. Cloud SQL has no free tier. Each meaningful step appends a checkpoint row; an interrupted run can resume from it without redoing accepted work.
 - **Workflow:** a small asyncio controller instead of LangGraph plus a job queue. Same stages and checkpoints, fewer moving parts. It runs inside the web service, which is limited to one instance.
-- **Models:** the official Anthropic, OpenAI and Google Gen AI SDKs. Claude defaults to `claude-opus-5-5`; ChatGPT and Gemini pick the newest general model from the account's live model list. Pin any of them with `CLAUDE_MODEL`, `OPENAI_MODEL`, `GEMINI_MODEL`.
+- **Models:** the official Anthropic, OpenAI and Google Gen AI SDKs, through Vertex AI on Cloud Run (see above) or with API keys. With a key, Claude defaults to `claude-opus-5-5`; ChatGPT and Gemini pick the newest general model from the account's live model list. Pin any of them with `CLAUDE_MODEL`, `OPENAI_MODEL`, `GEMINI_MODEL`.
 - **Sign-in:** a private access code, so only you can use it. Locking it to your Google account (Identity-Aware Proxy) is an easy later step.
 
 Not in this release: file uploads, sandboxed code execution, web search, benchmark feeds, multiple users. These are later phases in the document.

@@ -59,7 +59,7 @@ jobs:
             --memory 1Gi \
             --concurrency 80 \
             --timeout 3600 \
-            --set-env-vars "STORAGE_BACKEND=bigquery,KEY_STORE=secretmanager,GCP_PROJECT=${PROJECT_ID},BIGQUERY_DATASET=sasi_data" \
+            --set-env-vars "STORAGE_BACKEND=bigquery,KEY_STORE=secretmanager,GCP_PROJECT=${PROJECT_ID},BIGQUERY_DATASET=sasi_data,VERTEX_AI=true" \
             --set-secrets "$SECRETS"
 
       - name: Show URL

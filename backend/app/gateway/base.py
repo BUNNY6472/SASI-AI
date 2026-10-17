@@ -66,6 +66,7 @@ class ModelResult:
     output_tokens: int = 0
     stop_reason: str = ""
     simulated: bool = False
+    via: str = ""  # "vertex" (Google Cloud) or "key" (the provider's API key); empty when not known
 
     @property
     def total_tokens(self) -> int:
@@ -77,6 +78,16 @@ class ProviderError(Exception):
         super().__init__(f"{provider}: {message}")
         self.provider = provider
         self.retryable = retryable
+
+
+_KEY_PROBLEMS = ("401", "403", "authentication", "unauthorized", "permission", "api key", "api_key", "invalid x-api-key",
+                 "quota", "billing", "credit", "insufficient", "payment")
+
+
+def is_key_problem(message: str) -> bool:
+    """Errors that mean the key itself is bad or the account is out of credit, not a passing hiccup."""
+    low = message.lower()
+    return any(t in low for t in _KEY_PROBLEMS)
 
 
 class ProviderAdapter(Protocol):

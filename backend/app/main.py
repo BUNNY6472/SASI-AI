@@ -131,7 +131,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def providers(refresh: bool = False):
         if refresh or not registry.status:
             await registry.refresh()
-        return {"providers": registry.describe(), "needs_keys": registry.live_count == 0 and not settings.allow_simulated, "demo_mode": registry.live_count == 0 and settings.allow_simulated, "checked_at": registry.checked_at}
+        return {"providers": registry.describe(), "needs_keys": registry.live_count == 0 and not settings.allow_simulated,
+                "demo_mode": registry.live_count == 0 and settings.allow_simulated, "checked_at": registry.checked_at,
+                "vertex": {"on": registry.uses_vertex, "project": settings.gcp_project, "location": settings.vertex_location,
+                           "openai_location": settings.vertex_openai_location}}
 
     @app.get("/api/keys")
     async def keys_status():
@@ -161,7 +164,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(400, f"That key did not work: {msg}") from e
         # The key works, so use it right away even if saving it fails.
         registry.set_adapter(provider, key, model)
-        result = {"provider": provider, "configured": True, "hint": registry.hints.get(provider), "model": model, "saved": True}
+        result = {"provider": provider, "configured": True, "hint": registry.hints.get(provider), "model": model, "saved": True,
+                  "via": registry.status.get(provider, {}).get("via")}  # "vertex" when Google Cloud stays first and the key is the backup
         try:
             await key_store.save(provider, key)
         except Exception as e:  # noqa: BLE001
@@ -294,6 +298,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not registry.eligible():
             if registry.live_count:
                 why = "; ".join(f"{DISPLAY.get(p, p)}: {r}" for p, r in registry.unavailable().items())
+                if registry.uses_vertex:
+                    raise HTTPException(400, f"None of the models is working right now ({why}). See the Connections page.")
                 raise HTTPException(400, f"None of your API keys is working right now ({why}). Replace them on the Connections page.")
             raise HTTPException(400, "Add at least one API key on the Connections page first.")
         if controller.active_count() >= settings.max_concurrent_runs:

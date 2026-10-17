@@ -17,6 +17,18 @@ class Settings(BaseSettings):
     openai_model: str = ""
     gemini_model: str = ""
 
+    # Google Cloud Vertex AI. When on, the app's own service account calls the models (billed to the Google Cloud
+    # project), so no API keys are needed. A saved API key stays as the other route for that model.
+    vertex_ai: bool = False
+    vertex_location: str = "global"  # Claude and Gemini
+    vertex_openai_location: str = "us-central1"  # OpenAI's models on Vertex are served from this region
+    vertex_claude_model: str = ""  # empty: same as claude_model
+    vertex_gemini_model: str = "gemini-4-argon"
+    vertex_openai_model: str = "openai/gpt-oss-120b-maas"
+    # Models whose saved API key is tried before Vertex. ChatGPT by default: Vertex only offers OpenAI's open-weight
+    # models, while an OpenAI key reaches the newest GPT model.
+    key_first: str = "chatgpt"
+
     # Access control: everyone must enter this code before using the app.
     # Empty disables the gate (local development only).
     app_access_code: str = ""

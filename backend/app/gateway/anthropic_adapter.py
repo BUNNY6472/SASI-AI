@@ -54,9 +54,8 @@ class ClaudeAdapter:
         return [{"type": "text", "text": call.rules, "cache_control": {"type": "ephemeral"}},
                 {"type": "text", "text": call.system}]
 
-    async def generate(self, call: ModelCall) -> ModelResult:
-        model = await self.resolve_model()
-        kwargs = dict(
+    def _kwargs(self, call: ModelCall, model: str) -> dict:
+        return dict(
             model=model,
             max_tokens=call.max_output_tokens,
             system=self._system(call),
@@ -66,14 +65,22 @@ class ClaudeAdapter:
             betas=["server-side-fallback-2026-07-01"],
             extra_body={"fallbacks": "default"},
         )
+
+    @property
+    def _messages(self):
+        return self._client.beta.messages
+
+    async def generate(self, call: ModelCall) -> ModelResult:
+        model = await self.resolve_model()
+        kwargs = self._kwargs(call, model)
         try:
             if call.on_text:
-                async with self._client.beta.messages.stream(**kwargs) as stream:
+                async with self._messages.stream(**kwargs) as stream:
                     async for text in stream.text_stream:
                         await call.on_text(text)
                     resp = await stream.get_final_message()
             else:
-                resp = await self._client.beta.messages.create(**kwargs)
+                resp = await self._messages.create(**kwargs)
         except anthropic.RateLimitError as e:
             raise ProviderError(self.provider, f"rate limited: {e}", retryable=True) from e
         except anthropic.APIStatusError as e:

@@ -4,6 +4,8 @@
 # It runs the one-time setup (safe to repeat; skip it with SKIP_SETUP=1), builds the app
 # on Google Cloud Build (no large upload from Cloud Shell), deploys it to Cloud Run and
 # prints the link. Later deploys can also come from GitHub Actions.
+# Optional model settings, for example a different Claude model on Vertex AI:
+#   EXTRA_ENV="VERTEX_CLAUDE_MODEL=claude-fable-5-1" bash deploy/deploy-now.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -71,7 +73,7 @@ deploy_service() {
   --memory 1Gi \
   --concurrency 80 \
   --timeout 3600 \
-  --set-env-vars "STORAGE_BACKEND=bigquery,KEY_STORE=secretmanager,GCP_PROJECT=${PROJECT_ID},BIGQUERY_DATASET=sasi_data" \
+  --set-env-vars "STORAGE_BACKEND=bigquery,KEY_STORE=secretmanager,GCP_PROJECT=${PROJECT_ID},BIGQUERY_DATASET=sasi_data,VERTEX_AI=true${EXTRA_ENV:+,$EXTRA_ENV}" \
   --set-secrets "$SECRETS" \
   --quiet
 }

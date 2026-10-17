@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
-import { api, Provider, ProviderStatus } from "@/lib/api";
+import { api, Provider, ProviderStatus, RouteStatus, VertexInfo } from "@/lib/api";
 import { AgentChip } from "./ui";
 
 interface Limits {
@@ -22,7 +22,24 @@ const WHERE: Record<Provider, { label: string; url: string }> = {
   gemini: { label: "aistudio.google.com", url: "https://aistudio.google.com/apikey" },
 };
 
-function KeyForm({ p, onChange }: { p: ProviderStatus; onChange: () => Promise<void> }) {
+function RouteList({ p }: { p: ProviderStatus }) {
+  const active = p.ok ? p.via : null;
+  const line = (r: RouteStatus) => {
+    const name = r.via === "vertex" ? "Google Cloud (Vertex AI)" : `API key ${p.key_hint || ""}`.trim();
+    const state = r.ok === null ? "not checked yet" : r.ok ? `working${r.model ? ` · ${r.model}` : ""}` : "not working";
+    const role = r.via === active ? "in use" : r.ok ? "backup" : "";
+    return (
+      <li key={r.via} className={r.ok === false ? "route bad" : r.ok ? "route good" : "route"}>
+        <span><b>{name}</b>{role && <em>{role}</em>}</span>
+        <span className="small">{state}</span>
+        {r.ok === false && r.error && <span className="error small">{r.error}</span>}
+      </li>
+    );
+  };
+  return <ul className="routes">{p.routes.map(line)}</ul>;
+}
+
+function KeyForm({ p, vertexOn, onChange }: { p: ProviderStatus; vertexOn: boolean; onChange: () => Promise<void> }) {
   const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; warn?: boolean; text: string } | null>(null);
@@ -32,9 +49,12 @@ function KeyForm({ p, onChange }: { p: ProviderStatus; onChange: () => Promise<v
     setBusy(true);
     setMsg(null);
     try {
-      const r = await api<{ model: string; saved: boolean; warning?: string }>(`/api/keys/${p.provider}`, { method: "PUT", body: JSON.stringify({ key }) });
+      const r = await api<{ model: string; saved: boolean; warning?: string; via?: string | null }>(`/api/keys/${p.provider}`, { method: "PUT", body: JSON.stringify({ key }) });
       setKey("");
-      setMsg(r.saved ? { ok: true, text: `Saved and working. Using ${r.model}.` } : { ok: false, warn: true, text: r.warning || "Working, but not saved." });
+      const ok = r.via === "vertex"
+        ? `Saved and working. ${p.display_name} keeps running through Google Cloud; this key is the backup.`
+        : `Saved and working. Using ${r.model}.`;
+      setMsg(r.saved ? { ok: true, text: ok } : { ok: false, warn: true, text: r.warning || "Working, but not saved." });
       await onChange();
     } catch (err) {
       setMsg({ ok: false, text: (err as Error).message });
@@ -44,12 +64,14 @@ function KeyForm({ p, onChange }: { p: ProviderStatus; onChange: () => Promise<v
   }
 
   async function remove() {
-    if (!window.confirm(`Remove the ${p.display_name} key from SASI?`)) return;
+    const after = vertexOn ? ` ${p.display_name} will keep running through Google Cloud.` : "";
+    if (!window.confirm(`Remove the ${p.display_name} key from SASI?${after}`)) return;
     setBusy(true);
     setMsg(null);
     try {
       const r = await api<{ saved: boolean; warning?: string }>(`/api/keys/${p.provider}`, { method: "DELETE" });
-      setMsg(r.saved ? { ok: true, text: "Removed. Paste a new key any time." } : { ok: false, warn: true, text: r.warning || "Removed from SASI." });
+      const ok = vertexOn ? `Removed. ${p.display_name} runs through Google Cloud now. Paste a key any time.` : "Removed. Paste a new key any time.";
+      setMsg(r.saved ? { ok: true, text: ok } : { ok: false, warn: true, text: r.warning || "Removed from SASI." });
       await onChange();
     } catch (err) {
       setMsg({ ok: false, text: (err as Error).message });
@@ -63,7 +85,7 @@ function KeyForm({ p, onChange }: { p: ProviderStatus; onChange: () => Promise<v
     <form className="key-form" onSubmit={save} autoComplete="off">
       <input
         type="password"
-        placeholder={p.connected ? `Replace key (${p.key_hint})` : `Paste your ${p.display_name} API key`}
+        placeholder={p.has_key ? `Replace key (${p.key_hint})` : vertexOn ? `Optional: a ${p.display_name} API key` : `Paste your ${p.display_name} API key`}
         value={key}
         onChange={(e) => setKey(e.target.value)}
         autoComplete="new-password"
@@ -71,32 +93,46 @@ function KeyForm({ p, onChange }: { p: ProviderStatus; onChange: () => Promise<v
         aria-label={`${p.display_name} API key`}
       />
       <div className="row2">
-        <button className="btn primary" disabled={busy || key.trim().length < 10}>{busy ? "Checking…" : p.connected ? "Replace key" : "Save key"}</button>
-        {p.connected && <button type="button" className="btn ghost" disabled={busy} onClick={remove}>Remove</button>}
+        <button className="btn primary" disabled={busy || key.trim().length < 10}>{busy ? "Checking…" : p.has_key ? "Replace key" : "Save key"}</button>
+        {p.has_key && <button type="button" className="btn ghost" disabled={busy} onClick={remove}>Remove</button>}
       </div>
       {msg && <p className={msg.ok ? "ok small" : msg.warn ? "warn-text small" : "error small"}>{msg.text}</p>}
-      {!p.connected && (
+      {!p.has_key && (
         <p className="small muted">
-          Get a key at <a href={where.url} target="_blank" rel="noreferrer">{where.label}</a>.
+          {vertexOn ? "Not needed. To add one as the other route, get" : "Get"} a key at{" "}
+          <a href={where.url} target="_blank" rel="noreferrer">{where.label}</a>.
         </p>
       )}
     </form>
   );
 }
 
-export default function Connections({ providers, refresh, reload }: { providers: ProviderStatus[]; refresh: () => Promise<void>; reload: () => Promise<void> }) {
+function status(p: ProviderStatus): { cls: string; text: string } {
+  if (!p.connected) return { cls: "muted", text: "No key yet" };
+  if (p.ok === false) return { cls: "warn-text", text: p.has_key && p.routes.length < 2 ? "Key saved, but the last check failed" : "Not working right now" };
+  if (p.via === "vertex") return { cls: "ok", text: "Connected through Google Cloud" };
+  if (p.has_key) return { cls: "ok", text: `Connected · key ${p.key_hint || ""}` };
+  return { cls: "ok", text: "Connected" };
+}
+
+export default function Connections({ providers, vertex, refresh, reload }: {
+  providers: ProviderStatus[]; vertex: VertexInfo | null; refresh: () => Promise<void>; reload: () => Promise<void>;
+}) {
+  const vertexOn = !!vertex?.on;
   const [limits, setLimits] = useState<Limits | null>(null);
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [busy, setBusy] = useState(false);
   const [allMsg, setAllMsg] = useState<{ warn: boolean; text: string } | null>(null);
 
   async function removeAll() {
-    if (!window.confirm("Remove all API keys from SASI? Runs can't start until you add a key again.")) return;
+    const after = vertexOn ? " The models keep running through Google Cloud." : " Runs can't start until you add a key again.";
+    if (!window.confirm(`Remove all API keys from SASI?${after}`)) return;
     setBusy(true);
     setAllMsg(null);
     try {
       const r = await api<{ saved: boolean; warning?: string | null }>("/api/keys", { method: "DELETE" });
-      setAllMsg(r.saved ? { warn: false, text: "All keys removed. Paste new ones above." } : { warn: true, text: r.warning || "Removed from SASI." });
+      const ok = vertexOn ? "All keys removed. The models run through Google Cloud." : "All keys removed. Paste new ones above.";
+      setAllMsg(r.saved ? { warn: false, text: ok } : { warn: true, text: r.warning || "Removed from SASI." });
       await reload();
     } catch (err) {
       setAllMsg({ warn: true, text: (err as Error).message });
@@ -113,37 +149,52 @@ export default function Connections({ providers, refresh, reload }: { providers:
   return (
     <div className="connections">
       <h1>Connections</h1>
-      <p className="sub">
-        Paste each API key once. SASI checks it, stores it on the server in Google Secret Manager, and never sends it back
-        to any browser. Only the last 4 characters are shown so you can tell which key is saved.
-      </p>
+      {vertexOn ? (
+        <p className="sub">
+          Claude, ChatGPT and Gemini run through Google Cloud Vertex AI{vertex?.project ? <> in project <code>{vertex.project}</code></> : null},
+          signed in as the app&apos;s own service account, so no API keys are needed. An API key you add is the other route:
+          if one route fails, the other takes over. ChatGPT uses its key first when you add one, because Vertex AI only
+          offers OpenAI&apos;s open-weight models. Keys are stored in Google Secret Manager and never sent back to any browser.
+        </p>
+      ) : (
+        <p className="sub">
+          Paste each API key once. SASI checks it, stores it on the server in Google Secret Manager, and never sends it back
+          to any browser. Only the last 4 characters are shown so you can tell which key is saved.
+        </p>
+      )}
       <div className="provider-grid">
         {providers.map((p) => (
           <div key={p.provider} className="glass provider-card">
             <AgentChip id={p.provider} />
-            <p className={p.connected ? (p.ok === false ? "warn-text" : "ok") : "muted"}>
-              {p.connected ? (p.ok === false ? "Key saved, but the last check failed" : `Connected · key ${p.key_hint || ""}`) : "No key yet"}
-            </p>
+            <p className={status(p).cls}>{status(p).text}</p>
             {p.connected && p.model && <p className="small">Model: <code>{p.model}</code></p>}
-            {p.error && <p className="error small">{p.error}</p>}
-            <KeyForm p={p} onChange={reload} />
+            {p.routes.length > 1 || (vertexOn && p.routes.length) ? <RouteList p={p} /> : p.error && <p className="error small">{p.error}</p>}
+            <KeyForm p={p} vertexOn={vertexOn} onChange={reload} />
           </div>
         ))}
       </div>
       <p className="small muted">To change a key, paste the new one and press Replace key. You don&apos;t need to remove the old one first.</p>
+      {vertexOn && (
+        <p className="small muted">
+          If Google Cloud shows &ldquo;not working&rdquo; for Claude or ChatGPT, enable the model in Vertex AI Model Garden, then press
+          Check again.
+        </p>
+      )}
       <div className="key-actions">
         <button className="btn" disabled={busy} onClick={async () => { setBusy(true); await refresh(); setBusy(false); }}>
-          {busy ? "Checking…" : "Re-check all keys"}
+          {busy ? "Checking…" : vertexOn ? "Check again" : "Re-check all keys"}
         </button>
-        {providers.some((p) => p.connected) && (
+        {providers.some((p) => p.has_key) && (
           <button className="btn danger" disabled={busy} onClick={removeAll}>Remove all keys</button>
         )}
       </div>
       {allMsg && <p className={allMsg.warn ? "warn-text small" : "ok small"}>{allMsg.text}</p>}
 
       <div className="glass lock-note">
-        Only people with your access code can open SASI. Keep the code private. Every model call is billed to your own API accounts,
-        so set a monthly spending limit in each provider's console too.
+        Only people with your access code can open SASI. Keep the code private.{" "}
+        {vertexOn
+          ? "Calls through Google Cloud are billed to your Google Cloud project, and calls with an API key to that provider's account. Set a budget alert in Google Cloud Billing, and a monthly limit in each provider's console."
+          : "Every model call is billed to your own API accounts, so set a monthly spending limit in each provider's console too."}
       </div>
 
       {limits && (

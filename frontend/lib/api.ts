@@ -163,6 +163,25 @@ export interface ProviderStatus {
   model: string | null;
   error: string | null;
   key_hint: string | null;
+  /** How the model is reached right now: "vertex" (Google Cloud) or "key" (an API key). */
+  via: "vertex" | "key" | null;
+  has_key: boolean;
+  routes: RouteStatus[];
+}
+
+export interface RouteStatus {
+  via: "vertex" | "key";
+  label: string;
+  ok: boolean | null;
+  model: string | null;
+  error: string | null;
+}
+
+export interface VertexInfo {
+  on: boolean;
+  project: string;
+  location: string;
+  openai_location: string;
 }
 
 export interface Profile {
