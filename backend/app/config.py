@@ -30,9 +30,9 @@ class Settings(BaseSettings):
     simulated_delay: float = 0.6
 
     # Run limits (protect the budget).
-    max_model_calls_per_run: int = 40
+    max_model_calls_per_run: int = 60
     max_output_tokens_per_call: int = 4000
-    max_tokens_per_run: int = 200_000
+    max_tokens_per_run: int = 500_000
     max_tasks_per_plan: int = 5
     max_revisions_per_task: int = 1
     max_concurrent_runs: int = 3

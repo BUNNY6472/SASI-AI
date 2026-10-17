@@ -12,8 +12,8 @@ from app.workflow.prompts import parse_json
 
 
 def make_client(**overrides) -> TestClient:
-    opts = {"allow_simulated": True, **overrides}
-    settings = Settings(_env_file=None, simulated_delay=0.0, static_dir="/nonexistent", **opts)
+    opts = {"allow_simulated": True, "simulated_delay": 0.0, **overrides}
+    settings = Settings(_env_file=None, static_dir="/nonexistent", **opts)
     return TestClient(create_app(settings))
 
 
@@ -55,7 +55,7 @@ def test_full_run_in_demo_mode_with_plan_approval():
 
 
 def test_budget_limit_stops_run_and_keeps_state():
-    with make_client(max_model_calls_per_run=3) as client:
+    with make_client(max_model_calls_per_run=8) as client:
         run = client.post("/api/runs", json={"request": "Write a report", "require_plan_approval": False}).json()
         run = wait_for(client, run["id"], {"budget_stopped", "completed", "failed"})
         assert run["status"] == "budget_stopped"
@@ -142,3 +142,124 @@ def test_keys_saved_from_app_are_never_returned(monkeypatch):
 
         assert client.delete("/api/keys/claude").status_code == 200
         assert not any(p["configured"] for p in client.get("/api/keys").json())
+
+
+def test_files_all_three_analyse_compare_and_delete():
+    """Files reach every model, each analyses on its own, they cross-check, and delete removes everything."""
+    with make_client() as client:
+        csv_body = b"region,sales\nnorth,120\nsouth,80\n"
+        up = client.post("/api/files", content=csv_body, headers={"X-File-Name": "sales.csv", "Content-Type": "text/csv"})
+        assert up.status_code == 200, up.text
+        f = up.json()
+        assert f["kind"] == "text"
+        img = client.post("/api/files", content=b"\x89PNG\r\n\x1a\nfake", headers={"X-File-Name": "chart.png", "Content-Type": "image/png"}).json()
+        bad = client.post("/api/files", content=b"<svg/>", headers={"X-File-Name": "x.svg", "Content-Type": "image/svg+xml"})
+        assert bad.status_code == 400
+
+        run = client.post("/api/runs", json={"request": "Analyse the sales data", "profile": "research",
+                                             "require_plan_approval": False, "file_ids": [f["id"], img["id"]]}).json()
+        assert [x["name"] for x in run["files"]] == ["sales.csv", "chart.png"]
+        run = wait_for(client, run["id"], {"completed", "failed"})
+        assert run["status"] == "completed", run.get("error")
+        assert {a["provider"] for a in run["analyses"]} == {"claude", "chatgpt", "gemini"}
+        assert all("sales.csv" in a["output"] for a in run["analyses"]), "every model saw the files"
+        assert len(run["cross_checks"]) == 3
+        assert run["live"] == {}, "live text is cleared when the run ends"
+
+        store = client.app.state.store
+        stages = {o["stage"] for o in store.outputs.get(run["id"], [])}
+        assert {"analysis", "cross_check", "task", "review", "integrate"} <= stages, stages
+
+        got = client.get(f"/api/runs/{run['id']}/files/{f['id']}")
+        assert got.status_code == 200 and got.content == csv_body
+
+        # A staged file can only be used once.
+        again = client.post("/api/runs", json={"request": "again", "file_ids": [f["id"]]})
+        assert again.status_code == 400
+
+        d = client.delete(f"/api/runs/{run['id']}")
+        assert d.status_code == 200 and d.json()["deleted"] is True
+        assert client.get(f"/api/runs/{run['id']}").status_code == 404
+        assert run["id"] not in store.outputs
+
+
+def test_csv_profile_and_type_checks():
+    from app.files import FileRejected, prepare
+
+    f = prepare("data.csv", "", b"a,b\n1,x\n3,y\n")
+    assert "Rows: 2" in f.text and "min 1, max 3" in f.text
+    with pytest.raises(FileRejected):
+        prepare("tool.exe", "application/octet-stream", b"MZ")
+    assert prepare("clip.mov", "", b"0000").kind == "video"
+
+
+def test_cannot_delete_a_running_run():
+    with make_client(simulated_delay=0.3) as client:
+        run = client.post("/api/runs", json={"request": "Long task", "require_plan_approval": True}).json()
+        assert client.delete(f"/api/runs/{run['id']}").status_code == 409
+        client.post(f"/api/runs/{run['id']}/cancel")
+
+
+def test_bigquery_file_chunks_round_trip(monkeypatch):
+    """Large files are split into chunks for BigQuery and joined back in order; delete clears every table."""
+    import base64 as b64
+    import datetime
+
+    from app.files import StoredFile
+    from app.store import bigquery as bqmod
+
+    class FakeDB:
+        def __init__(self):
+            self.tables = {bqmod.CHECKPOINTS: [], bqmod.OUTPUTS: [], bqmod.FILES: []}
+
+        def ensure(self):
+            pass
+
+        def table(self, name):
+            return name
+
+        def param(self, name, value):
+            return value
+
+        def load_rows(self, name, rows):
+            self.tables[name].extend(rows)
+
+        def query(self, sql, params=None):
+            run_id = params[0]
+            if sql.startswith("DELETE"):
+                name = sql.split("`")[1]
+                self.tables[name] = [r for r in self.tables[name] if r["run_id"] != run_id]
+                return []
+            rows = [dict(r, data=b64.b64decode(r["data"]), created_at=datetime.datetime.now()) for r in self.tables[bqmod.FILES] if r["run_id"] == run_id]
+            return sorted(rows, key=lambda r: (r["file_id"], r["chunk"]))
+
+    monkeypatch.setattr(bqmod, "CHUNK", 10)
+    db = FakeDB()
+    files = bqmod.BigQueryFileStore(db)
+    store = bqmod.BigQueryStore("p", "d", db)
+    data = bytes(range(256)) * 2
+    f = StoredFile(id="f1", name="v.mp4", mime="video/mp4", kind="video", size=len(data), data=data)
+
+    async def scenario():
+        await files.attach("r1", [f])
+        assert len(db.tables[bqmod.FILES]) == -(-len(data) // 10)
+        files.forget("r1")
+        back = await files.get("r1")
+        assert back[0].data == data and back[0].name == "v.mp4"
+        store.record_output("r1", {"run_id": "r1", "stage": "analysis"})
+        assert await store.delete_run("r1") == "removed"
+        assert not any(db.tables.values())
+
+    asyncio.run(scenario())
+
+
+def test_field_is_detected_from_the_request():
+    from app.workflow.profiles import detect_profile
+
+    assert detect_profile("Fix the bug in my Python API endpoint") == "software"
+    assert detect_profile("Analyse this sales data and compare the trends", file_names=["sales.csv"]) == "research"
+    assert detect_profile("Plan a birthday party for 20 people") == "general"
+    with make_client() as client:
+        run = client.post("/api/runs", json={"request": "Write a FastAPI backend with a database schema", "require_plan_approval": True}).json()
+        assert run["profile"] == "software"
+        client.post(f"/api/runs/{run['id']}/cancel")

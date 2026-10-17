@@ -56,7 +56,7 @@ jobs:
             --min-instances 0 \
             --max-instances 1 \
             --cpu 1 \
-            --memory 512Mi \
+            --memory 1Gi \
             --concurrency 80 \
             --timeout 3600 \
             --set-env-vars "STORAGE_BACKEND=bigquery,KEY_STORE=secretmanager,GCP_PROJECT=${PROJECT_ID},BIGQUERY_DATASET=sasi_data" \

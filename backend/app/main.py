@@ -8,19 +8,22 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 
+from . import files as files_mod
 from .config import Settings, get_settings
+from .files import FileRejected, FileStore
 from .gateway.registry import PROVIDERS, ModelRegistry
 from .keys import build_key_store
-from .models import TERMINAL, ApprovePlan, CreateRun, Login, Run, SaveKey
+from .models import TERMINAL, ApprovePlan, CreateRun, FileRef, Login, Run, SaveKey
 from .store.memory import MemoryStore
 from .workflow.controller import Controller
-from .workflow.profiles import PROFILES
+from .workflow.profiles import PROFILES, detect_profile
 from .workflow.router import PerformanceHistory
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -32,20 +35,22 @@ OPEN_PATHS = {"/api/health", "/api/login", "/api/session", "/api/logout"}
 
 
 def build_store(settings: Settings):
+    """Run store and file store. On Cloud Run both live in BigQuery."""
     if settings.storage_backend == "bigquery":
-        from .store.bigquery import BigQueryStore
+        from .store.bigquery import BigQuery, BigQueryFileStore, BigQueryStore
 
-        return BigQueryStore(settings.gcp_project, settings.bigquery_dataset)
-    return MemoryStore()
+        db = BigQuery(settings.gcp_project, settings.bigquery_dataset)
+        return BigQueryStore(settings.gcp_project, settings.bigquery_dataset, db), BigQueryFileStore(db)
+    return MemoryStore(), FileStore()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     registry = ModelRegistry(settings)
     key_store = build_key_store(settings)
-    store = build_store(settings)
+    store, file_store = build_store(settings)
     history = PerformanceHistory()
-    controller = Controller(settings, registry, store, history)
+    controller = Controller(settings, registry, store, history, file_store)
     signer = URLSafeTimedSerializer(settings.session_secret, salt="sasi-session")
 
     @asynccontextmanager
@@ -187,6 +192,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "max_revisions_per_task": s.max_revisions_per_task,
             "max_concurrent_runs": s.max_concurrent_runs,
             "storage": s.storage_backend,
+            "max_file_mb": files_mod.MAX_FILE_BYTES // (1024 * 1024),
+            "max_files_per_run": files_mod.MAX_FILES_PER_RUN,
         }
 
     @app.get("/api/stats")
@@ -201,16 +208,79 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "Run not found")
         return run
 
+    # ------------------------------------------------------------------ files
+
+    @app.post("/api/files")
+    async def upload_file(request: Request):
+        """Upload one file as the raw request body. The name comes in the X-File-Name header."""
+        name = unquote(request.headers.get("x-file-name", "file"))
+        declared = int(request.headers.get("content-length") or 0)
+        if declared > files_mod.MAX_FILE_BYTES:
+            raise HTTPException(413, f"'{name}' is larger than {files_mod.MAX_FILE_BYTES // (1024 * 1024)} MB.")
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > files_mod.MAX_FILE_BYTES:
+                raise HTTPException(413, f"'{name}' is larger than {files_mod.MAX_FILE_BYTES // (1024 * 1024)} MB.")
+            chunks.append(chunk)
+        try:
+            f = files_mod.prepare(name, request.headers.get("content-type", ""), b"".join(chunks))
+            file_store.stage(f)
+        except FileRejected as e:
+            raise HTTPException(400, str(e)) from e
+        return f.ref()
+
+    @app.delete("/api/files/{file_id}")
+    async def remove_staged_file(file_id: str):
+        file_store.unstage(file_id)
+        return {"ok": True}
+
+    @app.get("/api/runs/{run_id}/files/{file_id}")
+    async def read_file(run_id: str, file_id: str):
+        get_run(run_id)
+        f = await file_store.get_one(run_id, file_id)
+        if not f:
+            raise HTTPException(404, "File not found")
+        inline = f.kind in ("image", "video", "audio", "pdf")
+        return Response(f.data, media_type=f.mime if inline else "text/plain; charset=utf-8", headers={
+            "Content-Disposition": f"{'inline' if inline else 'attachment'}; filename*=UTF-8''{quote(f.name)}",
+            "Content-Security-Policy": "sandbox; default-src 'none'; img-src 'self'; media-src 'self'",
+            "Cache-Control": "private, max-age=3600",
+        })
+
+    # ------------------------------------------------------------------ runs
+
     @app.post("/api/runs")
     async def create_run(body: CreateRun):
         if not registry.eligible():
             raise HTTPException(400, "Add at least one API key on the Connections page first.")
         if controller.active_count() >= settings.max_concurrent_runs:
             raise HTTPException(429, f"Up to {settings.max_concurrent_runs} runs can be active at once. Wait for one to finish.")
-        run = Run(request=body.request.strip(), materials=body.materials, profile=body.profile if body.profile in PROFILES else "general",
-                  require_plan_approval=body.require_plan_approval)
+        try:
+            files = file_store.take(body.file_ids)
+        except FileRejected as e:
+            raise HTTPException(400, str(e)) from e
+        profile = body.profile if body.profile in PROFILES else detect_profile(body.request, body.materials, [f.name for f in files])
+        run = Run(request=body.request.strip(), materials=body.materials, profile=profile,
+                  require_plan_approval=body.require_plan_approval, compare_all=body.compare_all,
+                  files=[FileRef(**f.ref()) for f in files])
+        try:
+            await file_store.attach(run.id, files)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not save files for run %s: %s", run.id, e)
+            raise HTTPException(500, "The files could not be saved. Try again.") from e
         await controller.start(run)
         return run.model_dump(mode="json")
+
+    @app.delete("/api/runs/{run_id}")
+    async def delete_run(run_id: str):
+        """Delete a finished run with its files and every model output, from BigQuery too."""
+        run = get_run(run_id)
+        try:
+            state = await controller.delete(run)
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from e
+        return {"deleted": True, "bigquery": state}
 
     @app.get("/api/runs")
     async def list_runs(limit: int = 50):

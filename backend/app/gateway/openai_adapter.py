@@ -4,7 +4,7 @@ import re
 
 import openai
 
-from .base import ModelCall, ModelResult, ProviderError
+from .base import ModelCall, ModelResult, ProviderError, split_attachments
 
 # Chat-capable families; everything else (embeddings, audio, image, moderation) is skipped.
 _CHAT = re.compile(r"^(gpt-\d|o\d)")
@@ -39,22 +39,37 @@ class ChatGPTAdapter:
                 return mid
         raise ProviderError(self.provider, "no chat model available for this key")
 
+    def _input(self, call: ModelCall) -> list[dict]:
+        media, extra = split_attachments(call, self.provider)
+        content: list[dict] = [{"type": "input_text", "text": extra + call.prompt}]
+        for f in media:
+            if f.kind == "image":
+                content.append({"type": "input_image", "image_url": f"data:{f.mime};base64,{f.b64}"})
+            elif f.kind == "pdf":
+                content.append({"type": "input_file", "filename": f.name, "file_data": f"data:application/pdf;base64,{f.b64}"})
+        return [{"role": "user", "content": content}]
+
     async def generate(self, call: ModelCall) -> ModelResult:
         model = await self.resolve_model()
+        kwargs = dict(model=model, instructions=call.system, input=self._input(call),
+                      max_output_tokens=call.max_output_tokens, store=False)
         try:
-            resp = await self._client.responses.create(
-                model=model,
-                instructions=call.system,
-                input=call.prompt,
-                max_output_tokens=call.max_output_tokens,
-                store=False,
-            )
+            if call.on_text:
+                async with self._client.responses.stream(**kwargs) as stream:
+                    async for event in stream:
+                        if event.type == "response.output_text.delta" and event.delta:
+                            await call.on_text(event.delta)
+                    resp = await stream.get_final_response()
+            else:
+                resp = await self._client.responses.create(**kwargs)
         except openai.RateLimitError as e:
             raise ProviderError(self.provider, f"rate limited: {e}", retryable=True) from e
         except openai.APIStatusError as e:
             raise ProviderError(self.provider, f"HTTP {e.status_code}: {e.message}", retryable=e.status_code >= 500) from e
         except openai.APIConnectionError as e:
             raise ProviderError(self.provider, f"connection error: {e}", retryable=True) from e
+        except openai.APIError as e:  # e.g. a stream that broke part-way
+            raise ProviderError(self.provider, f"API error: {e}", retryable=True) from e
 
         usage = resp.usage
         return ModelResult(

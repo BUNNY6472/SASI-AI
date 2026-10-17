@@ -36,6 +36,10 @@ class SimulatedAdapter:
     async def generate(self, call: ModelCall) -> ModelResult:
         await asyncio.sleep(self._delay * (0.5 + random.random()))
         text = self._respond(call)
+        if call.on_text:
+            for i in range(0, len(text), 40):
+                await call.on_text(text[i:i + 40])
+                await asyncio.sleep(self._delay * 0.15)
         return ModelResult(
             provider=self.provider,
             model=f"simulated-{self.provider}",
@@ -82,6 +86,11 @@ class SimulatedAdapter:
                 "gaps": [],
                 "limitations": ["Produced by simulated agents. Add API keys for real answers."],
             })
+        if call.kind == "analysis":
+            files = ", ".join(f.name for f in call.attachments) or "no files"
+            return f"## {name}'s independent analysis\n\nLooked at: {files}.\n\n- Main finding from {angle}.\n- One uncertainty to check."
+        if call.kind == "cross_check":
+            return f"## {name}'s cross-check\n\n- Agrees with the others on the main finding.\n- Disagrees on one detail and explains why."
         title = call.hints.get("task_title", "the task")
         if call.kind == "integrate":
             return (

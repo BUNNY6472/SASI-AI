@@ -1,16 +1,19 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { api, PROVIDER_META, Provider, Run, Task } from "@/lib/api";
+import { api, fileSize, Opinion, PROVIDER_META, Provider, Run, Task } from "@/lib/api";
 import Markdown from "./Markdown";
 import { AgentChip, StatusBadge, fmt } from "./ui";
 
-const LIVE = new Set(["planning", "reviewing_plan", "awaiting_approval", "running", "integrating"]);
+const LIVE = new Set(["analyzing", "cross_checking", "planning", "reviewing_plan", "awaiting_approval", "running", "integrating"]);
+const ORDER = ["claude", "chatgpt", "gemini"];
+const FIELD_NAME: Record<string, string> = { software: "Software engineering", research: "Research and analysis", general: "General" };
+const TERMINAL = new Set(["completed", "failed", "cancelled", "budget_stopped", "interrupted"]);
 
 export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Run | null) => void; back: () => void }) {
   const [run, setRun] = useState<Run | null>(null);
   const [error, setError] = useState("");
-  const [tab, setTab] = useState<"plan" | "result" | "activity">("plan");
+  const [tab, setTab] = useState<"compare" | "plan" | "result" | "activity">("plan");
   const [openTask, setOpenTask] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [stream, setStream] = useState(0);
@@ -41,9 +44,31 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
 
   useEffect(() => {
     onRun(run);
-    if (run?.status === "completed") setTab("result");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [run?.status, run?.updated_at]);
+
+  // Follow the work: show the stage that is happening now.
+  useEffect(() => {
+    const s = run?.status;
+    if (!s) return;
+    if (s === "analyzing" || s === "cross_checking") setTab("compare");
+    else if (["planning", "reviewing_plan", "awaiting_approval", "running"].includes(s)) setTab("plan");
+    else if (s === "integrating" || s === "completed") setTab("result");
+    else if (!run?.plan && run?.compare_all) setTab("compare");
+  }, [run?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function remove() {
+    if (!window.confirm("Delete this run? Its files and every model's results are removed from BigQuery. This cannot be undone.")) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/api/runs/${id}`, { method: "DELETE" });
+      back();
+    } catch (e) {
+      setError((e as Error).message);
+      setBusy(false);
+    }
+  }
 
   async function action(path: string) {
     setBusy(true);
@@ -73,6 +98,7 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
         <div className="run-title">
           <StatusBadge status={run.status} />
           {run.simulated && <span className="badge demo">Test agents</span>}
+          <span className="badge field" title="Chosen automatically from your request">{FIELD_NAME[run.profile] || run.profile}</span>
           <h1>{run.request}</h1>
         </div>
         <div className="run-actions">
@@ -80,15 +106,32 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
             <button className="btn primary" disabled={busy} onClick={() => action("approve")}>Approve plan and start</button>
           )}
           {live && <button className="btn danger" disabled={busy} onClick={() => action("cancel")}>Cancel</button>}
-          {["interrupted", "budget_stopped", "failed", "cancelled"].includes(run.status) && run.plan && (
+          {["interrupted", "budget_stopped", "failed", "cancelled"].includes(run.status) && (run.plan || run.analyses.length > 0) && (
             <button className="btn" disabled={busy} onClick={() => action("resume")}>Resume from checkpoint</button>
+          )}
+          {TERMINAL.has(run.status) && (
+            <button className="btn danger" disabled={busy} onClick={remove} title="Remove the run, its files and results from BigQuery">Delete</button>
           )}
         </div>
       </div>
       {error && <p className="error">{error}</p>}
       {run.error && <div className="notice warn">{run.error}</div>}
 
+      {run.files.length > 0 && (
+        <div className="file-strip">
+          {run.files.map((f) => (
+            <a key={f.id} className="file-chip glass" href={`/api/runs/${run.id}/files/${f.id}`} target="_blank" rel="noreferrer" title={f.name}>
+              {f.kind === "image" ? <img src={`/api/runs/${run.id}/files/${f.id}`} alt="" /> : <span className="file-kind">{f.kind}</span>}
+              <span className="file-name">{f.name}</span>
+              <small className="muted">{fileSize(f.size)}</small>
+            </a>
+          ))}
+        </div>
+      )}
+
       <div className="progress-strip glass">
+        {run.compare_all && <Stage label="Analyse" state={compareState(run, 0)} />}
+        {run.compare_all && <Stage label="Compare" state={compareState(run, 1)} />}
         <Stage label="Plan" state={stageState(run, 0)} />
         <Stage label="Review plan" state={stageState(run, 1)} />
         <Stage label="Approve" state={stageState(run, 2)} />
@@ -101,10 +144,33 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
       </div>
 
       <div className="tabs">
+        {run.compare_all && <button className={tab === "compare" ? "tab on" : "tab"} onClick={() => setTab("compare")}>Side by side</button>}
         <button className={tab === "plan" ? "tab on" : "tab"} onClick={() => setTab("plan")}>Plan and tasks</button>
-        <button className={tab === "result" ? "tab on" : "tab"} onClick={() => setTab("result")} disabled={!run.final}>Result and evidence</button>
+        <button className={tab === "result" ? "tab on" : "tab"} onClick={() => setTab("result")} disabled={!run.final && !run.live.final}>Result and evidence</button>
         <button className={tab === "activity" ? "tab on" : "tab"} onClick={() => setTab("activity")}>Activity</button>
       </div>
+
+      {tab === "compare" && (
+        <div className="compare">
+          <h2>Independent analyses</h2>
+          <p className="muted small">Each model studied your request{run.files.length ? " and files" : ""} on its own, at the same time.</p>
+          <OpinionGrid run={run} opinions={run.analyses} prefix="analysis" waiting={run.status === "analyzing"} empty="Waiting to start…" />
+          {(run.cross_checks.length > 0 || run.status === "cross_checking") && (
+            <>
+              <h2>Cross-checks</h2>
+              <p className="muted small">Each model read the others&apos; analyses and compared them with its own: agreements, disagreements and mistakes.</p>
+              <OpinionGrid run={run} opinions={run.cross_checks} prefix="cross" waiting={run.status === "cross_checking"} empty="Waiting for the analyses…" />
+            </>
+          )}
+        </div>
+      )}
+
+      {tab === "result" && !run.final && run.live.final && (
+        <article className="glass result">
+          <div className="result-meta"><AgentChip id={run.live.final.provider} /> is writing the final result <span className="typing" /></div>
+          <Markdown text={run.live.final.text} />
+        </article>
+      )}
 
       {tab === "plan" && (
         <div className="plan-grid">
@@ -132,7 +198,7 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
                 <div className="layer-label">{i === 0 ? "Starts first" : `Step ${i + 1}`}{layer.length > 1 ? " · parallel" : ""}</div>
                 <div className="layer-tasks">
                   {layer.map((t) => (
-                    <TaskCard key={t.id} task={t} open={openTask === t.id} toggle={() => setOpenTask(openTask === t.id ? null : t.id)} />
+                    <TaskCard key={t.id} task={t} live={run.live[`task:${t.id}`]?.text} open={openTask === t.id} toggle={() => setOpenTask(openTask === t.id ? null : t.id)} />
                   ))}
                 </div>
               </div>
@@ -193,11 +259,43 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
   );
 }
 
+function OpinionGrid({ run, opinions, prefix, waiting, empty }: { run: Run; opinions: Opinion[]; prefix: string; waiting: boolean; empty: string }) {
+  const live = Object.entries(run.live).filter(([k]) => k.startsWith(`${prefix}:`)).map(([k, v]) => ({ provider: k.slice(prefix.length + 1), text: v.text }));
+  const providers = ORDER.filter((p) => opinions.some((o) => o.provider === p) || live.some((l) => l.provider === p));
+  if (!providers.length) return <p className="muted pulse">{waiting ? "Starting…" : empty}</p>;
+  return (
+    <div className="opinions">
+      {providers.map((p) => {
+        const done = opinions.find((o) => o.provider === p);
+        const writing = live.find((l) => l.provider === p);
+        return (
+          <div key={p} className={`glass opinion ${writing ? "live" : ""}`} style={{ ["--c" as string]: PROVIDER_META[p as Provider]?.color }}>
+            <div className="opinion-head">
+              <AgentChip id={p} />
+              {writing ? <small className="ok">writing <span className="typing" /></small> : done?.error ? <small className="error">failed</small> : <small className="muted">{done?.model}</small>}
+            </div>
+            {done?.error && <p className="error small">{done.error}</p>}
+            <div className="opinion-body"><Markdown text={writing ? writing.text : done?.output || ""} /></div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function compareState(run: Run, idx: number): "done" | "now" | "todo" {
+  const now = run.status === "analyzing" ? 0 : run.status === "cross_checking" ? 1 : -1;
+  if (now === idx) return "now";
+  if (idx === 0) return run.analyses.length ? "done" : "todo";
+  return run.cross_checks.length || run.plan ? "done" : "todo";
+}
+
 function Stage({ label, state }: { label: string; state: "done" | "now" | "todo" }) {
   return <div className={`stage ${state}`}><span className="stage-dot" />{label}</div>;
 }
 
 function stageState(run: Run, idx: number): "done" | "now" | "todo" {
+  if (run.status === "analyzing" || run.status === "cross_checking") return "todo";
   const order = ["planning", "reviewing_plan", "awaiting_approval", "running", "integrating", "completed"];
   let cur = order.indexOf(run.status);
   if (cur < 0) {
@@ -220,7 +318,7 @@ function List({ title, items }: { title: string; items: string[] }) {
   );
 }
 
-function TaskCard({ task, open, toggle }: { task: Task; open: boolean; toggle: () => void }) {
+function TaskCard({ task, live, open, toggle }: { task: Task; live?: string; open: boolean; toggle: () => void }) {
   const working = ["working", "reviewing", "revising"].includes(task.status);
   const color = PROVIDER_META[(task.status === "reviewing" ? task.reviewer : task.implementer) as Provider]?.color;
   return (
@@ -232,6 +330,7 @@ function TaskCard({ task, open, toggle }: { task: Task; open: boolean; toggle: (
       <div className="task-agents">
         <AgentChip id={task.implementer} label="does" /> <AgentChip id={task.reviewer} label="checks" />
       </div>
+      {live && <div className="task-live"><Markdown text={live.slice(-900)} /></div>}
       {open && (
         <div className="task-body">
           <p className="muted">{task.description}</p>

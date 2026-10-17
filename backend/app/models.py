@@ -8,7 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 RunStatus = Literal[
-    "planning", "reviewing_plan", "awaiting_approval", "running", "integrating",
+    "analyzing", "cross_checking", "planning", "reviewing_plan", "awaiting_approval", "running", "integrating",
     "completed", "failed", "cancelled", "budget_stopped", "interrupted",
 ]
 TaskStatus = Literal["pending", "working", "reviewing", "revising", "accepted", "needs_human_review", "blocked", "failed"]
@@ -92,6 +92,33 @@ class FinalResult(BaseModel):
     limitations: list[str] = []
 
 
+class FileRef(BaseModel):
+    id: str
+    name: str
+    mime: str
+    kind: str  # image | video | audio | pdf | text
+    size: int
+
+
+class Opinion(BaseModel):
+    """One model's independent analysis, or its cross-check of the others."""
+
+    provider: str
+    model: str = ""
+    output: str = ""
+    error: str | None = None
+    at: float = Field(default_factory=now)
+
+
+class LiveText(BaseModel):
+    """Text a model is writing right now, streamed to the screen."""
+
+    provider: str
+    label: str
+    text: str = ""
+    at: float = Field(default_factory=now)
+
+
 class Run(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
     created_at: float = Field(default_factory=now)
@@ -100,6 +127,11 @@ class Run(BaseModel):
     materials: str = ""
     profile: str = "general"
     require_plan_approval: bool = True
+    compare_all: bool = True
+    files: list[FileRef] = []
+    analyses: list[Opinion] = []
+    cross_checks: list[Opinion] = []
+    live: dict[str, LiveText] = {}
     status: RunStatus = "planning"
     simulated: bool = False
     plan: Plan | None = None
@@ -121,14 +153,17 @@ class Run(BaseModel):
             "simulated": self.simulated,
             "tasks": len(self.plan.tasks) if self.plan else 0,
             "tokens": self.usage.total_tokens,
+            "files": len(self.files),
         }
 
 
 class CreateRun(BaseModel):
     request: str = Field(min_length=3, max_length=20_000)
     materials: str = Field(default="", max_length=60_000)
-    profile: str = "general"
+    profile: str = "auto"  # "auto" lets SASI pick the field from the request
     require_plan_approval: bool = True
+    compare_all: bool = True
+    file_ids: list[str] = Field(default=[], max_length=10)
 
 
 class ApprovePlan(BaseModel):

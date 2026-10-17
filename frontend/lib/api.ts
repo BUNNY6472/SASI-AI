@@ -57,6 +57,29 @@ export interface RunEvent {
   task_id: string | null;
 }
 
+export interface FileRef {
+  id: string;
+  name: string;
+  mime: string;
+  kind: "image" | "video" | "audio" | "pdf" | "text";
+  size: number;
+}
+
+export interface Opinion {
+  provider: string;
+  model: string;
+  output: string;
+  error: string | null;
+  at: number;
+}
+
+export interface LiveText {
+  provider: string;
+  label: string;
+  text: string;
+  at: number;
+}
+
 export interface Run {
   id: string;
   created_at: number;
@@ -65,6 +88,11 @@ export interface Run {
   materials: string;
   profile: string;
   require_plan_approval: boolean;
+  compare_all: boolean;
+  files: FileRef[];
+  analyses: Opinion[];
+  cross_checks: Opinion[];
+  live: Record<string, LiveText>;
   status: string;
   simulated: boolean;
   plan: Plan | null;
@@ -98,6 +126,7 @@ export interface RunSummary {
   simulated: boolean;
   tasks: number;
   tokens: number;
+  files: number;
 }
 
 export interface ProviderStatus {
@@ -123,6 +152,36 @@ export class ApiError extends Error {
   }
 }
 
+/** Upload one file with progress. Returns its reference for the run. */
+export function uploadFile(file: File, onProgress: (pct: number) => void): Promise<FileRef> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/files");
+    xhr.withCredentials = true;
+    xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
+    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(Math.round((e.loaded / e.total) * 100));
+    xhr.onload = () => {
+      let body: { detail?: string } & Partial<FileRef> = {};
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        /* not JSON */
+      }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(body as FileRef);
+      else reject(new Error(typeof body.detail === "string" ? body.detail : xhr.status === 413 ? "File is too large." : `Upload failed (${xhr.status})`));
+    };
+    xhr.onerror = () => reject(new Error("Upload failed. Check your connection."));
+    xhr.send(file);
+  });
+}
+
+export function fileSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
@@ -145,7 +204,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 /** Providers currently doing something in a run, so the 3D scene can light them up. */
 export function activeProviders(run: Run | null): string[] {
   if (!run) return [];
-  const out = new Set<string>();
+  const out = new Set<string>(Object.values(run.live || {}).map((l) => l.provider));
   if (run.status === "planning" && run.events.length) {
     const last = [...run.events].reverse().find((e) => e.provider);
     if (last?.provider) out.add(last.provider);
@@ -162,6 +221,8 @@ export function activeProviders(run: Run | null): string[] {
 }
 
 export const STATUS_LABEL: Record<string, string> = {
+  analyzing: "Analysing",
+  cross_checking: "Comparing",
   planning: "Planning",
   reviewing_plan: "Reviewing plan",
   awaiting_approval: "Waiting for your approval",

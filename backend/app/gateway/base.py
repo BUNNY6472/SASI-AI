@@ -6,7 +6,10 @@ touches provider-specific shapes or keys.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
+
+if TYPE_CHECKING:
+    from ..files import StoredFile
 
 
 @dataclass
@@ -19,6 +22,29 @@ class ModelCall:
     max_output_tokens: int = 4000
     # Free-form hints used only by the simulated adapter.
     hints: dict = field(default_factory=dict)
+    # Files the model should look at directly (images, video, audio, PDFs, data).
+    attachments: list["StoredFile"] = field(default_factory=list)
+    # Called with each piece of text as the model writes it, so the screen updates live.
+    on_text: Callable[[str], Awaitable[None]] | None = None
+
+
+def split_attachments(call: ModelCall, provider: str) -> tuple[list["StoredFile"], str]:
+    """Files this provider can read directly, plus prompt text for data files and ones it cannot open."""
+    from ..files import CAN_READ, DIRECT_LIMIT
+
+    media, notes = [], []
+    for f in call.attachments:
+        if f.kind == "text":
+            notes.append(f'<file name="{f.name}" untrusted="true">\n{f.text}\n</file>')
+        elif f.kind in CAN_READ.get(provider, set()) and f.size <= DIRECT_LIMIT.get(provider, {}).get(f.kind, f.size):
+            media.append(f)
+        elif f.kind in CAN_READ.get(provider, set()):
+            notes.append(f"[{f.name} is too large for this model to open directly. Use the other models' analyses of it.]")
+        else:
+            notes.append(f"[{f.name} is a {f.kind} file this model cannot open directly. "
+                         "Use the other models' analyses of it and say so where it matters.]")
+    text = ("\n\n".join(notes) + "\n\n") if notes else ""
+    return media, text
 
 
 @dataclass

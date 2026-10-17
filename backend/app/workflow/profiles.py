@@ -1,6 +1,7 @@
 """Field profiles: the same engine, different instructions and acceptance checks."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -67,3 +68,38 @@ PROFILES: dict[str, FieldProfile] = {
 
 def get_profile(key: str) -> FieldProfile:
     return PROFILES.get(key, PROFILES["general"])
+
+
+_SOFTWARE = re.compile(
+    r"\b(code|coding|program|programming|bug|bugs|debug|api|apis|function|python|javascript|typescript|java|kotlin|swift|"
+    r"react|next\.?js|node|sql|database|schema|deploy|deployment|backend|frontend|script|algorithm|repo|repository|github|"
+    r"docker|kubernetes|compile|stack trace|exception|refactor|unit tests?|endpoint|software|website|web app|mobile app|"
+    r"android|ios|flutter|django|fastapi|microservices?|architecture|devops|ci/cd|cloud run|terraform)\b", re.I)
+_RESEARCH = re.compile(
+    r"\b(research|analy[sz]e|analy[sz]is|analytics|compare|comparison|study|studies|report|literature|paper|papers|evidence|"
+    r"data|dataset|csv|statistics|statistical|trend|trends|survey|hypothesis|market|sources|scientific|science|medical|"
+    r"clinical|findings|forecast|insights?|investigate|evaluate|assessment|review of|pros and cons|explain why)\b", re.I)
+_CODE_FILES = (".py", ".js", ".ts", ".sql", ".java", ".go", ".rs", ".tsx", ".jsx")
+
+
+def detect_profile(request: str, materials: str = "", file_names: list[str] | None = None) -> str:
+    """Choose the field from the request itself, so one box handles every kind of question.
+
+    The planner confirms or corrects this once it has read everything.
+    """
+    text = f"{request}\n{materials[:4000]}"
+    software = len(_SOFTWARE.findall(text))
+    research = len(_RESEARCH.findall(text))
+    for name in file_names or []:
+        low = name.lower()
+        if low.endswith(_CODE_FILES):
+            software += 2
+        elif low.endswith((".csv", ".tsv", ".json", ".pdf", ".xlsx")):
+            research += 1
+    if software == research == 0:
+        return "general"
+    if software > research:
+        return "software"
+    if research > software:
+        return "research"
+    return "general"

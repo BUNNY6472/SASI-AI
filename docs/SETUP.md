@@ -75,10 +75,10 @@ Where to get keys: Claude at console.anthropic.com, ChatGPT at platform.openai.c
 | Cloud Run | 1 instance max, scales to zero | 2M requests and 180k vCPU-seconds a month |
 | Artifact Registry | keeps the 2 newest images | 0.5 GB |
 | Secret Manager | 5 secrets | 6 active versions |
-| BigQuery | run checkpoints | 10 GB storage, 1 TB queries a month |
+| BigQuery | runs, every model's output, attached files | 10 GB storage, 1 TB queries a month |
 | Cloud Build | builds the image when you use deploy-now.sh | 2,500 build-minutes a month |
 
-Streaming rows into BigQuery costs about $0.01 per 200 MB, which is far beyond what this app writes. Model API usage is the main cost, and it is billed by Anthropic, OpenAI and Google AI Studio.
+SASI writes to BigQuery with load jobs, which are free. Files count toward the 10 GB of free storage, so delete finished runs you no longer need. Model API usage is the main cost, and it is billed by Anthropic, OpenAI and Google AI Studio.
 
 ## Good to know
 

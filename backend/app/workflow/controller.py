@@ -15,14 +15,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 
+from .. import files as files_mod
 from ..config import Settings
+from ..files import FileStore, StoredFile
 from ..gateway.base import ModelCall, ModelResult, ProviderError
 from ..gateway.registry import ModelRegistry
-from ..models import TERMINAL, Attempt, Event, FinalResult, Plan, Review, Run, Task, now
+from ..models import TERMINAL, Attempt, Event, FinalResult, LiveText, Opinion, Plan, Review, Run, Task, now
 from ..store.base import RunStore
 from . import prompts
-from .profiles import get_profile
+from .profiles import PROFILES, get_profile
 from .router import PerformanceHistory, Router
 
 log = logging.getLogger("sasi.controller")
@@ -43,10 +46,13 @@ class NoProviders(Exception):
 
 
 class Controller:
-    def __init__(self, settings: Settings, registry: ModelRegistry, store: RunStore, history: PerformanceHistory):
+    def __init__(self, settings: Settings, registry: ModelRegistry, store: RunStore, history: PerformanceHistory,
+                 files: FileStore | None = None):
         self.settings = settings
         self.registry = registry
         self.store = store
+        self.files = files or FileStore()
+        self._last_publish: dict[str, float] = {}
         self.history = history
         self.router = Router(history)
         self._tasks: dict[str, asyncio.Task] = {}
@@ -59,6 +65,20 @@ class Controller:
 
     def active_count(self) -> int:
         return sum(1 for t in self._tasks.values() if not t.done())
+
+    def is_active(self, run_id: str) -> bool:
+        task = self._tasks.get(run_id)
+        return bool(task and not task.done())
+
+    async def delete(self, run: Run) -> str:
+        """Remove a finished run, its files and every model output (from BigQuery too)."""
+        if self.is_active(run.id) or run.status not in TERMINAL:
+            raise ValueError("Stop the run before deleting it.")
+        self._tasks.pop(run.id, None)
+        self._approvals.pop(run.id, None)
+        self._last_publish.pop(run.id, None)
+        await self.files.delete(run.id)
+        return await self.store.delete_run(run.id)
 
     async def start(self, run: Run) -> None:
         run.simulated = self.registry.live_count == 0
@@ -130,7 +150,7 @@ class Controller:
         bad = self._unhealthy.get(run.id, set())
         eligible = [p for p in self.registry.eligible() if p not in bad]
         if not eligible:
-            raise NoProviders("no model provider is available (add API keys in Secret Manager)")
+            raise NoProviders("no model provider is available. Check your API keys on the Connections page.")
         return eligible
 
     def _check_budget(self, run: Run) -> None:
@@ -140,16 +160,50 @@ class Controller:
         if run.usage.total_tokens >= s.max_tokens_per_run:
             raise BudgetExceeded(f"reached the limit of {s.max_tokens_per_run:,} tokens for one run")
 
-    async def _call(self, run: Run, provider: str, call: ModelCall) -> ModelResult:
+    def _live(self, run: Run, call: ModelCall, provider: str, key: str, label: str) -> None:
+        """Stream this call's text to the screen while the model writes it."""
+        live = run.live[key] = LiveText(provider=provider, label=label)
+
+        async def on_text(piece: str) -> None:
+            live.text += piece
+            t = time.monotonic()
+            if t - self._last_publish.get(run.id, 0) >= 0.5:
+                self._last_publish[run.id] = t
+                await self._publish(run)
+
+        call.on_text = on_text
+
+    def _record(self, run: Run, call: ModelCall, result: ModelResult) -> None:
+        """Keep every model output, so each model's work can be seen and compared (saved to BigQuery)."""
+        data = prompts.parse_json(result.text) if call.kind in ("review", "plan_review", "final_eval") else None
+        score = (data or {}).get("score")
+        self.store.record_output(run.id, {
+            "run_id": run.id, "stage": call.kind, "provider": result.provider, "model": result.model,
+            "task_id": call.hints.get("task_id"), "title": call.hints.get("task_title") or call.kind,
+            "content": result.text[:1_000_000], "verdict": str((data or {}).get("verdict") or (data or {}).get("meets_criteria") or "") or None,
+            "score": float(score) if isinstance(score, (int, float)) else None,
+            "input_tokens": result.input_tokens, "output_tokens": result.output_tokens, "created_at": time.time(),
+        })
+
+    async def _call(self, run: Run, provider: str, call: ModelCall, live: tuple[str, str] | None = None) -> ModelResult:
         """Bounded retry on transient errors. Non-transient errors mark the provider unhealthy for this run."""
+        try:
+            return await self._call_inner(run, provider, call, live)
+        finally:
+            if live:
+                run.live.pop(live[0], None)
+
+    async def _call_inner(self, run: Run, provider: str, call: ModelCall, live: tuple[str, str] | None) -> ModelResult:
         adapter = self.registry.adapters[provider]
         call.max_output_tokens = min(call.max_output_tokens, self.settings.max_output_tokens_per_call)
         last: Exception | None = None
         for attempt in range(2):
             self._check_budget(run)
             run.usage.calls += 1
+            if live:
+                self._live(run, call, provider, *live)
             try:
-                result = await asyncio.wait_for(adapter.generate(call), timeout=300)
+                result = await asyncio.wait_for(adapter.generate(call), timeout=600 if call.attachments else 300)
             except ProviderError as e:
                 last = e
                 if e.retryable and attempt == 0:
@@ -169,13 +223,14 @@ class Controller:
             bp["calls"] += 1
             bp["input_tokens"] += result.input_tokens
             bp["output_tokens"] += result.output_tokens
+            self._record(run, call, result)
             return result
         self._unhealthy.setdefault(run.id, set()).add(provider)
         self._event(run, "provider_error", f"{NAMES[provider]} failed and is skipped for the rest of this run: {last}", provider)
         raise last or ProviderError(provider, "unknown error")
 
     async def _call_any(self, run: Run, role: str, call: ModelCall, load: dict[str, int],
-                        exclude: set[str] | None = None) -> tuple[str, ModelResult, str]:
+                        exclude: set[str] | None = None, live: tuple[str, str] | None = None) -> tuple[str, ModelResult, str]:
         """Pick a provider for a role; on provider failure fall back to the next one and record it."""
         tried: set[str] = set()
         while True:
@@ -185,7 +240,7 @@ class Controller:
             kind = "review" if "review" in role or "evaluator" in role else "work"
             choice = self.router.pick(eligible, run.profile, load, role, exclude, kind=kind)
             try:
-                return choice.provider, await self._call(run, choice.provider, call), choice.reason
+                return choice.provider, await self._call(run, choice.provider, call, live), choice.reason
             except ProviderError:
                 tried.add(choice.provider)
                 self._event(run, "fallback", f"Reassigning {role} after {NAMES[choice.provider]} failed")
@@ -195,8 +250,13 @@ class Controller:
     async def _execute(self, run: Run) -> None:
         load: dict[str, int] = {}
         try:
+            files = await self.files.get(run.id) if run.files else []
+            if run.compare_all and not run.analyses:
+                await self._analyze(run, files)
+            if run.compare_all and not run.cross_checks:
+                await self._cross_check(run)
             if not run.plan or not run.plan.tasks:
-                await self._plan(run, load)
+                await self._plan(run, load, files)
             if run.require_plan_approval and not run.plan_approved:
                 run.status = "awaiting_approval"
                 self._event(run, "awaiting_approval", "Plan is ready. Review it and approve to start the work.")
@@ -204,7 +264,7 @@ class Controller:
                 await self._approvals.setdefault(run.id, asyncio.Event()).wait()
             run.status = "running"
             await self._publish(run)
-            await self._run_tasks(run, load)
+            await self._run_tasks(run, load, files)
             await self._integrate(run, load)
         except asyncio.CancelledError:
             run.status = "cancelled"
@@ -228,19 +288,97 @@ class Controller:
             await self._publish(run, checkpoint=True)
         finally:
             self._unhealthy.pop(run.id, None)
+            if run.live:
+                run.live = {}
+                await self._publish(run)
 
-    async def _plan(self, run: Run, load: dict[str, int]) -> None:
+    # ------------------------------------------------------------------ independent analyses and cross-checks
+
+    async def _gather(self, coros) -> None:
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        for r in results:
+            if isinstance(r, BaseException):
+                raise r
+
+    async def _analyze(self, run: Run, files: list[StoredFile]) -> None:
+        """Every connected model studies the request and files on its own, at the same time."""
+        providers = self._eligible(run)
+        profile = get_profile(run.profile)
+        run.status = "analyzing"
+        what = "the request and files" if files else "the request"
+        self._event(run, "stage", f"{', '.join(NAMES[p] for p in providers)} are analysing {what} independently, at the same time")
+        await self._publish(run)
+        system, prompt = prompts.analysis_prompt(run.request, run.materials, files_mod.describe(files), profile)
+
+        async def one(p: str) -> None:
+            call = ModelCall(system, prompt, "analysis", self.settings.max_output_tokens_per_call,
+                             {"request": run.request, "task_title": "Independent analysis"}, attachments=files)
+            try:
+                res = await self._call(run, p, call, live=(f"analysis:{p}", "Independent analysis"))
+                run.analyses.append(Opinion(provider=p, model=res.model, output=res.text))
+                self._event(run, "analysis", f"{NAMES[p]} finished its independent analysis", p)
+            except ProviderError as e:
+                run.analyses.append(Opinion(provider=p, error=str(e)))
+            await self._publish(run)
+
+        await self._gather(one(p) for p in providers)
+        if not any(a.output for a in run.analyses):
+            raise NoProviders("no model could analyse the request")
+        await self._publish(run, checkpoint=True)
+
+    async def _cross_check(self, run: Run) -> None:
+        """Each model reads the others' analyses and compares them with its own."""
+        ok = [a for a in run.analyses if a.output and a.provider in self._eligible(run)]
+        if len(ok) < 2:
+            return
+        profile = get_profile(run.profile)
+        run.status = "cross_checking"
+        self._event(run, "stage", "Each model is now reading the others' analyses and comparing them with its own")
+        await self._publish(run)
+
+        async def one(a: Opinion) -> None:
+            others = [o for o in run.analyses if o.output and o.provider != a.provider]
+            system, prompt = prompts.cross_check_prompt(run.request, a, others, profile)
+            call = ModelCall(system, prompt, "cross_check", min(3000, self.settings.max_output_tokens_per_call),
+                             {"request": run.request, "task_title": "Cross-check"})
+            try:
+                res = await self._call(run, a.provider, call, live=(f"cross:{a.provider}", "Cross-check"))
+                run.cross_checks.append(Opinion(provider=a.provider, model=res.model, output=res.text))
+                self._event(run, "cross_check", f"{NAMES[a.provider]} compared the analyses", a.provider)
+            except ProviderError as e:
+                run.cross_checks.append(Opinion(provider=a.provider, error=str(e)))
+            await self._publish(run)
+
+        await self._gather(one(a) for a in ok)
+        await self._publish(run, checkpoint=True)
+
+    @staticmethod
+    def _task_files(run: Run, files: list[StoredFile]) -> list[StoredFile]:
+        """Tasks see images, PDFs and data directly. Video and audio reach them through the analyses, to save tokens."""
+        if not run.analyses:
+            return files
+        return [f for f in files if f.kind not in ("video", "audio")]
+
+    async def _plan(self, run: Run, load: dict[str, int], files: list[StoredFile] | None = None) -> None:
         profile = get_profile(run.profile)
         run.status = "planning"
         self._event(run, "stage", "Understanding the request and drafting a plan")
         await self._publish(run)
 
-        system, prompt = prompts.plan_prompt(run.request, run.materials, profile, self.settings.max_tasks_per_plan)
+        shared = prompts.findings_block(run.analyses, run.cross_checks)
+        system, prompt = prompts.plan_prompt(run.request, run.materials, profile, self.settings.max_tasks_per_plan,
+                                             shared + ("\n\n" + files_mod.describe(files or []) if files else ""))
         planner, result, reason = await self._call_any(
-            run, "planner", ModelCall(system, prompt, "plan", 3000, {"request": run.request}), load)
+            run, "planner", ModelCall(system, prompt, "plan", 3000, {"request": run.request},
+                                      attachments=[] if run.analyses else (files or [])), load)
         plan = self._parse_plan(result.text, run)
         plan.planner = planner
         run.plan = plan
+        field = str((prompts.parse_json(result.text) or {}).get("field") or "").lower()
+        if field in PROFILES and field != run.profile:
+            run.profile = field
+            profile = get_profile(field)
+            self._event(run, "field", f"{NAMES[planner]} judged this to be {profile.name.lower()} work, so the rest of the run uses that approach", planner)
         self._event(run, "plan", f"{NAMES[planner]} drafted a plan with {len(plan.tasks)} tasks ({reason})", planner)
 
         # Independent plan review by a different provider, at most one revision.
@@ -332,7 +470,7 @@ class Controller:
                       score=float(score) if isinstance(score, (int, float)) else None,
                       findings=[str(f) for f in (data.get("findings") or [])][:12])
 
-    async def _run_tasks(self, run: Run, load: dict[str, int]) -> None:
+    async def _run_tasks(self, run: Run, load: dict[str, int], files: list[StoredFile] | None = None) -> None:
         plan = run.plan
         assert plan is not None
         while True:
@@ -350,17 +488,19 @@ class Controller:
                 return
             if len(ready) > 1:
                 self._event(run, "parallel", f"Running {len(ready)} independent tasks in parallel")
-            results = await asyncio.gather(*(self._run_task(run, t, load) for t in ready), return_exceptions=True)
+            results = await asyncio.gather(*(self._run_task(run, t, load, files or []) for t in ready), return_exceptions=True)
             for r in results:
                 if isinstance(r, (BudgetExceeded, NoProviders, asyncio.CancelledError)):
                     raise r
                 if isinstance(r, Exception):
                     raise r
 
-    async def _run_task(self, run: Run, task: Task, load: dict[str, int]) -> None:
+    async def _run_task(self, run: Run, task: Task, load: dict[str, int], files: list[StoredFile]) -> None:
         plan = run.plan
         assert plan is not None
         profile = get_profile(run.profile)
+        shared = prompts.findings_block(run.analyses, run.cross_checks, limit=4000)
+        task_files = self._task_files(run, files)
         deps = [t for t in plan.tasks if t.id in task.depends_on]
         tried_implementers: set[str] = set()
 
@@ -383,11 +523,12 @@ class Controller:
                 task.status = "working" if revision == 0 else "revising"
                 self._event(run, "working", f"{NAMES[implementer]} is {'revising' if revision else 'working on'} '{task.title}'", implementer, task.id)
                 await self._publish(run)
-                system, prompt = prompts.task_prompt(plan, task, deps, profile, run.materials, findings, previous)
+                system, prompt = prompts.task_prompt(plan, task, deps, profile, run.materials, findings, previous, shared)
                 try:
                     result = await self._call(run, implementer, ModelCall(
                         system, prompt, "task", self.settings.max_output_tokens_per_call,
-                        {"request": run.request, "task_title": task.title, "is_revision": revision > 0}))
+                        {"request": run.request, "task_title": task.title, "task_id": task.id, "is_revision": revision > 0},
+                        attachments=task_files), live=(f"task:{task.id}", task.title))
                 except ProviderError as e:
                     task.attempts.append(Attempt(provider=implementer, error=str(e)))
                     break  # move on to reassignment
@@ -400,7 +541,7 @@ class Controller:
                 system, prompt = prompts.review_prompt(plan, task, result.text, profile)
                 try:
                     rres = await self._call(run, reviewer, ModelCall(
-                        system, prompt, "review", 1500, {"request": run.request, "is_revision": revision > 0}))
+                        system, prompt, "review", 1500, {"request": run.request, "task_id": task.id, "task_title": task.title, "is_revision": revision > 0}))
                     review = self._parse_review(rres.text, reviewer, rres.model, default="pass")
                 except ProviderError:
                     # Reviewer down: pick another independent reviewer.
@@ -411,7 +552,7 @@ class Controller:
                         reviewer = self.router.pick(alt, run.profile, load, "reviewer", kind="review").provider
                         task.reviewer = reviewer
                         rres = await self._call(run, reviewer, ModelCall(
-                            system, prompt, "review", 1500, {"request": run.request, "is_revision": revision > 0}))
+                            system, prompt, "review", 1500, {"request": run.request, "task_id": task.id, "task_title": task.title, "is_revision": revision > 0}))
                         review = self._parse_review(rres.text, reviewer, rres.model, default="pass")
                 attempt.review = review
                 self._event(run, "review", f"{NAMES.get(review.reviewer, review.reviewer)}: {review.verdict} on '{task.title}'", review.reviewer, task.id)
@@ -449,10 +590,12 @@ class Controller:
         run.status = "integrating"
         self._event(run, "stage", f"Integrating {len(accepted)} accepted outputs")
         await self._publish(run)
-        system, prompt = prompts.integrate_prompt(run.request, plan, accepted, missing, profile)
+        shared = prompts.findings_block(run.analyses, run.cross_checks, limit=3000)
+        system, prompt = prompts.integrate_prompt(run.request, plan, accepted, missing, profile, shared)
         integrator, result, reason = await self._call_any(run, "integrator", ModelCall(
             system, prompt, "integrate", self.settings.max_output_tokens_per_call,
-            {"request": run.request, "sections": [(t.title, t.output) for t in accepted]}), load)
+            {"request": run.request, "sections": [(t.title, t.output) for t in accepted]}), load,
+            live=("final", "Final result"))
         final = FinalResult(output=result.text, integrator=integrator)
         self._event(run, "integrated", f"{NAMES[integrator]} integrated the result", integrator)
         await self._publish(run)

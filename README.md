@@ -1,13 +1,15 @@
 # SASI
 
-Claude, ChatGPT and Gemini working as one team. You ask once; SASI plans the work, splits it across the three models, has each piece checked by a different model, and delivers one combined result with the evidence behind it.
+Claude, ChatGPT and Gemini working as one team. You ask once, in one box, and attach any files (images, video, audio, PDFs, CSV and other data). All three models analyse it on their own at the same time, read and check each other's analyses, then SASI plans the work, splits it across the models, has each piece checked by a different model, and delivers one combined result that shows where the models agreed and disagreed.
 
-This is the first release of the design in the *Multi-Model Collaboration App* architecture document: the common engine with the **software engineering** and **research/report** field profiles (plus a general profile).
+This release builds the design in the *Multi-Model Collaboration App* architecture document. SASI picks the field (software engineering, research and analysis, or general) from the request itself, and the planner confirms or corrects it.
 
 ## How a request moves through SASI
 
 | Stage | What happens | Gate before moving on |
 |---|---|---|
+| 0a. Independent analysis | Every connected model studies the request and attached files on its own, in parallel. Text appears live as each model writes | At least one analysis succeeded |
+| 0b. Cross-check | Each model reads the others' analyses and lists agreements, disagreements and mistakes | Runs when two or more analyses exist |
 | 1. Understand + plan | One model turns the request into a goal, assumptions, success criteria and a task graph | Plan is readable; falls back to a single task if not |
 | 2. Plan review | A *different* model reviews the plan; the planner revises once if asked | Reviewer accepts, or one revision is done |
 | 3. Your approval | You see the plan and approve it (optional switch) | You click Approve |
@@ -25,6 +27,12 @@ Rules that are enforced by code, not by model opinion:
 - A provider that fails is retried once for temporary errors, then skipped for the rest of that run, and its work goes to another model.
 - Pasted reference material is passed to models as untrusted data, never as instructions.
 - Model output is sanitized before it is shown in the browser.
+
+## Files and the project record
+
+Files are uploaded from the composer (button or drag and drop), up to 10 per run and 25 MB each. Images and PDFs go to every model; video and audio go to Gemini, and the other models work from Gemini's analysis of them. CSV and other data files are sent as text with a profile of every column (counts, min, max, mean).
+
+On Cloud Run everything for a run is kept in BigQuery (dataset `sasi_data`): `run_checkpoints` (run state), `run_outputs` (every model's analysis, cross-check, task work, review and final result, ready to compare with SQL) and `run_files` (the files, in chunks). **Delete** on a finished run removes it from all three tables.
 
 ## API keys
 
