@@ -138,7 +138,7 @@ class Controller:
 
     async def _gather_evidence(self, run: Run, files: list[StoredFile]) -> None:
         """Evidence collection extension point; model prose is never source evidence."""
-        from ..gateway.research import search
+        from ..gateway.research import needs_web_research, search, web_research_opted_out
         from ..models import SourceEvidence
         from ..tools import collect_evidence
 
@@ -149,7 +149,8 @@ class Controller:
         await self._publish(run)
         remaining, _ = self._time_left(run)
         budget = min(12.0, max(0.1, (remaining - policy.finish_reserve(run)) if remaining is not None else 12.0))
-        supplied = await collect_evidence("" if run.eris else run.request, "" if run.eris else run.materials,
+        no_web = run.eris or web_research_opted_out(run.request)
+        supplied = await collect_evidence("" if no_web else run.request, "" if no_web else run.materials,
                                           files, deadline_s=budget, max_sources=self.settings.research_max_sources)
         by_url = {e.url: e for e in run.evidence}
         for item in supplied["items"]:
@@ -162,9 +163,7 @@ class Controller:
         run.evidence = list(by_url.values())
         for issue in supplied["issues"][:6]:
             self._event(run, "evidence_unavailable", f"Could not retrieve {issue.get('url', 'source')}: {issue.get('summary', 'unavailable')}")
-        needs_search = (not run.eris and (run.profile == "research" or bool(re.search(
-            r"\b(search|browse|research|latest|today|current|recent|sources|literature)\b", run.request, re.I))))
-        if run.eris or not needs_search:
+        if not needs_web_research(run.request, run.profile, eris=run.eris):
             run.research_status = "supplied_only" if run.evidence else "not_needed"
             await self._publish(run, checkpoint=True)
             return

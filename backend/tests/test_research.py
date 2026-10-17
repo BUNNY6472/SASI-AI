@@ -5,8 +5,11 @@ from types import SimpleNamespace as NS
 import pytest
 
 from app.config import Settings
+from app.files import StoredFile
 from app.gateway.base import ModelResult, ProviderError
-from app.gateway.research import ResearchError, ResearchResult, parse_research, search
+from app.gateway.research import (
+    ResearchError, ResearchResult, needs_web_research, parse_research, search, web_research_opted_out,
+)
 from app.gateway.routes import Route, RoutedAdapter
 from app.gateway.registry import ModelRegistry
 from app.models import FinalResult, Judgement, Run
@@ -14,6 +17,48 @@ from app.store.memory import MemoryStore
 from app.verification import check_citations
 from app.workflow.controller import Controller
 from app.workflow.router import PerformanceHistory
+
+
+SMOKE_REQUEST = (
+    "Deployment smoke check: calculate 6 multiplied by 7. Return the numeric answer with one short "
+    "sentence explaining the arithmetic. No web research, code, or extra tasks are needed."
+)
+
+
+@pytest.mark.parametrize("prompt", [
+    SMOKE_REQUEST,
+    "Research my uploaded notes. Do not browse the web.",
+    "Summarize current findings. Don't use external sources.",
+    "Explain the latest design using my notes, without any web research.",
+    "No research is needed. Calculate 6 times 7.",
+    "Research isn't required; use the supplied text.",
+    "Research isn’t necessary for this calculation.",
+    "No need for further research. Use the attachment.",
+    "Skip web search and explain current flow from the diagram.",
+    "Answer with no-web access.",
+])
+def test_explicit_no_web_overrides_keywords_and_research_profile(prompt):
+    assert web_research_opted_out(prompt)
+    assert not needs_web_research(prompt)
+    assert not needs_web_research(prompt, "research")
+
+
+@pytest.mark.parametrize("prompt, profile", [
+    ("Research current evidence with primary sources.", "general"),
+    ("Browse official documentation for the latest release.", "general"),
+    ("Compare the available treatments.", "research"),
+    ("No research exists on this exact topic; search the broader literature.", "general"),
+    ("Do not skip research. Check current sources.", "general"),
+    ("Don't skip web search; find recent sources.", "general"),
+])
+def test_genuine_research_requests_still_search(prompt, profile):
+    assert not web_research_opted_out(prompt)
+    assert needs_web_research(prompt, profile)
+
+
+def test_plain_arithmetic_and_eris_do_not_need_public_search():
+    assert not needs_web_research("Calculate 6 multiplied by 7.")
+    assert not needs_web_research("Research current evidence.", "research", eris=True)
 
 
 def response(grounded=True, finish="STOP"):
@@ -70,6 +115,42 @@ def make_controller():
     registry = ModelRegistry(settings)
     registry.adapters["gemini"] = NS(simulated=False)
     return Controller(settings, registry, MemoryStore(), PerformanceHistory())
+
+
+@pytest.mark.parametrize("with_attachment", [False, True])
+def test_no_web_workflow_skips_search_and_url_fetch_but_keeps_attachments(monkeypatch, with_attachment):
+    from app.gateway import research
+    from app.tools import evidence
+    external_calls = []
+
+    async def forbidden_fetch(*args, **kwargs):
+        external_calls.append("fetch")
+        raise AssertionError("No-web instruction must prevent URL retrieval")
+
+    async def forbidden_search(*args, **kwargs):
+        external_calls.append("search")
+        raise AssertionError("No-web instruction must prevent grounded search")
+
+    monkeypatch.setattr(evidence, "fetch_url", forbidden_fetch)
+    monkeypatch.setattr(research, "search", forbidden_search)
+
+    async def scenario():
+        c = make_controller()
+        attachment = StoredFile(id="notes", name="notes.txt", mime="text/plain", kind="text",
+                                size=11, data=b"6 x 7 is 42", text="6 x 7 is 42")
+        run = Run(request=SMOKE_REQUEST + " Reference: https://example.org/request",
+                  profile="research", materials="Supplied notes: https://example.org/materials")
+        await c._gather_evidence(run, [attachment] if with_attachment else [])
+        assert external_calls == []
+        assert run.usage.calls == 0 and run.usage.total_tokens == 0
+        assert run.research_status == ("supplied_only" if with_attachment else "not_needed")
+        assert not run.search_queries and not run.research_summary
+        assert len(run.evidence) == int(with_attachment)
+        if with_attachment:
+            assert run.evidence[0].source_kind == "attachment"
+            assert run.evidence[0].excerpt == "6 x 7 is 42"
+
+    asyncio.run(scenario())
 
 
 def test_workflow_accounts_grounding_and_does_not_resend_on_resume(monkeypatch):

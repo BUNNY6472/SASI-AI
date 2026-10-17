@@ -95,14 +95,15 @@ PROFILES: dict[str, FieldProfile] = {
             name="General",
             description="Product, business, planning and anything else.",
             planning="Use the smallest set of tasks that covers the request. Run independent parts in parallel.",
-            work="Be concrete and practical. State assumptions.",
+            work="Be concrete, correct, and concise. State only assumptions that materially affect the answer and fit the user's requested format.",
             review_checks=[
                 "Does it fully address the assigned task?",
                 "Is it correct, concrete and internally consistent?",
-                "Are assumptions and risks stated?",
+                "Are any material assumptions or risks made clear, where relevant and compatible with the requested format?",
             ],
-            final_checks=["Request fully addressed", "Clear and actionable", "Assumptions and limitations stated"],
-            output_format="Clear Markdown with headings.",
+            final_checks=["Request fully addressed in the requested format", "Clear and correct",
+                          "Material assumptions or limitations made clear when relevant and compatible with the requested format"],
+            output_format="Use the simplest clear format that fits the answer; headings only when helpful and compatible with the request.",
         ),
     ]
 }

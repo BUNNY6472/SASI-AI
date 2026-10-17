@@ -6,12 +6,50 @@ fetched. Missing grounding metadata means an ungrounded response, not a source.
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from dataclasses import dataclass, field
 from collections.abc import Callable
 from urllib.parse import urlsplit
 
 from .base import ModelResult, ProviderError
+
+
+# Keep routing deterministic: an explicit opt-out takes precedence over a
+# research profile or a keyword such as "current". This is deliberately a
+# small instruction heuristic, not a semantic classifier for every sentence.
+_WEB_ACTIVITY = (
+    r"(?:research|(?:web|online|internet)\s+(?:research|search(?:es|ing)?|browsing)"
+    r"|(?:external|public)\s+(?:research|sources)"
+    r"|brows(?:e|ing)(?:\s+(?:the\s+)?(?:web|internet))?"
+    r"|search(?:es|ing)?(?:\s+(?:the\s+)?(?:web|internet|online))?"
+    r"|(?:the\s+)?(?:web|internet)(?:\s+access)?)\b"
+)
+_WEB_OPT_OUT = tuple(re.compile(pattern, re.I) for pattern in (
+    r"\b(?:do\s+not|don't|never)\s+(?:(?:use|perform|conduct|do|run|access)\s+)?"
+    r"(?:(?:any|the|additional|further)\s+)?" + _WEB_ACTIVITY,
+    r"\bwithout\s+(?:(?:using|doing|performing|conducting)\s+)?"
+    r"(?:(?:any|the|additional|further)\s+)?" + _WEB_ACTIVITY,
+    r"\bno[-\s]+(?:(?:additional|further|extra)\s+)?" + _WEB_ACTIVITY
+    + r"(?=\s*(?:$|[.,;:!?/]|(?:is\s+|are\s+)?(?:needed|required|necessary|allowed)\b))",
+    _WEB_ACTIVITY + r"\s+(?:is\s+not|are\s+not|isn't|aren't|not)\s+(?:needed|required|necessary)\b",
+    r"\bno\s+need\s+(?:for|to)\s+(?:(?:any|the|additional|further)\s+)?" + _WEB_ACTIVITY,
+    r"(?<!not )(?<!n't )\b(?:skip|avoid|omit)\s+(?:using\s+)?(?:(?:any|the|additional|further)\s+)?" + _WEB_ACTIVITY,
+))
+_RESEARCH_SIGNAL = re.compile(r"\b(search|browse|research|latest|today|current|recent|sources|literature)\b", re.I)
+
+
+def web_research_opted_out(request: str) -> bool:
+    """Recognize common explicit instructions against public web access."""
+    text = request.replace("\u2019", "'")
+    return any(pattern.search(text) for pattern in _WEB_OPT_OUT)
+
+
+def needs_web_research(request: str, profile: str = "general", *, eris: bool = False) -> bool:
+    """Select public search only when permitted and requested by profile/text."""
+    if eris or web_research_opted_out(request):
+        return False
+    return profile == "research" or bool(_RESEARCH_SIGNAL.search(request))
 
 
 @dataclass
