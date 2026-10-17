@@ -5,7 +5,9 @@ import time
 import uuid
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
+
+from . import codefile
 
 RunStatus = Literal[
     "analyzing", "cross_checking", "planning", "reviewing_plan", "awaiting_approval", "running", "integrating",
@@ -178,6 +180,14 @@ class Run(BaseModel):
     deadline_at: float | None = None  # when the run must be finished, while the clock runs
     wrapping_up: bool = False
     finished_at: float | None = None
+
+    @computed_field  # saved with the run and sent to the page; the code file in the final result
+    @property
+    def solution(self) -> dict | None:
+        if not self.final or not self.final.output:
+            return None
+        return codefile.find(self.final.output, any_python=self.eris or self.profile == "software",
+                             name="solution.py" if self.eris else "")
 
     @property
     def elapsed_s(self) -> float:

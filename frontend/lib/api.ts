@@ -153,6 +153,8 @@ export interface Run {
   };
   events: RunEvent[];
   error: string | null;
+  /** The code file in the final result (solution.py on Project Eris runs), when there is one. */
+  solution?: { name: string; code: string; lines: number } | null;
   /** Time is the run's limit. The clock pauses while the plan waits for approval. */
   time_limit_s?: number;
   wrap_up_s?: number;

@@ -349,6 +349,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def read_run(run_id: str):
         return get_run(run_id).model_dump(mode="json")
 
+    @app.get("/api/runs/{run_id}/solution")
+    async def download_solution(run_id: str):
+        """The code file in the run's final result (solution.py for Project Eris runs), as a download."""
+        sol = get_run(run_id).solution
+        if not sol:
+            raise HTTPException(404, "This run's result has no code file.")
+        return Response(sol["code"].encode(), media_type="text/x-python; charset=utf-8", headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(sol['name'])}",
+            "Content-Security-Policy": "sandbox; default-src 'none'",
+            "Cache-Control": "no-store",
+        })
+
     @app.post("/api/runs/{run_id}/approve")
     async def approve(run_id: str, body: ApprovePlan | None = None):
         run = get_run(run_id)

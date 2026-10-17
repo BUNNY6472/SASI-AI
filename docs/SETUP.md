@@ -12,6 +12,10 @@ In Cloud Shell (the `>_` icon at the top of the Google Cloud console):
 git clone -b claude/sasi-multi-ai-app-c549ms https://github.com/BUNNY6472/SASI-AI.git && cd SASI-AI && bash deploy/deploy-now.sh
 ```
 
+The repository is private, so Cloud Shell must sign in to GitHub once before `git clone` or `git pull` works. Run `gh auth login` and choose **GitHub.com**, **HTTPS**, **Yes** (authenticate Git) and **Login with a web browser**, then open the link it shows and enter the code. Cloud Shell remembers it.
+
+To redeploy after changes: `cd ~/SASI-AI && git pull && bash deploy/deploy-now.sh`
+
 It sets everything up, builds the app on Cloud Build (inside the free tier), deploys it and prints the link and access code. Do step 1 below too, and step 3 if you want merges to deploy automatically.
 
 ## 1. Protect the budget (2 minutes)
@@ -26,7 +30,7 @@ Alerts only email you; they do not stop spending. The app's own guards also limi
 
 ## 2. Run the setup script in Cloud Shell (5 minutes)
 
-Open Cloud Shell (the `>_` icon at the top of the console), then:
+Open Cloud Shell (the `>_` icon at the top of the console), sign in to GitHub once with `gh auth login` (see above), then:
 
 ```bash
 git clone https://github.com/BUNNY6472/SASI-AI.git

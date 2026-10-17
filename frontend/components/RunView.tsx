@@ -112,7 +112,7 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
           ) : (
             <span className="badge field" title="Chosen automatically from your request">{FIELD_NAME[run.profile] || run.profile}</span>
           )}
-          <h1>{run.request}</h1>
+          <RunQuestion text={run.request} />
         </div>
         <div className="run-actions">
           {run.status === "awaiting_approval" && (
@@ -259,8 +259,9 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
                 <small className="muted">Being tested <span className="typing" /></small>
               ) : null}
             </div>
+            {run.solution && <SolutionFile run={run} />}
             <div className="result-meta">
-              <button className="btn ghost small" onClick={() => navigator.clipboard.writeText(run.final!.output)}>Copy</button>
+              <CopyButton text={run.final.output} label="Copy all" />
             </div>
             <Markdown text={run.final.output} />
           </article>
@@ -342,6 +343,61 @@ function OpinionGrid({ run, opinions, prefix, waiting, empty }: { run: Run; opin
 }
 
 /** The scores JSON at the end of a cross-check is shown as a line under the card, not as raw code. */
+/** The question as a short header, so the run's progress stays in view. The full text opens on request. */
+function RunQuestion({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const long = text.length > 140 || text.trim().includes("\n");
+  return (
+    <div className="run-question">
+      <h1 className={open ? "open" : ""} title={long && !open ? text.slice(0, 600) : undefined}>{text}</h1>
+      {long && (
+        <button className="link-btn" aria-expanded={open} onClick={() => setOpen(!open)}>
+          {open ? "Hide full question" : "Show full question"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Copies text and says so for a moment. */
+function CopyButton({ text, label, primary }: { text: string; label: string; primary?: boolean }) {
+  const [state, setState] = useState<"" | "done" | "failed">("");
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(text);
+      setState("done");
+    } catch {
+      setState("failed");
+    }
+    setTimeout(() => setState(""), 1800);
+  }
+  return (
+    <button className={`btn small ${primary ? "" : "ghost"}`} onClick={copy}>
+      {state === "done" ? "Copied" : state === "failed" ? "Copy failed" : label}
+    </button>
+  );
+}
+
+/** The final code as one file to download or copy (solution.py on Project Eris runs). */
+function SolutionFile({ run }: { run: Run }) {
+  const sol = run.solution!;
+  return (
+    <div className="solution-file">
+      <div className="solution-name">
+        <span className="solution-kind">PY</span>
+        <div>
+          <b>{sol.name}</b>
+          <small className="muted">{sol.lines} lines · the complete final code{run.eris ? ", ready to submit" : ""}</small>
+        </div>
+      </div>
+      <div className="solution-actions">
+        <a className="btn primary small" href={`/api/runs/${run.id}/solution`} download={sol.name}>Download {sol.name}</a>
+        <CopyButton text={sol.code} label="Copy code" />
+      </div>
+    </div>
+  );
+}
+
 function stripScores(text: string): string {
   const at = text.lastIndexOf("```json");
   if (at < 0 || !/"scores"|```json\s*$/.test(text.slice(at))) return text;

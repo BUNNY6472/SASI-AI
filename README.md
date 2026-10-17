@@ -54,7 +54,7 @@ On Cloud Run everything for a run is kept in BigQuery (dataset `sasi_data`): `ru
 A separate switch in the composer, for Project Eris ML challenges. When it is on:
 
 - Every model, on every step, gets the full Eris Solver Guidebook (`backend/app/workflow/eris_guidebook.md`) as rules. The text is sent as a repeated prefix, so the providers cache it.
-- The models are told never to run, or ask for, the full end-to-end training. They deliver one clean `solution.py` with no dry-run flags or switches (the determinism check rejects those), plus separate dry-run steps for a copy of the script.
+- The models are told never to run, or ask for, the full end-to-end training. They deliver one clean `solution.py` with no dry-run flags or switches (the determinism check rejects those), plus separate dry-run steps for a copy of the script. The result page has a **Download solution.py** button (and **Copy code**); the file is taken from the result's `solution.py` block and kept with the run.
 - The side-by-side comparison adds an "Eris rule check" table: every model's answer against each rule (real training in the script, no hardcoding, one end-to-end script, data, libraries, test-set use, determinism, 1.5 hours on an A10G, a complete submission.csv, domain rules).
 - Reviews send back any work that fails a rule, and the final result ends with the rule check, the dry-run steps and the expected runtime.
 - Eris answers may be up to 32,000 tokens per call (plus the same again for thinking), because they carry the guidebook and whole training scripts.

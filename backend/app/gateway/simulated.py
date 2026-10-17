@@ -27,6 +27,33 @@ def persona(provider: str) -> tuple[str, str]:
     return name(provider), ANGLES.get(provider, "a second opinion")
 
 
+# What a Project Eris result ends with: the one solution.py, and the dry-run wrapper to delete before submitting.
+SIMULATED_SOLUTION = """
+
+## solution.py
+```python
+import numpy as np
+
+
+def main():
+    # Simulated solution. Connect real models for a real one.
+    rng = np.random.default_rng(0)
+    print(rng.permutation(24).tolist())
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## dry_run.py
+```python
+import solution
+
+solution.main()
+```
+"""
+
+
 class SimulatedAdapter:
     simulated = True
 
@@ -109,6 +136,7 @@ class SimulatedAdapter:
                 f"# Result\n\n_Simulated output assembled by {name_}. Connect real API keys to get real answers._\n\n"
                 f"**Request:** {request}\n\n"
                 + "\n\n".join(f"## {t}\n{c}" for t, c in call.hints.get("sections", []))
+                + (SIMULATED_SOLUTION if call.rules else "")  # Project Eris runs deliver one solution.py
             )
         return (
             f"_Simulated work by {name_}, focused on {angle}._\n\n"
