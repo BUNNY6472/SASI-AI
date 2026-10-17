@@ -23,10 +23,12 @@ gcloud config set project "$PROJECT_ID" >/dev/null
 PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
 RUNTIME_SA="sasi-runtime@${PROJECT_ID}.iam.gserviceaccount.com"
 DEPLOY_SA="sasi-deployer@${PROJECT_ID}.iam.gserviceaccount.com"
+BUILD_SA="sasi-builder@${PROJECT_ID}.iam.gserviceaccount.com"
 
 echo "== Enabling APIs"
 gcloud services enable run.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com \
-  iamcredentials.googleapis.com iam.googleapis.com sts.googleapis.com bigquery.googleapis.com
+  iamcredentials.googleapis.com iam.googleapis.com sts.googleapis.com bigquery.googleapis.com \
+  cloudbuild.googleapis.com storage.googleapis.com logging.googleapis.com
 
 echo "== Artifact Registry"
 if ! gcloud artifacts repositories describe sasi --location "$REGION" >/dev/null 2>&1; then
@@ -45,11 +47,16 @@ gcloud iam service-accounts describe "$RUNTIME_SA" >/dev/null 2>&1 || \
   gcloud iam service-accounts create sasi-runtime --display-name "SASI app runtime"
 gcloud iam service-accounts describe "$DEPLOY_SA" >/dev/null 2>&1 || \
   gcloud iam service-accounts create sasi-deployer --display-name "SASI GitHub deployer"
+gcloud iam service-accounts describe "$BUILD_SA" >/dev/null 2>&1 || \
+  gcloud iam service-accounts create sasi-builder --display-name "SASI Cloud Build"
 
 bind() { gcloud projects add-iam-policy-binding "$PROJECT_ID" --member "serviceAccount:$1" --role "$2" --condition None >/dev/null; echo "  $2 -> $1"; }
 bind "$RUNTIME_SA" roles/bigquery.dataEditor
 bind "$RUNTIME_SA" roles/bigquery.jobUser
 bind "$RUNTIME_SA" roles/secretmanager.secretAccessor
+bind "$BUILD_SA" roles/artifactregistry.writer
+bind "$BUILD_SA" roles/logging.logWriter
+bind "$BUILD_SA" roles/storage.objectViewer
 bind "$DEPLOY_SA" roles/run.admin
 bind "$DEPLOY_SA" roles/artifactregistry.writer
 bind "$DEPLOY_SA" roles/secretmanager.viewer

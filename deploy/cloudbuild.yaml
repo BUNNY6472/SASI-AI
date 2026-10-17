@@ -1,0 +1,10 @@
+# Builds the SASI image on Google Cloud Build and pushes it to Artifact Registry.
+# Used by deploy/deploy-now.sh. Default machine type, which is inside the free tier.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "${_IMAGE}", "."]
+images:
+  - "${_IMAGE}"
+timeout: 1800s
+options:
+  logging: CLOUD_LOGGING_ONLY

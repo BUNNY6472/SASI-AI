@@ -12,7 +12,7 @@ In Cloud Shell (the `>_` icon at the top of the Google Cloud console):
 git clone -b claude/sasi-multi-ai-app-c549ms https://github.com/BUNNY6472/SASI-AI.git && cd SASI-AI && bash deploy/deploy-now.sh
 ```
 
-It sets everything up, builds the app inside Cloud Shell, deploys it and prints the link and access code. Do step 1 below too, and step 3 if you want merges to deploy automatically.
+It sets everything up, builds the app on Cloud Build (inside the free tier), deploys it and prints the link and access code. Do step 1 below too, and step 3 if you want merges to deploy automatically.
 
 ## 1. Protect the budget (2 minutes)
 
@@ -84,6 +84,7 @@ Where to get keys: Claude at console.anthropic.com, ChatGPT at platform.openai.c
 | Artifact Registry | keeps the 2 newest images | 0.5 GB |
 | Secret Manager | 5 secrets | 6 active versions |
 | BigQuery | run checkpoints | 10 GB storage, 1 TB queries a month |
+| Cloud Build | builds the image when you use deploy-now.sh | 2,500 build-minutes a month |
 
 Streaming rows into BigQuery costs about $0.01 per 200 MB, which is far beyond what this app writes. Model API usage is the main cost, and it is billed by Anthropic, OpenAI and Google AI Studio.
 
