@@ -449,9 +449,15 @@ class Controller:
         return task
 
     async def _drain_checkpoint(self, run: Run) -> None:
-        task = self._heartbeat_tasks.pop(run.id, None)
+        task = self._heartbeat_tasks.get(run.id)
         if task is not None:
-            await asyncio.shield(task)
+            try:
+                await asyncio.shield(task)
+            finally:
+                # A second cancellation must not orphan a still-writing checkpoint.
+                # Shutdown (or the next waiter) retains ownership until it finishes.
+                if task.done() and self._heartbeat_tasks.get(run.id) is task:
+                    self._heartbeat_tasks.pop(run.id, None)
 
     def _notify(self, run: Run) -> None:
         """Wake clients even when durable storage is unavailable; this never claims a save."""
