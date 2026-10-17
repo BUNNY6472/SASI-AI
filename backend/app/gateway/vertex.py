@@ -37,6 +37,20 @@ def _unique(models: list[str]) -> list[str]:
     return [m for m in dict.fromkeys(m.strip() for m in models) if m]
 
 
+def _why(code: int, text: str) -> str:
+    """A plain hint for a refused open-model call."""
+    low = text.lower()
+    if code == 429 or "quota" in low:
+        return (" This Google Cloud project has no quota left for this model; new and free-trial projects can start with"
+                " none. See IAM & Admin > Quotas, or upgrade the billing account.")
+    if "billing" in low or "free trial" in low:
+        return " Google Cloud billing does not allow this model yet: upgrade the free trial to a paid billing account."
+    if code in (401, 403):
+        return (" Check that the app's service account has the Vertex AI User role, and that the model's API Service"
+                f" card in Model Garden ({GARDEN}) is open to this project.")
+    return ""
+
+
 def _not_found(provider: str, tried: list[str], detail: str) -> ProviderError:
     return ProviderError(provider, f"HTTP 404: none of {', '.join(tried)} can be used by this project on Vertex AI. "
                                    f"{_hint(provider)}. ({detail[:160]})")
@@ -199,20 +213,30 @@ class VertexOpenModelAdapter:
             raise ProviderError(self.provider, f"could not sign in to Google Cloud: {type(e).__name__}: {e}") from e
 
     async def list_models(self) -> list[str]:
-        detail = ""
+        """Use the newest model ID this project can call, trying each one in every location. A model that is
+        missing, refused or out of quota in one place does not stop the next one being tried; if none works,
+        the error says which model and location refused and why."""
+        detail, refused = "", None
         for m, loc in self._candidates:
             client = await self._signed(loc)
             try:
-                await client.chat.completions.create(model=m, messages=[{"role": "user", "content": "Say OK."}], max_tokens=16)
-            except (openai.NotFoundError, openai.BadRequestError) as e:
-                if isinstance(e, openai.BadRequestError) and "not found" not in str(e).lower() and "not supported" not in str(e).lower():
-                    raise ProviderError(self.provider, f"HTTP {e.status_code}: {e.message}") from e
-                detail = e.message
-                continue
+                await client.chat.completions.create(model=m, messages=[{"role": "user", "content": "Say OK."}], max_tokens=64)
             except openai.APIStatusError as e:
-                raise ProviderError(self.provider, f"HTTP {e.status_code}: {e.message}") from e
+                text = str(e.message)
+                if e.status_code == 404 or (e.status_code == 400 and ("not found" in text.lower() or "not supported" in text.lower())):
+                    detail = text
+                else:
+                    refused = refused or (m, loc, e.status_code, text)
+                continue
+            except openai.APIConnectionError as e:
+                refused = refused or (m, loc, 0, f"could not connect: {e}")
+                continue
             self._model, self._location = m, loc
             return [m]
+        if refused:
+            m, loc, code, text = refused
+            raise ProviderError(self.provider, f"HTTP {code}: {m} ({loc}) refused the request.{_why(code, text)} "
+                                               f"Google Cloud said: {text[:300]}", retryable=code == 429 or code >= 500)
         raise _not_found(self.provider, _unique([m for m, _ in self._candidates]), detail)
 
     async def resolve_model(self) -> str:

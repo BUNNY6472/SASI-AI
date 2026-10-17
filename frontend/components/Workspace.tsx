@@ -116,12 +116,22 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
         </p>
         <div className="agents-row">
           {providers.map((p) => (
-            <span key={p.provider} className="agent-pill">
+            <span key={p.provider} className={p.ok === false ? "agent-pill bad" : "agent-pill"} title={p.ok === false ? p.error || undefined : undefined}>
               <AgentChip id={p.provider} />
-              <small>{p.connected ? (p.ok === false ? "error" : p.via === "vertex" ? "Google Cloud" : "connected") : "no key"}</small>
+              <small>{p.connected ? (p.ok === false ? "not working" : p.via === "vertex" ? "Google Cloud" : "connected") : "no key"}</small>
             </span>
           ))}
         </div>
+        {providers.some((p) => p.connected && p.ok === false) && (
+          <div className="model-errors">
+            {providers.filter((p) => p.connected && p.ok === false).map((p) => (
+              <p key={p.provider} className="small">
+                <b>{p.display_name}:</b> <span className="error">{p.error || "the last check failed."}</span>
+              </p>
+            ))}
+            <p className="small muted">Runs go ahead with the models that work. <a href="#/settings">Connections</a> has Check again.</p>
+          </div>
+        )}
       </section>
 
       {needsKeys && (

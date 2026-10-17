@@ -368,3 +368,7 @@ details summary { cursor: pointer; color: var(--accent-2); font-size: 13px; }
 .route.good { border-color: rgba(61, 220, 151, 0.35); }
 .route.good em { color: var(--ok); }
 .route.bad { border-color: rgba(255, 107, 139, 0.35); }
+.agent-pill.bad { border-color: rgba(255, 107, 139, 0.45); }
+.model-errors { margin: 12px 0 0; max-width: 760px; text-align: left; display: grid; gap: 4px; padding: 10px 14px;
+  border-radius: 12px; border: 1px solid rgba(255, 107, 139, 0.35); background: rgba(24, 10, 34, 0.88); backdrop-filter: blur(8px); overflow-wrap: anywhere; }
+.model-errors p { margin: 0; }

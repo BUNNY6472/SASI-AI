@@ -21,7 +21,7 @@ def _plain(e: Exception) -> str:
     """The error without the "claude: " prefix, since the screen already says which model it is."""
     msg = str(e) or type(e).__name__
     prefix = f"{getattr(e, 'provider', '')}: "
-    return (msg[len(prefix):] if prefix != ": " and msg.startswith(prefix) else msg)[:300]
+    return (msg[len(prefix):] if prefix != ": " and msg.startswith(prefix) else msg)[:700]
 
 
 def lasting_problem(message: str) -> bool:
@@ -77,7 +77,7 @@ class RoutedAdapter:
             st.update(ok=True, model=a.model, via=a.via)
         elif all(r.ok is False for r in self.routes):
             st.update(ok=False, model=None, via=None,
-                      error="; ".join(f"{VIA[r.via]}: {r.error}" for r in self.routes if r.error)[:400])
+                      error="; ".join(f"{VIA[r.via]}: {r.error}" for r in self.routes if r.error)[:900])
         return st
 
     async def list_models(self) -> list[str]:

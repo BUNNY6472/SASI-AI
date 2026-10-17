@@ -191,6 +191,50 @@ def test_open_model_on_vertex_uses_the_openai_compatible_endpoint(monkeypatch):
     assert "chart.png" in body["messages"][1]["content"], "a text-only model is told about files it cannot open"
 
 
+def test_an_open_model_that_is_refused_falls_back_and_otherwise_says_why(monkeypatch):
+    import google.auth
+    import openai
+
+    from app.gateway import vertex
+
+    class Creds:
+        valid, token = True, "t"
+
+    monkeypatch.setattr(google.auth, "default", lambda scopes=None: (Creds(), "p"))
+    answers = {}
+
+    def handler(req: httpx2.Request) -> httpx2.Response:
+        body = json.loads(req.content)
+        code, message = answers.get(body["model"], (200, ""))
+        if code != 200:
+            return httpx2.Response(code, json={"error": {"code": code, "message": message}})
+        return httpx2.Response(200, json={
+            "id": "c", "object": "chat.completion", "created": 1, "model": body["model"],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+
+    real = openai.AsyncOpenAI
+    monkeypatch.setattr(openai, "AsyncOpenAI", lambda **kw: real(
+        **{**kw, "max_retries": 0}, http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler))))
+
+    def adapter():
+        return vertex.VertexOpenModelAdapter("glm", "GLM", "p", ["zai-org/glm-5.2-maas", "zai-org/glm-5-maas"], ["global"])
+
+    answers["zai-org/glm-5.2-maas"] = (403, "Permission denied: this experimental model is not open to the project")
+    assert run(adapter().resolve_model()) == "zai-org/glm-5-maas", "a refused model does not stop the next one"
+
+    answers["zai-org/glm-5-maas"] = (429, "Quota exceeded for aiplatform.googleapis.com/online_prediction_requests_per_base_model")
+    with pytest.raises(ProviderError) as e:
+        run(adapter().resolve_model())
+    msg = str(e.value)
+    assert "HTTP 403" in msg and "zai-org/glm-5.2-maas (global)" in msg and "experimental model" in msg, "the first refusal is shown"
+    assert "Vertex AI User" in msg
+
+    answers["zai-org/glm-5.2-maas"] = (429, "Quota exceeded")
+    with pytest.raises(ProviderError) as e:
+        run(adapter().resolve_model())
+    assert "HTTP 429" in str(e.value) and "quota" in str(e.value).lower() and e.value.retryable
+
+
 def test_deepseek_gets_images_inline_and_falls_back_to_text_if_they_are_refused(monkeypatch):
     import google.auth
     import openai

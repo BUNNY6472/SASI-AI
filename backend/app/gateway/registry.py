@@ -172,7 +172,7 @@ class ModelRegistry:
             model = await asyncio.wait_for(adapter.resolve_model(), timeout=timeout)
             return name_, {"ok": True, "model": model, "simulated": adapter.simulated}
         except Exception as e:  # noqa: BLE001 - surfaced to the UI
-            return name_, {"ok": False, "model": None, "simulated": adapter.simulated, "error": str(e)[:300]}
+            return name_, {"ok": False, "model": None, "simulated": adapter.simulated, "error": str(e)[:700]}
 
     async def refresh(self) -> dict[str, dict]:
         results = await asyncio.gather(*(self._check(n, a) for n, a in self.adapters.items()))
@@ -189,7 +189,7 @@ class ModelRegistry:
     def mark_failed(self, provider: str, error: str) -> None:
         """Every way to reach this model failed during a run: skip it until it passes a check again."""
         if provider in self.adapters:
-            self.status[provider] = {**self.status.get(provider, {}), "ok": False, "error": error[:300]}
+            self.status[provider] = {**self.status.get(provider, {}), "ok": False, "error": error[:700]}
 
     async def recheck_failed(self, timeout: float = 12) -> None:
         """Before a run, check the models that failed (a fixed key or setting is used again) and the ones not
