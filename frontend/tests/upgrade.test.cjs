@@ -26,12 +26,13 @@ function load(relative) {
   vm.runInThisContext(`(function(require,module,exports){${output}\n})`, { filename: target })(localRequire, module, module.exports);
   return module.exports;
 }
-const { uploadFile, committedBytes, validateAttachment } = load("lib/uploads.ts");
+const { uploadFile, committedBytes, validateAttachment, uploadSettings } = load("lib/uploads.ts");
 const UsageDetails = load("components/UsageDetails.tsx").default;
 const FileCoverage = load("components/FileCoverage.tsx").default;
 const GiB = 1024 ** 3;
 const MiB = 1024 ** 2;
-const limits = { max_run_bytes: 2 * GiB, max_file_bytes: 2 * GiB, max_files_per_run: 20, resumable_uploads: true };
+const limits = { max_run_bytes: 10 * GiB, max_file_bytes: 10 * GiB, max_files_per_run: 20, resumable_uploads: true, upload_storage: "cloud" };
+const localLimits = { ...limits, max_run_bytes: 60 * MiB, max_file_bytes: 25 * MiB, raw_upload_max_bytes: 25 * MiB, resumable_uploads: false, upload_storage: "local" };
 const file = (size) => ({ name: "data.csv", size, type: "text/csv", slice(start, end) { return { size: end - start }; } });
 const session = { id: "upload1", upload_url: "https://storage.googleapis.com/bucket/private-session", chunk_size: 8 * MiB };
 const ref = { id: "upload1", name: "data.csv", size: 20 * MiB, mime: "text/csv", kind: "text", preview_complete: false, preview_bytes: 2 * MiB, coverage_note: "A bounded prefix was examined; full-file coverage is not established.", storage: "cloud" };
@@ -65,13 +66,45 @@ function mocks(handler, fetchHandler) {
   return { requests, apiCalls, restore() { global.fetch = beforeFetch; global.XMLHttpRequest = beforeXHR; } };
 }
 
-test("2 GiB aggregate boundary, single file and file count are enforced before upload", () => {
-  assert.equal(validateAttachment(file(2 * GiB), 0, 0, limits), null);
-  assert.match(validateAttachment(file(2 * GiB + 1), 0, 0, limits), /per-file limit/);
-  assert.match(validateAttachment(file(1), 2 * GiB, 1, limits), /in total/);
+test("10 GiB aggregate boundary, single file and file count follow confirmed server limits", () => {
+  assert.equal(validateAttachment(file(10 * GiB), 0, 0, limits), null);
+  assert.equal(validateAttachment(file(6 * GiB), 4 * GiB, 1, limits), null);
+  assert.match(validateAttachment(file(10 * GiB + 1), 0, 0, limits), /per-file limit/);
+  assert.match(validateAttachment(file(1), 10 * GiB, 1, limits), /in total/);
   assert.match(validateAttachment(file(1), 0, 20, limits), /20 files/);
   assert.match(validateAttachment(file(0), 0, 0, limits), /empty/);
-  assert.match(validateAttachment(file(26 * MiB), 0, 0, { ...limits, resumable_uploads: false }), /per-file limit/);
+  assert.match(validateAttachment(file(26 * MiB), 0, 0, localLimits), /per-file limit/);
+  assert.equal(validateAttachment(file(33 * MiB), 0, 0, limits), null);
+});
+
+test("unknown, invalid, and disabled cloud settings never silently choose a raw limit", async () => {
+  const m = mocks(() => assert.fail("No upload can begin without confirmed settings"));
+  try {
+    assert.equal(uploadSettings(null), null);
+    for (const unknown of [
+      {}, { ...limits, max_run_bytes: undefined }, { ...limits, max_file_bytes: NaN },
+      { ...limits, max_files_per_run: 0 }, { ...limits, resumable_uploads: undefined },
+      { ...limits, resumable_uploads: false }, { ...localLimits, upload_storage: undefined },
+      { ...localLimits, raw_upload_max_bytes: undefined },
+    ]) {
+      assert.equal(uploadSettings(unknown), null);
+      assert.match(validateAttachment(file(33 * MiB), 0, 0, unknown), /settings are unavailable/);
+      await assert.rejects(uploadFile(file(33 * MiB), unknown, new AbortController().signal, () => {}), /settings are unavailable/);
+    }
+    assert.equal(m.apiCalls.length, 0);
+    assert.equal(m.requests.length, 0);
+  } finally { m.restore(); }
+});
+
+test("only an explicitly local store can use the small direct-upload transport", async () => {
+  const m = mocks((xhr) => xhr.respond(200, null, JSON.stringify(ref)));
+  try {
+    await uploadFile(file(20 * MiB), localLimits, new AbortController().signal, () => {});
+    assert.equal(m.requests[0].url, "/api/files");
+    assert.equal(m.requests[0].method, "POST");
+    assert.equal(m.requests[0].withCredentials, true);
+    assert.equal(m.apiCalls.length, 0);
+  } finally { m.restore(); }
 });
 
 test("only valid committed ranges can advance progress", () => {
@@ -96,8 +129,8 @@ test("large files use bounded slices, cloud requests omit cookies, and completio
   } finally { m.restore(); }
 });
 
-test("a 2 GiB file is sliced without reading it into memory", async () => {
-  const total = 2 * GiB;
+test("a 10 GiB file is sliced without reading it into memory", async () => {
+  const total = 10 * GiB;
   const m = mocks((xhr) => {
     const match = /bytes (\d+)-(\d+)\/(\d+)/.exec(xhr.headers["Content-Range"]);
     assert.ok(match);
@@ -106,7 +139,7 @@ test("a 2 GiB file is sliced without reading it into memory", async () => {
   });
   try {
     await uploadFile(file(total), limits, new AbortController().signal, () => {});
-    assert.equal(m.requests.length, 256);
+    assert.equal(m.requests.length, 1280);
     assert.ok(m.requests.every((request) => request.body.size === 8 * MiB));
   } finally { m.restore(); }
 });
@@ -184,4 +217,11 @@ test("coverage describes a stored original separately from its limited preview",
   assert.match(html, /does not mean the models inspected every byte/);
   const historical = renderToStaticMarkup(React.createElement(FileCoverage, { files: [{ id: "old", name: "old.csv", size: 100 }] }));
   assert.match(historical, /coverage was not recorded/);
+});
+
+test("ZIP coverage keeps server evidence and describes large-archive inspection limits", () => {
+  const html = renderToStaticMarkup(React.createElement(FileCoverage, { files: [{ ...ref, name: "research.ZIP", mime: "application/octet-stream", kind: "other" }] }));
+  assert.match(html, /A bounded prefix was examined/);
+  assert.match(html, /Large ZIP archives are stored unchanged/);
+  assert.match(html, /member files are not automatically inspected/);
 });

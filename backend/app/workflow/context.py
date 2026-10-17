@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import replace
 
 from .. import extract
@@ -33,7 +34,9 @@ STOP_WORDS = frozenset("the and for are with this that from have has into your t
                        "not but these those then than also other must content answer work original".split())
 CONSTRAINT = re.compile(r"\b(?:must|shall|required|never|prohibited|forbidden|do not|cannot|not allowed|"
                         r"maximum|minimum|constraint|submission|acceptance|target|metric)\b", re.I)
-WORDS = re.compile(r"[\w.-]{3,}", re.UNICODE)
+WORDS = re.compile(r"\b\w+(?:[.-]\w+)*\b", re.UNICODE)
+NEIGHBOR_CHARS = 180
+MAX_RELEVANT_PASSAGES = 8
 
 # A bounded cache of small reports avoids re-profiling legacy raw CSV previews
 # on every call. Keys retain no source text or file bytes.
@@ -41,7 +44,12 @@ _legacy_reports: OrderedDict[tuple, str] = OrderedDict()
 
 
 def _terms(query: str) -> set[str]:
-    return {w.lower() for w in WORDS.findall(query[:80_000]) if w.lower() not in STOP_WORDS}
+    return set(_tokens(query[:80_000]))
+
+
+def _tokens(text: str) -> list[str]:
+    return [w.lower() for w in WORDS.findall(text)
+            if (len(w) >= 3 or any(c.isdigit() for c in w)) and w.lower() not in STOP_WORDS]
 
 
 def _prepared_text(f: StoredFile) -> str:
@@ -67,12 +75,176 @@ def _chunks(text: str) -> list[tuple[int, int]]:
     while start < len(text):
         end = min(len(text), start + CHUNK_CHARS)
         if end < len(text):
-            newline = text.rfind("\n", start + CHUNK_CHARS // 2, end)
+            # Prefer section/paragraph boundaries, then a line boundary, so a
+            # passage rarely starts halfway through a heading or table row.
+            newline = text.rfind("\n\n", start + CHUNK_CHARS // 3, end)
+            if newline < 0:
+                newline = text.rfind("\n", start + CHUNK_CHARS // 2, end)
             if newline >= 0:
                 end = newline + 1
         chunks.append((start, end))
         start = end
     return chunks
+
+
+def _passage_scores(text: str, chunks: list[tuple[int, int]], terms: set[str]) -> list[float]:
+    """BM25 lexical scores within this preview; no learned reranker is claimed.
+
+    Saturation limits repeated keywords' influence and IDF favors informative
+    terms. This adapts retrieve-then-select competition pipelines to CPU-only
+    operation; their trained cross-encoders are not reproduced here.
+    """
+    counts = [Counter(_tokens(text[start:end])) for start, end in chunks]
+    lengths = [sum(row.values()) for row in counts]
+    average = sum(lengths) / max(1, len(lengths)) or 1
+    frequencies = Counter(term for row in counts for term in row.keys() & terms)
+    size = len(chunks)
+    scores = []
+    for row, length in zip(counts, lengths):
+        denominator = 1.2 * (0.25 + 0.75 * length / average)
+        score = 0.0
+        for term in sorted(row.keys() & terms):
+            frequency = frequencies[term]
+            idf = math.log1p((size - frequency + 0.5) / (frequency + 0.5))
+            score += idf * row[term] * 2.2 / (row[term] + denominator)
+        scores.append(score)
+    return scores
+
+
+def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    result: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if result and start <= result[-1][1]:
+            result[-1] = (result[-1][0], max(end, result[-1][1]))
+        else:
+            result.append((start, end))
+    return result
+
+
+def _coverage_order(indices: list[int]) -> list[int]:
+    """Visit the opening, end, middle and successively smaller gaps."""
+    ordered = sorted(indices)
+    if len(ordered) <= 2:
+        return ordered
+    result = [ordered[0], ordered[-1]]
+    gaps = [(1, len(ordered) - 2)]
+    while gaps:
+        next_gaps = []
+        for left, right in gaps:
+            if left > right:
+                continue
+            middle = (left + right) // 2
+            result.append(ordered[middle])
+            next_gaps.extend(((left, middle - 1), (middle + 1, right)))
+        gaps = next_gaps
+    return result
+
+
+def select_source_excerpt(text: str, query: str = "", max_chars: int = 8000) -> str:
+    """Return exact small inputs or a bounded, provenance-preserving selection.
+
+    Ranges are 1-based inclusive character positions in ``text``, never byte
+    ranges or page numbers. Original content is not paraphrased. A no-match
+    query falls back to broad source coverage; empty budgets return empty text.
+    Duplicate removal is byte-for-byte exact, so negations, numbers, identifier
+    case and code whitespace cannot silently turn different claims into one.
+    """
+    max_chars = max(0, max_chars)
+    if len(text) <= max_chars:
+        return text
+    if not max_chars:
+        return ""
+    chunks = _chunks(text)
+    terms = _terms(query)
+    scores = _passage_scores(text, chunks, terms)
+    matched = any(score > 0 for score in scores)
+    strongest = max(scores, default=0)
+    # An enormous task transcript is not a focused retrieval query. Prefer
+    # broad coverage over aggressively treating its incidental words as intent.
+    focused = matched and strongest >= 0.5 and len(terms) <= 96
+    note = ("\n[Excerpts only; original character ranges are shown. "
+            + ("Selected relevant passages with neighboring context; " if focused else
+               "No strong focused match; broad coverage fallback; ")
+            + "exact duplicate passages appear once with range aliases. Omitted content, including possible "
+              "constraints, is not verified. This is not a complete inspection.]")
+    if max_chars < len(note) + 100:
+        # Even a tiny budget stays honest; do not provide a deceptively complete
+        # unlabelled prefix when no provenance/coverage note can fit.
+        return "[Source excerpt omitted: insufficient context budget; original retained.]"[:max_chars]
+
+    # Canonical byte-identical chunks plus their original locations. No fuzzy
+    # similarity merging: a changed number or 'not' must remain distinct.
+    groups: dict[str, list[int]] = {}
+    for index, (start, end) in enumerate(chunks):
+        fingerprint = hashlib.sha256(text[start:end].encode()).hexdigest()
+        groups.setdefault(fingerprint, []).append(index)
+    canonical = {indices[0]: indices for indices in groups.values()}
+    ranked = sorted(canonical, key=lambda i: (-scores[i], i))
+    constraints = [i for i in ranked if CONSTRAINT.search(text[chunks[i][0]:chunks[i][1]])]
+    relevant = [i for i in ranked if scores[i] >= max(0.5, strongest * 0.18)] if focused else ranked
+    # Retain opening/schema and the strongest evidence before broad constraints
+    # consume the budget. Constraint-bearing passages are never subject to the
+    # top-k stopping rule; all still obey the caller's hard character budget.
+    order = (list(dict.fromkeys([0] + relevant[:2] + constraints + relevant[:MAX_RELEVANT_PASSAGES])) if focused
+             else list(dict.fromkeys([0] + constraints + (ranked[:2] if matched else [])
+                                     + _coverage_order(list(canonical)))))
+    selected: list[int] = []
+    ranges: list[tuple[int, int]] = []
+
+    def render(indices: list[int], intervals: list[tuple[int, int]]) -> str:
+        blocks = []
+        for start, end in _merge_ranges(intervals):
+            aliases = []
+            for i in indices:
+                a, b = chunks[i]
+                overlap_start, overlap_end = max(start, a), min(end, b)
+                if overlap_start < overlap_end:
+                    aliases.extend((chunks[other][0] + overlap_start - a, chunks[other][0] + overlap_end - a)
+                                   for other in canonical.get(i, [i])[1:])
+            label = f"\n[preview characters {start + 1}-{end}"
+            if aliases:
+                label += "; identical passages also at " + ", ".join(f"{a + 1}-{b}" for a, b in aliases[:4])
+                if len(aliases) > 4:
+                    label += f" (+{len(aliases) - 4} further occurrences)"
+            blocks.append(label + "]\n" + text[start:end])
+        return "".join(blocks) + note
+
+    for index in order:
+        if selected and max_chars - len(render(selected, ranges)) < 160:
+            break
+        start, end = chunks[index]
+        expanded = (max(0, start - NEIGHBOR_CHARS), min(len(text), end + NEIGHBOR_CHARS))
+        if index == 0 and len(chunks) > 2 and (not focused or (relevant and relevant[0] != 0)):
+            # Small per-source budgets must not spend everything on the opening
+            # and miss the late fact that retrieval actually found.
+            expanded = (0, min(end, max(120, min(500, (max_chars - len(note)) // 6))))
+        candidate = render(selected + [index], ranges + [expanded])
+        if len(candidate) <= max_chars:
+            selected.append(index)
+            ranges.append(expanded)
+            continue
+        # First drop neighboring expansion, then shorten around the most
+        # specific matched term. This matters when a global evidence budget is
+        # divided among several sources and each receives less than one chunk.
+        plain = render(selected + [index], ranges + [(start, end)])
+        if len(plain) <= max_chars:
+            selected.append(index)
+            ranges.append((start, end))
+            continue
+        available = max_chars - len(render(selected, ranges)) - 100
+        if available >= 160:
+            piece = text[start:end]
+            counts = Counter(_tokens(piece))
+            hits = [(counts[m.group().lower()], -int(any(c.isdigit() for c in m.group())),
+                     -len(m.group()), m.start()) for m in WORDS.finditer(piece) if m.group().lower() in terms]
+            center = start + min(hits)[-1] if hits else start
+            narrow_start = max(start, min(max(start, end - available), center - available // 3))
+            narrow = (narrow_start, min(end, narrow_start + available))
+            candidate = render(selected + [index], ranges + [narrow])
+            if len(candidate) <= max_chars:
+                selected.append(index)
+                ranges.append(narrow)
+    return render(selected, ranges)[:max_chars]
 
 
 def _metadata(f: StoredFile, length: int) -> str:
@@ -91,43 +263,14 @@ def _excerpt(f: StoredFile, text: str, budget: int, query_terms: set[str]) -> st
         return meta + "Complete stored preview below; any extraction sampling limits still apply.\n" + text
 
     code = extract.ext_of(f.name) in CODE_EXTENSIONS
-    note = ("\n[Excerpts only: omitted material remains in the original file. Selection is deterministic lexical "
-            "relevance plus opening and constraint-bearing chunks; it is not a complete inspection. "
-            "Do not infer absent details or whole-file correctness."
-            + (" Code is incomplete here; obtain the complete file before validating or rewriting it." if code else "") + "]")
+    note = ("\n[Code is incomplete here; obtain the complete file before validating or rewriting it.]" if code else "")
     room = budget - len(meta) - len(note)
     if room < 120:
         fallback = (f"Source {json.dumps(f.id)} {json.dumps(f.name)} ({f.size:,} bytes): source content omitted by "
                     "this stage's context budget. Original retained; no full-file inspection is established.")
         return fallback[:budget]
 
-    chunks = _chunks(text)
-    ranked = []
-    for index, (start, end) in enumerate(chunks):
-        piece = text[start:end]
-        hits = len(_terms(piece) & query_terms)
-        # Include the source's coverage/schema opening. Constraint-bearing
-        # chunks survive even when the user's phrasing differs from the source.
-        score = hits * 4 + min(3, len(CONSTRAINT.findall(piece))) * 3
-        if index == 0:
-            score += 1000
-        ranked.append((-score, index, start, end))
-    selected = []
-    for _, index, start, end in sorted(ranked):
-        label = f"\n[Source {f.id}, preview characters {start + 1}-{end}]\n"
-        needed = len(label) + end - start
-        if needed <= room:
-            selected.append((start, label + text[start:end]))
-            room -= needed
-        elif not selected and room > len(label) + 80:
-            end = start + room - len(label) - 16
-            label = f"\n[Source {f.id}, preview characters {start + 1}-{end}]\n"
-            selected.append((start, label + text[start:end]))
-            room = 0
-        if room < 100:
-            break
-    # Source order makes the remaining references and code fragments legible.
-    result = meta + "".join(s for _, s in sorted(selected)) + note
+    result = meta + select_source_excerpt(text, " ".join(sorted(query_terms)), room) + note
     return result[:budget]
 
 
@@ -145,9 +288,27 @@ def compact_attachments(files: list[StoredFile], kind: str, query: str = "") -> 
     if not text_files:
         return list(files)
 
+    aliases: dict[int, int] = {}
+    seen: dict[bytes, tuple[int, str]] = {}
+    by_index = {i: f for i, f, _ in text_files}
+    for i, f, text in text_files:
+        if not text or extract.ext_of(f.name) in CODE_EXTENSIONS:
+            continue  # Keep complete small source-code files unchanged.
+        fingerprint = hashlib.sha256(text.encode()).digest()
+        previous = seen.get(fingerprint)
+        if previous is not None and previous[1] == text:
+            aliases[i] = previous[0]
+        else:
+            seen[fingerprint] = (i, text)
+
+    def duplicate_note(i: int) -> str:
+        return (f"Extracted preview is byte-for-byte identical to source file ID {json.dumps(by_index[aliases[i]].id)}; "
+                "see its selected context above. This does not establish identical original files or full-data inspection.")
+
     # Every attached text file gets a reference. Give short files their complete
     # preview, then spend the remainder on relevant longer files.
-    desired = {i: min(PER_FILE_CHARS, len(text) + len(_metadata(f, len(text))) + 80)
+    desired = {i: min(PER_FILE_CHARS, (len(duplicate_note(i)) if i in aliases else len(text) + 80)
+                     + len(_metadata(f, len(text))))
                for i, f, text in text_files}
     fair = max(1, budget // len(text_files))
     allocations = {i: min(fair, desired[i]) for i, _, _ in text_files}
@@ -161,5 +322,7 @@ def compact_attachments(files: list[StoredFile], kind: str, query: str = "") -> 
         spare -= addition
     copies = list(files)
     for i, f, text in text_files:
-        copies[i] = replace(f, text=_excerpt(f, text, allocations[i], terms))
+        selected = ((_metadata(f, len(text)) + duplicate_note(i))[:allocations[i]] if i in aliases
+                    else _excerpt(f, text, allocations[i], terms))
+        copies[i] = replace(f, text=selected)
     return copies

@@ -11,7 +11,8 @@ import {
   RunSummary,
   StagedUpload,
 } from "@/lib/api";
-import { DEFAULT_FILE_COUNT, DEFAULT_RUN_FILE_BYTES, uploadFile, UploadStatus, validateAttachment } from "@/lib/uploads";
+import { uploadFile, uploadSettings, UPLOAD_SETTINGS_UNAVAILABLE, UploadStatus, validateAttachment } from "@/lib/uploads";
+import { isZipArchive, ZIP_COVERAGE_NOTE } from "@/lib/file-coverage";
 import { AgentChip, StatusBadge, fmt, timeAgo } from "./ui";
 import Icon from "./Icon";
 import { researchTitle } from "@/lib/research-title";
@@ -85,6 +86,9 @@ export default function Workspace({
   const [mode, setMode] = useState<Mode>("adaptive");
   const [minutes, setMinutes] = useState(120);
   const [limits, setLimits] = useState<RunLimits | null>(null);
+  const [limitsLoading, setLimitsLoading] = useState(true);
+  const [limitsError, setLimitsError] = useState("");
+  const limitsRequest = useRef<Promise<RunLimits | null> | null>(null);
   const [files, setFiles] = useState<Attachment[]>([]);
   const [inventoryLoading, setInventoryLoading] = useState(true);
   const [inventoryUnavailable, setInventoryUnavailable] = useState(false);
@@ -102,12 +106,38 @@ export default function Workspace({
   const failedUploads = files.some((f) => f.error);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const fileLimits = uploadSettings(limits);
+
+  function refreshUploadLimits(): Promise<RunLimits | null> {
+    if (limitsRequest.current) return limitsRequest.current;
+    setLimitsLoading(true);
+    setLimitsError("");
+    const pending = api<RunLimits>("/api/limits", { cache: "no-store", signal: AbortSignal.timeout(15_000) })
+      .then((value) => {
+        if (mounted.current) {
+          setLimits(value);
+          setLimitsError(uploadSettings(value) ? "" : UPLOAD_SETTINGS_UNAVAILABLE);
+        }
+        return uploadSettings(value) ? value : null;
+      })
+      .catch(() => {
+        if (mounted.current) {
+          setLimits(null);
+          setLimitsError("Upload limits could not be loaded. Retry settings, or save your question text and refresh the page.");
+        }
+        return null;
+      })
+      .finally(() => {
+        limitsRequest.current = null;
+        if (mounted.current) setLimitsLoading(false);
+      });
+    limitsRequest.current = pending;
+    return pending;
+  }
 
   useEffect(() => {
     let ignore = false;
-    api<RunLimits>("/api/limits")
-      .then((value) => { if (!ignore) setLimits(value); })
-      .catch(() => { if (!ignore) setError("Upload limits could not be loaded. Refresh the page to retry."); });
+    refreshUploadLimits();
     try {
       setEris(localStorage.getItem("sasi.eris") === "1");
     } catch {}
@@ -177,7 +207,7 @@ export default function Workspace({
     while (mounted.current && controllers.current.size < 2 && uploadQueue.current.length) {
       const key = uploadQueue.current.shift()!;
       const file = fileObjects.current.get(key);
-      if (!file || removed.current.has(key)) continue;
+      if (!file || removed.current.has(key) || controllers.current.has(key)) continue;
       const controller = new AbortController();
       controllers.current.set(key, controller);
       uploadFile(file, uploadLimits, controller.signal, (state) => patchFile(key, state))
@@ -199,15 +229,16 @@ export default function Workspace({
         });
     }
   }
-  function addFiles(list: FileList | null) {
+  async function addFiles(list: FileList | null) {
     if (!list || busy || inventoryLoading || inventoryUnavailable) return;
-    if (!limits) {
-      setError("Upload limits are still loading. Try again shortly.");
-      return;
-    }
+    const selected = Array.from(list);
+    if (!selected.length) return;
+    // An open tab may span a deployment. Validate against fresh server limits.
+    const currentLimits = await refreshUploadLimits();
+    if (!currentLimits || !mounted.current) return;
     const errors: string[] = [];
-    for (const file of Array.from(list)) {
-      const problem = validateAttachment(file, filesRef.current.reduce((sum, f) => sum + f.size, 0), filesRef.current.length, limits);
+    for (const file of selected) {
+      const problem = validateAttachment(file, filesRef.current.reduce((sum, f) => sum + f.size, 0), filesRef.current.length, currentLimits);
       if (problem) { errors.push(problem); continue; }
       const key = crypto.randomUUID();
       fileObjects.current.set(key, file);
@@ -215,13 +246,19 @@ export default function Workspace({
       uploadQueue.current.push(key);
     }
     setError([...new Set(errors)].join(" "));
-    pumpUploads(limits);
+    pumpUploads(currentLimits);
   }
-  function retryFile(a: Attachment) {
-    if (!limits || busy || controllers.current.has(a.key)) return;
+  async function retryFile(a: Attachment) {
+    if (busy || controllers.current.has(a.key) || limitsLoading) return;
+    const currentLimits = await refreshUploadLimits();
+    const file = fileObjects.current.get(a.key);
+    if (!currentLimits || !file || !mounted.current || removed.current.has(a.key)) return;
+    const otherFiles = filesRef.current.filter((f) => f.key !== a.key);
+    const problem = validateAttachment(file, otherFiles.reduce((sum, f) => sum + f.size, 0), otherFiles.length, currentLimits);
+    if (problem) { patchFile(a.key, { error: problem }); return; }
     patchFile(a.key, { status: "queued", error: undefined, progress: 0 });
     uploadQueue.current.push(a.key);
-    pumpUploads(limits);
+    pumpUploads(currentLimits);
   }
   function removeFile(a: Attachment) {
     if (busy) return;
@@ -240,7 +277,7 @@ export default function Workspace({
   }
   async function submit(e: FormEvent) {
     e.preventDefault();
-    if (busy || uploading || inventoryLoading || failedUploads || needsKeys || request.trim().length < 3) return;
+    if (busy || uploading || limitsLoading || inventoryLoading || failedUploads || needsKeys || request.trim().length < 3) return;
     setBusy(true);
     setError("");
     try {
@@ -374,6 +411,7 @@ export default function Workspace({
                   <small>{fileSize(f.size)} · {f.error ? "Upload failed" : f.status === "ready" ? "Stored" : f.status === "queued" ? "Queued" : f.status === "starting" ? "Preparing upload…" : f.status === "finalizing" ? "Preparing preview…" : f.status === "retrying" ? "Connection interrupted · retrying…" : `${f.progress}% uploaded`}</small>
                   {f.error && <span className="upload-detail error" role="alert">{f.error}</span>}
                   {f.ref?.coverage_note && <span className="upload-detail">{f.ref.coverage_note}</span>}
+                  {f.ref && isZipArchive(f.name, f.ref.mime) && <span className="upload-detail">{ZIP_COVERAGE_NOTE}</span>}
                 </div>
                 {!f.id && !f.error && (
                   <span
@@ -383,7 +421,7 @@ export default function Workspace({
                     style={{ width: f.progress + "%" }}
                   />
                 )}
-                {f.error && fileObjects.current.has(f.key) && <button type="button" className="btn ghost small upload-retry" disabled={busy} onClick={() => retryFile(f)}>Retry</button>}
+                {f.error && fileObjects.current.has(f.key) && <button type="button" className="btn ghost small upload-retry" disabled={busy || limitsLoading} onClick={() => retryFile(f)}>Retry</button>}
                 <button
                   type="button"
                   className="attach-x"
@@ -412,7 +450,7 @@ export default function Workspace({
             <button
               type="button"
               className="btn ghost small"
-              disabled={busy || !limits || inventoryLoading || inventoryUnavailable}
+              disabled={busy || !fileLimits || limitsLoading || inventoryLoading || inventoryUnavailable}
               onClick={() => picker.current?.click()}
             >
               <Icon name="clip" size={17} /> Attach files
@@ -432,9 +470,11 @@ export default function Workspace({
           </span>
         </div>
         <div className="upload-policy" aria-live="polite">
-          <span><strong>{fileSize(files.reduce((sum, f) => sum + f.size, 0))}</strong> / {fileSize(limits?.max_run_bytes ?? DEFAULT_RUN_FILE_BYTES)} total · {files.length} / {limits?.max_files_per_run ?? DEFAULT_FILE_COUNT} files</span>
-          <span>{inventoryLoading ? "Recovering staged uploads…" : inventoryUnavailable ? "File recovery is unavailable. Refresh before attaching files." : limits ? limits.resumable_uploads ? "Uploads resume automatically after connection interruptions. Keep this page open." : `Direct uploads: up to ${fileSize(limits.raw_upload_max_bytes ?? 25 * 1024 ** 2)} per file.` : "Checking upload availability…"}</span>
+          {fileLimits && <span><strong>{fileSize(files.reduce((sum, f) => sum + f.size, 0))}</strong> / {fileSize(fileLimits.total)} total · up to {fileSize(fileLimits.perFile)} per file · {files.length} / {fileLimits.count} files</span>}
+          <span>{limitsLoading ? "Checking current upload limits…" : inventoryLoading ? "Recovering staged uploads…" : inventoryUnavailable ? "File recovery is unavailable. Refresh before attaching files." : fileLimits ? fileLimits.resumable ? "Uploads resume automatically after connection interruptions. Keep this page open." : `Local storage: direct uploads up to ${fileSize(fileLimits.perFile)} per file.` : "File uploads are unavailable until settings are confirmed."}</span>
+          {limitsError && <span className="error" role="alert">{limitsError} <button type="button" className="link-btn" disabled={limitsLoading} onClick={() => refreshUploadLimits()}>Retry settings</button></span>}
           <span>Original files are stored. Models receive bounded previews and compact data reports, not every uploaded byte. Check file coverage in the session.</span>
+          <span>{ZIP_COVERAGE_NOTE}</span>
         </div>
         <div className="composer-bottom">
           <div className="mode-picker" role="group" aria-label="Research mode">
@@ -472,10 +512,10 @@ export default function Workspace({
           <button
             className="btn primary start-btn"
             disabled={
-              busy || uploading || inventoryLoading || failedUploads || needsKeys || request.trim().length < 3
+              busy || uploading || limitsLoading || inventoryLoading || failedUploads || needsKeys || request.trim().length < 3
             }
           >
-            {busy ? "Starting…" : inventoryLoading ? "Loading files…" : uploading ? "Uploading…" : failedUploads ? "Retry or remove failed files" : "Start research"}
+            {busy ? "Starting…" : limitsLoading ? "Checking limits…" : inventoryLoading ? "Loading files…" : uploading ? "Uploading…" : failedUploads ? "Retry or remove failed files" : "Start research"}
             <Icon name="arrow" size={17} />
           </button>
         </div>

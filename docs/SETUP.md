@@ -32,7 +32,7 @@ Alerts only email you; they do not stop spending. By default the app limits each
 
 ## 2. Run the setup script in Cloud Shell (5 minutes)
 
-The setup script provisions `${PROJECT_ID}-uploads` as a private bucket with uniform access and public access prevention. Only the runtime service account receives object access on that bucket. `deploy/upload-cors.json` permits resumable transfers from SASI's production origin; update the exact origin if you use a different domain. `UPLOAD_BUCKET` enables the 2 GiB combined attachment limit. Staged files expire after three hours; accepted originals remain until their run is deleted. Storage and transfer can consume trial credits. No GPU or managed model endpoint is provisioned for uploads.
+The setup script provisions `${PROJECT_ID}-uploads` as a private bucket with uniform access and public access prevention. Only the runtime service account receives object access on that bucket. `deploy/upload-cors.json` permits resumable transfers from SASI's production origin; update the exact origin if you use a different domain. `UPLOAD_BUCKET` enables the 10 GiB combined attachment limit. Staged files expire after three hours; accepted originals remain until their run is deleted. Storage and transfer can consume trial credits. No GPU or managed model endpoint is provisioned for uploads.
 
 Original storage and model inspection are separate: the app uses bounded previews and statistical reports, not whole-dataset execution. Cloud Storage holds complete bytes; authenticated downloads support ranges. A whole-dataset analysis/training sandbox remains future work.
 

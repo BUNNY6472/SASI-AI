@@ -46,6 +46,13 @@ def prepare_preview(entry: dict, data: bytes) -> StoredFile:
                    data=data if complete and kind != "text" else b"", created_at=entry["created_at"],
                    object_uri=entry["object_uri"], object_generation=entry["generation"],
                    preview_complete=complete, preview_bytes=len(data), coverage_note=note)
+    if not complete and entry["name"].lower().endswith(".zip"):
+        f.coverage_note = (f"ZIP original preserved ({entry['size']:,} bytes). Archive members have not been extracted "
+                           "or analyzed. Models receive the archive name and size only; attach relevant extracted "
+                           "files or a schema/manifest for content analysis.")
+        f.text = f.coverage_note
+        f.preview_bytes = 0
+        return f
     if kind == "text":
         try:
             text, readable = extract.to_text(f.name, data, complete=complete, total_bytes=f.size)
@@ -141,13 +148,13 @@ class ObjectFileStore(FileStore):
             if len(index) >= MAX_FILES_PER_RUN:
                 raise FileRejected(f"Attach at most {MAX_FILES_PER_RUN} files. Remove unused uploads first.")
             if sum(row["size"] for row in index.values()) + entry["size"] > MAX_RUN_BYTES:
-                raise FileRejected("Pending and ready uploads together may total at most 2 GiB. Remove unused files first.")
+                raise FileRejected("Pending and ready uploads together may total at most 10 GiB. Remove unused files first.")
             index[entry["id"]] = entry
         self._edit_index(change)
 
     async def initiate(self, name: str, mime: str, size: int, origin: str) -> dict:
         if not isinstance(size, int) or isinstance(size, bool) or not 1 <= size <= MAX_FILE_BYTES:
-            raise FileRejected("Choose a non-empty file of at most 2 GiB.")
+            raise FileRejected("Choose a non-empty file of at most 10 GiB.")
         await self.cleanup()
         fid = uuid.uuid4().hex
         _, mime = classify(name, mime)
@@ -210,6 +217,8 @@ class ObjectFileStore(FileStore):
         kind, _ = classify(entry["name"], entry["mime"])
         read_size = (min(PREVIEW_BYTES, entry["size"]) if kind == "text"
                      else entry["size"] if entry["size"] <= MEDIA_BYTES else 0)
+        if entry["name"].lower().endswith(".zip") and entry["size"] > PREVIEW_BYTES:
+            read_size = 0  # A prefix is not a complete archive; do not attempt to unpack it.
         data = (await asyncio.to_thread(blob.download_as_bytes, start=0, end=read_size - 1,
                                        raw_download=True, if_generation_match=int(blob.generation), timeout=30)
                 if read_size else b"")
@@ -294,7 +303,7 @@ class ObjectFileStore(FileStore):
         if any(row["state"] != "ready" for row in entries):
             raise FileRejected("Wait for every upload to finish before starting a run.")
         if sum(row["size"] for row in entries) > MAX_RUN_BYTES:
-            raise FileRejected("Files for one run may total at most 2 GiB.")
+            raise FileRejected("Files for one run may total at most 10 GiB.")
         return await self._hydrate_run(entries)
 
     async def attach(self, run_id: str, files: list[StoredFile]) -> None:

@@ -205,6 +205,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Run data and attachments must not be reused from browser/proxy
             # caches after logout or an owner-token/session-secret rotation.
             response.headers["Cache-Control"] = "no-store"
+        elif response.headers.get("content-type", "").startswith("text/html"):
+            # A fresh navigation must load the current hashed JS bundle and its
+            # upload protocol. Do not keep a pre-resumable HTML entry point.
+            response.headers["Cache-Control"] = "no-cache, max-age=0, must-revalidate"
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "same-origin")
         return response
@@ -367,6 +371,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "max_run_bytes": file_store.max_run_bytes,
             "raw_upload_max_bytes": files_mod.RAW_UPLOAD_MAX_BYTES,
             "resumable_uploads": file_store.resumable_uploads,
+            "upload_storage": "cloud" if file_store.resumable_uploads else "local",
             "preview_max_bytes": files_mod.PREVIEW_BYTES,
             "max_files_per_run": files_mod.MAX_FILES_PER_RUN,
         }

@@ -1,11 +1,23 @@
 import { api, ApiError, FileRef, fileSize, RunLimits } from "./api";
 
-export const DEFAULT_RUN_FILE_BYTES = 2 * 1024 ** 3;
-export const DEFAULT_RAW_FILE_BYTES = 25 * 1024 ** 2;
-export const DEFAULT_FILE_COUNT = 20;
 const CHUNK_BYTES = 8 * 1024 ** 2;
 const CHUNK_ALIGNMENT = 256 * 1024;
 const ATTEMPTS = 5;
+
+export const UPLOAD_SETTINGS_UNAVAILABLE = "Upload settings are unavailable or out of date. Retry settings; if this continues, save your question text and refresh the page.";
+
+/** Never guess a small legacy limit when cloud settings are absent or unavailable. */
+export function uploadSettings(limits: RunLimits | null) {
+  if (!limits) return null;
+  const { max_file_bytes: perFile, max_run_bytes: total, max_files_per_run: count } = limits;
+  const valid = (value: number | undefined): value is number => Number.isSafeInteger(value) && value! > 0;
+  if (!valid(perFile) || !valid(total) || !valid(count)) return null;
+  if (limits.resumable_uploads === true)
+    return { perFile, total, count, resumable: true };
+  if (limits.resumable_uploads === false && limits.upload_storage === "local" && valid(limits.raw_upload_max_bytes))
+    return { perFile: Math.min(perFile, limits.raw_upload_max_bytes), total, count, resumable: false };
+  return null;
+}
 
 export type UploadStatus = "starting" | "uploading" | "retrying" | "finalizing";
 export interface UploadUpdate {
@@ -66,14 +78,9 @@ export function validateAttachment(
   currentCount: number,
   limits: RunLimits,
 ): string | null {
-  const count = limits.max_files_per_run ?? DEFAULT_FILE_COUNT;
-  const total = limits.max_run_bytes ?? DEFAULT_RUN_FILE_BYTES;
-  const perFile = limits.resumable_uploads
-    ? (limits.max_file_bytes ?? DEFAULT_RUN_FILE_BYTES)
-    : Math.min(
-        limits.max_file_bytes ?? DEFAULT_RUN_FILE_BYTES,
-        limits.raw_upload_max_bytes ?? DEFAULT_RAW_FILE_BYTES,
-      );
+  const settings = uploadSettings(limits);
+  if (!settings) return UPLOAD_SETTINGS_UNAVAILABLE;
+  const { count, total, perFile } = settings;
   if (currentCount >= count) return `You can attach up to ${count} files per session.`;
   if (!file.size) return `${file.name} is empty. Choose a file with content.`;
   if (file.size > perFile)
@@ -146,12 +153,14 @@ export async function uploadFile(
   update: (state: UploadUpdate) => void,
 ): Promise<FileRef> {
   checkAbort(signal);
+  const settings = uploadSettings(limits);
+  if (!settings) throw new Error(UPLOAD_SETTINGS_UNAVAILABLE);
+  const invalid = validateAttachment(file, 0, 0, limits);
+  if (invalid) throw new Error(invalid);
   update({ status: "starting", progress: 0 });
   let stagedId: string | undefined;
   try {
-    if (!limits.resumable_uploads) {
-      if (file.size > (limits.raw_upload_max_bytes ?? DEFAULT_RAW_FILE_BYTES))
-        throw new Error("Large uploads are unavailable. Refresh and check Connections.");
+    if (!settings.resumable) {
       const response = await transfer(
         "/api/files", file,
         { "X-File-Name": encodeURIComponent(file.name), "Content-Type": file.type || "application/octet-stream" },

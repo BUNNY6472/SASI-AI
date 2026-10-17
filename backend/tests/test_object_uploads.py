@@ -1,6 +1,6 @@
 """Large-upload admission, durable metadata, private downloads, and bounded reads.
 
-The fake stores only small prefixes even when declared size is 2 GiB. No cloud
+The fake stores only small prefixes even when declared size is 10 GiB. No cloud
 credentials, large fixture allocation, or provider calls are needed.
 """
 import asyncio
@@ -96,9 +96,9 @@ def test_maximum_file_reserves_whole_aggregate_before_bytes_arrive(storage):
     async def run():
         first = await store.initiate("../../data.csv", "text/csv", MAX_FILE_BYTES, "https://sasi.test")
         request = bucket.sessions["objects/" + first["id"]]
-        assert request["size"] == 2 * 1024**3
+        assert request["size"] == 10 * 1024**3
         assert request["if_generation_match"] == 0 and request["origin"] == "https://sasi.test"
-        with pytest.raises(FileRejected, match="total at most 2 GiB"):
+        with pytest.raises(FileRejected, match="total at most 10 GiB"):
             await store.initiate("another.csv", "text/csv", 1, "https://sasi.test")
         assert len(bucket.sessions) == 1
         row = json.loads(bucket.rows[INDEX]["data"])[first["id"]]
@@ -127,6 +127,18 @@ def test_invalid_size_never_reserves_cloud_session(storage, size):
     with pytest.raises(FileRejected):
         asyncio.run(store.initiate("bad.bin", "", size, "https://sasi.test"))
     assert not bucket.sessions
+
+
+def test_large_zip_is_stored_without_loading_or_unpacking_members(storage):
+    store, bucket, _ = storage
+    async def run():
+        upload = await store.initiate("12fishcorpus.zip", "application/zip", 3 * 1024**3, "https://sasi.test")
+        bucket.finish(upload["id"], b"PK", size=3 * 1024**3)
+        f = await store.complete(upload["id"])
+        assert f.size == 3 * 1024**3 and f.data == b"" and f.preview_bytes == 0
+        assert not f.preview_complete and "not been extracted or analyzed" in f.coverage_note
+        assert not any(key.startswith("objects/") for key, _ in bucket.reads)
+    asyncio.run(run())
 
 
 def test_complete_requires_actual_exact_size_and_cleans_rejected_object(storage):

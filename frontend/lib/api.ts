@@ -323,6 +323,7 @@ export interface RunLimits {
   raw_upload_max_bytes?: number;
   max_files_per_run?: number;
   resumable_uploads?: boolean;
+  upload_storage?: "cloud" | "local";
 }
 
 export interface ProviderStatus {

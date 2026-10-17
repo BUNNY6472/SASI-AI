@@ -4,6 +4,10 @@ SASI means **Sasidhar’s Artificial Super Intelligence**. This release improves
 
 ## Implemented
 
+### Competition adaptations and 10 GiB uploads — 18 October 2026
+
+The follow-up release adds passage ranking, exact duplicate provenance, shared evidence budgets and no-progress guards for unchanged rejected artifacts. The user increased the combined upload allowance from 2 GiB to 10 GiB. See [competition evidence, implementation and evaluation limits](COMPETITION_EFFICIENCY.md). HTML entry pages revalidate on navigation so cached pages do not keep obsolete upload clients; already-open old tabs must be reloaded.
+
 ### Token efficiency and large uploads — 18 October 2026
 
 - Both general and Eris runs have a 5,000,000 aggregate-token ceiling (50 lakh). The 120-minute inclusive runtime cap and trial-only access policy remain enforced. Deep mode can request up to 64,000 answer tokens plus reasoning, still bounded by the selected provider's output/context capacity. Adaptive mode retains smaller writing allowances and stage-sized reviews.

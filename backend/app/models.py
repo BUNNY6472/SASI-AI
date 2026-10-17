@@ -168,6 +168,9 @@ class FinalResult(BaseModel):
     verification_status: Literal["unverified", "reviewed", "partial", "failed"] = "unverified"
     artifact_hash: str = ""
     artifact_version: int = 0
+    # A completed fix returned identical bytes under this unchanged review context.
+    # Persist across resume; new evidence/criteria/files invalidate the stop.
+    stalled_context_hash: str = ""
     checks: list[CheckResult] = Field(default_factory=list)
 
 

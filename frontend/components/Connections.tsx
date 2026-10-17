@@ -10,6 +10,7 @@ import {
   VertexInfo,
 } from "@/lib/api";
 import { AgentChip } from "./ui";
+import { uploadSettings } from "@/lib/uploads";
 
 interface HistoryRow {
   provider: string;
@@ -694,7 +695,7 @@ export default function Connections({
             </div>
             {!!limits.max_run_bytes && <div><b>{fileSize(limits.max_run_bytes)}</b><span>combined original file size per session</span></div>}
             {!!limits.max_files_per_run && <div><b>{limits.max_files_per_run}</b><span>files per session</span></div>}
-            {limits.resumable_uploads !== undefined && <div><b>{limits.resumable_uploads ? "Resumable" : "Direct"}</b><span>{limits.resumable_uploads ? "chunked cloud uploads with retry" : `${fileSize(limits.raw_upload_max_bytes ?? 25 * 1024 ** 2)} per-file upload limit`}</span></div>}
+            <div><b>{uploadSettings(limits) ? limits.resumable_uploads ? "Resumable" : "Local direct" : "Unavailable"}</b><span>{uploadSettings(limits) ? limits.resumable_uploads ? "chunked cloud uploads with retry" : `${fileSize(uploadSettings(limits)!.perFile)} per-file upload limit` : "Upload settings must be confirmed. Refresh to load the current app."}</span></div>
             <div>
               <b>{limits.max_tasks_per_plan}</b>
               <span>tasks per plan</span>

@@ -70,13 +70,27 @@ def test_transport_allowance_does_not_cut_off_twenty_minute_phase():
 def test_slow_peer_finishes_after_target_without_being_cancelled():
     async def scenario():
         c = controller()
-        run = run_state(time_limit_s=.02, compare_all=True)
+        run = run_state(time_limit_s=10, model_phase_min_s=1, compare_all=True)
         c._clock_start(run)
+        both_started, fast_finished = asyncio.Event(), asyncio.Event()
+        started = 0
+        async def admit_both():
+            nonlocal started
+            started += 1
+            if started == 2:
+                # Expire the admission target only after both provider calls
+                # started; a busy host must not decide this test via a 20ms race.
+                run.time_limit_s = max(.000001, run.elapsed_s / 2)
+                both_started.set()
+            await both_started.wait()
         async def fast(request):
-            await asyncio.sleep(.002)
+            await admit_both()
+            fast_finished.set()
             return answer()
         async def slow(request):
-            await asyncio.sleep(.05)
+            await admit_both()
+            await fast_finished.wait()
+            await asyncio.sleep(.01)
             return answer("gemini")
         c.registry.adapters["claude"].generate = fast
         c.registry.adapters["gemini"].generate = slow

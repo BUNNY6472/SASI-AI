@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import json
 import logging
 import re
 import time
@@ -47,6 +48,8 @@ from .profiles import AUTO_FIELDS, get_profile
 from .router import PerformanceHistory, Router
 
 log = logging.getLogger("sasi.controller")
+STALLED_FINAL_LIMITATION = ("A completed fix returned the unchanged result. Existing failed checks and reviewer findings "
+                            "remain unresolved; repeated reviews and fixes were stopped.")
 
 class ReviewPayload(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
@@ -1151,7 +1154,7 @@ class Controller:
                     f"{'are' if len(providers) > 1 else 'is'} analysing {what} independently, at the same time")
         await self._publish(run)
         system, prompt = prompts.analysis_prompt(run.request, run.materials, files_mod.describe(files), profile)
-        prompt += prompts.evidence_block(run.evidence)
+        prompt += prompts.evidence_block(run.evidence, run.request, "analysis")
 
         async def one(p: str) -> None:
             call = ModelCall(system, prompt, "analysis", self._out_cap(run),
@@ -1251,7 +1254,7 @@ class Controller:
         await self._publish(run)
 
         shared = (prompts.findings_block(run.analyses, run.cross_checks) + prompts.consensus_block(run.consensus)
-                  + prompts.evidence_block(run.evidence) + self._partial_notes(run, {"analysis", "cross_check"}))
+                  + prompts.evidence_block(run.evidence, run.request, "plan") + self._partial_notes(run, {"analysis", "cross_check"}))
         task_limit = policy.allocate(run, len(self._eligible(run)), self.settings.max_tasks_per_plan).task_limit
         plan = run.plan
         if plan is None or not plan.tasks:
@@ -1279,7 +1282,8 @@ class Controller:
             review = run.plan_review
             if review is None:
                 system, prompt = prompts.plan_review_prompt(run.request, plan, profile,
-                                                            prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence))
+                                                            prompts.materials_block(run.materials)
+                                                            + prompts.evidence_block(run.evidence, run.request, "plan_review"))
                 reviewer, rres, _ = await self._call_any(
                     run, "plan reviewer", ModelCall(system, prompt, "plan_review", 2500,
                                                      {"request": run.request, "phase": str(plan.version - 1) if plan.version > 1 else ""},
@@ -1486,12 +1490,44 @@ class Controller:
                 return Review(reviewer="none", verdict="revise", findings=["No independent reviewer was available"])
             return self._parse_review(rres.text, reviewer, rres.model, default="pass")
 
+    @staticmethod
+    def _review_context_hash(run: Run, system: str, prompt: str, files: list[StoredFile]) -> str:
+        """Exact review inputs, excluding runtime bookkeeping and old opinions.
+
+        Retain full evidence and source identity even when a prompt uses bounded
+        excerpts. A changed omitted source must not inherit an old failure stop.
+        """
+        plan = run.plan
+        context = {
+            "system": system, "prompt": prompt, "request": run.request, "materials": run.materials,
+            "profile": run.profile, "eris": run.eris,
+            "evidence": [item.model_dump() for item in run.evidence],
+            "file_refs": [item.model_dump() for item in run.files],
+            "plan": ({"goal": plan.goal, "assumptions": plan.assumptions, "deliverables": plan.deliverables,
+                      "success_criteria": plan.success_criteria,
+                      "tasks": [{"id": task.id, "title": task.title, "description": task.description,
+                                 "depends_on": task.depends_on, "output": task.output} for task in plan.tasks]}
+                     if plan else None),
+            "attachments": [{"ref": f.ref(), "text": f.text, "object_uri": f.object_uri,
+                             "object_generation": f.object_generation,
+                             "data_sha256": hashlib.sha256(f.data).hexdigest()} for f in files],
+        }
+        return hashlib.sha256(json.dumps(context, sort_keys=True, ensure_ascii=False,
+                                         separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    async def _final_review_context_hash(self, run: Run, plan: Plan, output: str, profile) -> str:
+        system, prompt = prompts.final_eval_prompt(run.request, plan, output, profile,
+                                                   prompts.materials_block(run.materials) + prompts.evidence_block(
+                                                       run.evidence, run.request + "\n" + "\n".join(plan.success_criteria), "final_eval"))
+        files = await self.files.get(run.id) if run.files else []
+        return self._review_context_hash(run, system, prompt, files)
+
     async def _run_task(self, run: Run, task: Task, load: dict[str, int], files: list[StoredFile]) -> None:
         plan = run.plan
         assert plan is not None
         profile = get_profile(run.profile)
         shared = (prompts.findings_block(run.analyses, run.cross_checks, limit=4000) + prompts.consensus_block(run.consensus)
-                  + prompts.evidence_block(run.evidence))
+                  + prompts.evidence_block(run.evidence, f"{run.request}\n{task.title}\n{task.description}", "task"))
         task_files = self._task_files(run, files)
         deps = [t for t in plan.tasks if t.id in task.depends_on]
         tried_implementers: set[str] = set()
@@ -1503,10 +1539,16 @@ class Controller:
         resume_implementer = task.implementer if (pending_attempt or (task.implementer and self._can_continue(
             run, task.implementer, "task", task.id, phase))) else None
         resume_reviewer = task.reviewer
+        # Reuse only a known failure for exact unchanged review inputs. This is
+        # local to the invocation: old checkpoints without context fingerprints
+        # are reviewed afresh, and no previous passing opinion is promoted.
+        failed_reviews: dict[str, Review] = {}
 
         # Up to two implementers (original + one reassignment), each with bounded revisions.
         for assignment in range(2):
             eligible = self._eligible(run)
+            if assignment and not any(p not in tried_implementers for p in eligible):
+                break
             impl = self.router.pick(eligible, run.profile, load, "implementer", exclude=tried_implementers)
             implementer = resume_implementer if assignment == 0 and resume_implementer in eligible else impl.provider
             tried_implementers.add(implementer)
@@ -1545,9 +1587,19 @@ class Controller:
                 self._event(run, "reviewing", f"{name(reviewer)} is reviewing '{task.title}'", reviewer, task.id)
                 await self._publish(run)
                 context = (f"Original user request:\n{run.request}" + prompts.materials_block(run.materials)
-                           + prompts.evidence_block(run.evidence)
+                           + prompts.evidence_block(run.evidence, f"{run.request}\n{task.title}\n{task.description}", "review")
                            + "\n\nAccepted dependencies:\n" + "\n\n".join(f"{d.id}: {d.output}" for d in deps))
                 system, prompt = prompts.review_prompt(plan, task, result.text, profile, context)
+                review_context = self._review_context_hash(run, system, prompt, task_files)
+                prior_failure = failed_reviews.get(review_context)
+                if prior_failure is not None:
+                    attempt.review = prior_failure.model_copy(deep=True)
+                    previous, findings = result.text, list(prior_failure.findings)
+                    self._event(run, "no_progress", f"'{task.title}' returned an identical previously rejected draft with unchanged "
+                                "requirements and evidence. Its findings are retained; no duplicate review was requested.",
+                                implementer, task.id)
+                    await self._publish(run, checkpoint=True)
+                    break  # one different implementer may still resolve the findings
                 review = await self._review_call(run, reviewer, implementer, load, system, prompt, task, revision, task_files)
                 reviewer = task.reviewer or reviewer
                 attempt.review = review
@@ -1562,6 +1614,8 @@ class Controller:
                     await self._publish(run, checkpoint=True)
                     return
                 self.history.record(implementer, run.profile, False)
+                if review.verdict in ("revise", "block") and review.score is not None:
+                    failed_reviews[review_context] = review.model_copy(deep=True)
                 previous, findings = result.text, review.findings
                 if review.verdict == "block":
                     break
@@ -1575,7 +1629,8 @@ class Controller:
         """Each judge tests the final result on its own, at the same time. A judge that fails or runs out of time
         is left out of that round."""
         system, prompt = prompts.final_eval_prompt(run.request, plan, output, profile,
-                                                  prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence))
+                                                  prompts.materials_block(run.materials) + prompts.evidence_block(
+                                                      run.evidence, run.request + "\n" + "\n".join(plan.success_criteria), "final_eval"))
         final = run.final
         assert final is not None
         artifact_hash = hashlib.sha256(output.encode("utf-8")).hexdigest()
@@ -1632,7 +1687,8 @@ class Controller:
                     + (f" and {len(drafts)} unreviewed draft{'s' if len(drafts) != 1 else ''}" if drafts else ""))
         await self._publish(run)
         shared = (prompts.findings_block(run.analyses, run.cross_checks, limit=3000) + prompts.consensus_block(run.consensus)
-                  + prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence))
+                  + prompts.materials_block(run.materials) + prompts.evidence_block(
+                      run.evidence, run.request + "\n" + "\n".join(plan.deliverables), "integrate"))
         system, prompt = prompts.integrate_prompt(run.request, plan, accepted, missing, profile, shared, drafts)
         if run.final and run.final.output:
             final = run.final
@@ -1661,7 +1717,24 @@ class Controller:
         sections = [(t.title, t.output) for t in accepted]
         latest: list[Judgement] = []
         tested = True
-        for round_ in range(final.fixes, self.settings.max_final_fix_rounds + 1):
+        final_context = await self._final_review_context_hash(run, plan, final.output, profile)
+        context_changed = bool(final.stalled_context_hash and final.stalled_context_hash != final_context)
+        if context_changed:
+            final.stalled_context_hash = ""
+            final.limitations = [note for note in final.limitations if note != STALLED_FINAL_LIMITATION]
+        stalled = final.stalled_context_hash == final_context
+        if stalled:
+            final.limitations.insert(0, STALLED_FINAL_LIMITATION)
+            latest = [j for j in final.judges if j.artifact_hash == final.artifact_hash]
+            tested = bool(latest)
+            self._event(run, "no_progress", "Resumed the unchanged stalled result with its existing review findings; "
+                        "no repeated review or fix was started.")
+        prior_round = max((j.round for j in final.judges), default=-1)
+        current_round = max((j.round for j in final.judges if j.artifact_hash == final.artifact_hash), default=prior_round + 1)
+        start_round = prior_round + 1 if context_changed else current_round
+        rounds = range(start_round, start_round + max(0, self.settings.max_final_fix_rounds - final.fixes) + 1)
+        for round_ in ([] if stalled else rounds):
+            reviewed_context = await self._final_review_context_hash(run, plan, final.output, profile)
             judged = [j for j in final.judges if j.round == round_ and j.artifact_hash == final.artifact_hash]
             pending_judges = [p for p in judges if p not in {j.judge for j in judged}]
             can_start = self._has_time(run, 3 * self._min_call(run))
@@ -1685,7 +1758,7 @@ class Controller:
             for j in judged:
                 if j.meets_criteria is False and not j.must_fix:
                     must.append("The reviewer marked success criteria unmet. Recheck every criterion and correct the unmet requirements.")
-            if not must or round_ == self.settings.max_final_fix_rounds:
+            if not must or final.fixes >= self.settings.max_final_fix_rounds:
                 break
             fix_phase = f"fix:{round_}"
             if not self._has_time(run, took * 1.3 + 3 * self._min_call(run)) and not self._can_continue(run, integrator, "integrate", phase=fix_phase):
@@ -1696,7 +1769,7 @@ class Controller:
             await self._publish(run)
             system, prompt = prompts.fix_prompt(run.request, plan, final.output, must, profile)
             extra = await self._expand_for_gaps(run, load, must)
-            prompt += (prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence)
+            prompt += (prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence, run.request + "\n" + "\n".join(must), "fix")
                        + ("\n\nNew independently reviewed gap investigation:\n" + extra if extra else ""))
             try:
                 fixed = await self._call(run, integrator, ModelCall(
@@ -1708,6 +1781,16 @@ class Controller:
                 final.limitations.append(f"These problems found by the other models could not be fixed ({why}): "
                                          + "; ".join(must[:5]))
                 break
+            if (fixed.text == final.output and reviewed_context ==
+                    await self._final_review_context_hash(run, plan, final.output, profile)):
+                final.stalled_context_hash = reviewed_context
+                final.limitations.insert(0, STALLED_FINAL_LIMITATION)
+                self._event(run, "no_progress", "The fix returned identical bytes with unchanged requirements and evidence. "
+                            "Retained the existing findings and stopped repeated final reviews and fixes.", integrator)
+                self._partial.pop(run.id, None)
+                await self._publish(run, checkpoint=True)
+                break
+            final.stalled_context_hash = ""
             final.output = fixed.text
             final.fixes += 1
             await self._verify_final(run)
@@ -1819,7 +1902,7 @@ class Controller:
         system, prompt = prompts.wrap_up_prompt(
             run.request, plan, profile, max(1.0, (left or 60) / 60), "", accepted, drafts,
             run.analyses, prompts.consensus_block(run.consensus))
-        prompt += prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence)
+        prompt += prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence, run.request, "wrap_up")
         for p in writers:
             if not self._has_time(run, self._min_call(run)):
                 break

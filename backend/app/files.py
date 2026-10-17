@@ -21,7 +21,7 @@ from . import extract
 
 log = logging.getLogger("sasi.files")
 
-MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024
 MAX_RUN_BYTES = MAX_FILE_BYTES
 MAX_FILES_PER_RUN = 20
 RAW_UPLOAD_MAX_BYTES = 25 * 1024 * 1024  # never send large uploads through Cloud Run

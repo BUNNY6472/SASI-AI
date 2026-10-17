@@ -49,6 +49,14 @@ def test_local_open_mode_remains_explicitly_available():
         assert client.get("/api/limits").status_code == 200
 
 
+def test_html_entry_revalidates_to_load_current_upload_client(tmp_path):
+    (tmp_path / "index.html").write_text("<html><body>SASI</body></html>", encoding="utf-8")
+    with TestClient(create_app(settings(static_dir=str(tmp_path))), base_url="https://testserver") as client:
+        response = client.get("/")
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-cache, max-age=0, must-revalidate"
+
+
 @pytest.mark.parametrize("method,path", [
     ("GET", "/api/runs"), ("POST", "/api/runs"), ("GET", "/api/runs/private-run"),
     ("GET", "/api/runs/private-run/solution"),
