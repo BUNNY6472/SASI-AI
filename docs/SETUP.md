@@ -4,6 +4,16 @@ Project: `sasi-511906` · Region: `us-central1` · Service: `sasi` on Cloud Run.
 
 You do steps 1 to 3 once. After that, every merge to `main` deploys automatically.
 
+## Fastest: one command for a live link
+
+In Cloud Shell (the `>_` icon at the top of the Google Cloud console):
+
+```bash
+git clone -b claude/sasi-multi-ai-app-c549ms https://github.com/BUNNY6472/SASI-AI.git && cd SASI-AI && bash deploy/deploy-now.sh
+```
+
+It sets everything up, builds the app inside Cloud Shell, deploys it and prints the link and access code. Do step 1 below too, and step 3 if you want merges to deploy automatically.
+
 ## 1. Protect the budget (2 minutes)
 
 Google Cloud console → **Billing** → **Budgets & alerts** → **Create budget**
