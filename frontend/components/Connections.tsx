@@ -43,6 +43,21 @@ function tokens(n: number): string {
   return n >= 1_000_000 ? `${n / 1_000_000}M` : `${Math.round(n / 1000)}K`;
 }
 
+function creditCutoff(value: string): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "Invalid configured cutoff";
+  return date.toLocaleString("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "UTC",
+    timeZoneName: "short",
+    hour12: false,
+  });
+}
+
 function RouteList({ p }: { p: ProviderStatus }) {
   const active = p.ok ? p.via : null;
   const line = (r: RouteStatus) => {
@@ -260,12 +275,16 @@ export default function Connections({
   providers,
   vertex,
   trialCreditsOnly = false,
+  trialCreditExpiresAt = null,
+  trialCreditWindowError = null,
   refresh,
   reload,
 }: {
   providers: ProviderStatus[];
   vertex: VertexInfo | null;
   trialCreditsOnly?: boolean;
+  trialCreditExpiresAt?: string | null;
+  trialCreditWindowError?: string | null;
   refresh: () => Promise<void>;
   reload: () => Promise<void>;
 }) {
@@ -279,7 +298,7 @@ export default function Connections({
 
   async function removeAll() {
     const after = trialCreditsOnly
-      ? " Trial-credit policy will continue to allow only Vertex Gemini."
+      ? " The trial-credit policy and its configured cutoff remain in place."
       : vertexOn
         ? " Only models with a working Google Cloud route can keep running."
         : " Runs can't start until you add a key again.";
@@ -292,7 +311,7 @@ export default function Connections({
         { method: "DELETE" },
       );
       const ok = trialCreditsOnly
-        ? "All API keys removed. Trial-credit policy still allows only Vertex Gemini."
+        ? "All API keys removed. The trial-credit policy and its configured cutoff remain in place."
         : vertexOn
           ? "All keys removed. Models with a working Google Cloud route remain available."
           : "All keys removed. Paste new ones above.";
@@ -328,17 +347,28 @@ export default function Connections({
         <>
           <div className="notice warn" role="status">
             <div>
-              <strong>Trial credits only · Vertex Gemini</strong>
+              <strong>
+                {trialCreditWindowError
+                  ? "Trial access paused"
+                  : "Trial credits only · Vertex Gemini"}
+              </strong>
               <p>
-                SASI allows Gemini through your Google Cloud project only.
-                Claude, open-model managed APIs and all direct API-key routes
-                are disabled by this policy.
+                {trialCreditWindowError ||
+                  "SASI allows Gemini through your Google Cloud project only. Claude, open-model managed APIs and all direct API-key routes are disabled by this policy."}
               </p>
+              {trialCreditExpiresAt && (
+                <p className="small">
+                  <b>Configured credit cutoff:</b>{" "}
+                  {creditCutoff(trialCreditExpiresAt)}. SASI stops model access
+                  at this time. Credits may run out earlier.
+                </p>
+              )}
             </div>
           </div>
           <p className="sub">
-            Research can run with Vertex Gemini alone. Other integrations remain
-            available in SASI for a future billing-policy change.
+            {trialCreditWindowError
+              ? "New research is paused under the trial-credit policy. Your saved research remains accessible."
+              : "Research can run with Vertex Gemini alone. Other integrations remain available in SASI for a future billing-policy change."}
             {vertex?.project && (
               <>
                 {" "}
@@ -396,7 +426,7 @@ export default function Connections({
               <p className="small muted">
                 {p.provider === "claude"
                   ? "Claude integration is ready when your billing policy allows a separate Anthropic API account. API-key entry is disabled for now."
-                  : "The Gemini API-key route is disabled. Gemini can use the allowed Vertex AI route only."}
+                  : "The Gemini API-key route is disabled. Vertex AI is the only eligible route; its current access status is shown above."}
               </p>
             ) : p.key_option ? (
               <KeyForm
@@ -515,7 +545,9 @@ export default function Connections({
           {busy
             ? "Checking…"
             : trialCreditsOnly
-              ? "Check Vertex Gemini"
+              ? trialCreditWindowError
+                ? "Refresh access status"
+                : "Check Vertex Gemini"
               : vertexOn
                 ? "Check again"
                 : "Re-check all keys"}
@@ -535,7 +567,7 @@ export default function Connections({
       <div className="glass lock-note">
         When the access-code gate is enabled, keep that code private.{" "}
         {trialCreditsOnly
-          ? "The current policy allows only Vertex Gemini in your Google Cloud project. Keep an eye on your credit balance and expiry in Google Cloud Billing."
+          ? "The current policy permits only Vertex Gemini before the configured cutoff. Keep an eye on your credit balance and expiry in Google Cloud Billing."
           : vertexOn
             ? "Calls through Google Cloud are billed to your Google Cloud project, and calls with an API key to that provider's account. Set a budget alert in Google Cloud Billing, and a monthly limit in each provider's console."
             : "Every model call is billed to your own API accounts, so set a monthly spending limit in each provider's console too."}
@@ -560,10 +592,18 @@ export default function Connections({
               <span>delivery reserve, adjusted per run</span>
             </div>
             <div>
-              <b>{trialCreditsOnly ? "Gemini" : limits.team_size}</b>
+              <b>
+                {trialCreditsOnly
+                  ? trialCreditWindowError
+                    ? "Paused"
+                    : "Gemini"
+                  : limits.team_size}
+              </b>
               <span>
                 {trialCreditsOnly
-                  ? "allowed by current policy"
+                  ? trialCreditWindowError
+                    ? "trial-credit access"
+                    : "allowed by current policy"
                   : "models per run"}
               </span>
             </div>

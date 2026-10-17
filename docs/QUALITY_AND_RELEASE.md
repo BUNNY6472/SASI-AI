@@ -28,7 +28,7 @@ These are maximums, not targets. The selected 5–60 minute ceiling still applie
 
 ## Release boundary
 
-Local validation on 2026-10-17: **205 backend tests passed**, including trial-policy restrictions and owner authentication; the production frontend build passed. Desktop and 390-pixel mobile browser checks covered navigation, uploads, plan approval, simulated completion, evidence/checks and settings. SQLite history and the uploaded attachment survived a backend restart. The six-case evaluation suite passed dry validation (18 planned mode comparisons); no paid model evaluation or live quality score was produced.
+Local validation on 2026-10-17: **214 backend tests passed**, including trial-policy restrictions, expiry and owner authentication; the production frontend build passed. Desktop and 390-pixel mobile browser checks covered navigation, uploads, plan approval, simulated completion, evidence/checks and settings. SQLite history and the uploaded attachment survived a backend restart. The six-case evaluation suite passed dry validation (18 planned mode comparisons); no paid model evaluation or live quality score was produced.
 
 The upgrade is prepared in branch `codex/sasi-quality-workspace`. A production release requires successful CI, verified billing constraints, configured GitHub federation and a checked Cloud Run revision. Local tests and browser checks alone do not establish a successful deployment.
 
@@ -37,6 +37,8 @@ The checked-in Cloud Run configuration permits scale-to-zero, caps instances at 
 The requested deployment uses `TRIAL_CREDITS_ONLY=true`: only Vertex Gemini is allowed, with partner models and all API-key fallbacks disabled before any provider probes. All six open-model integrations remain configured for a later funded configuration. Qwen, Kimi and MiniMax retire on October 21, 2026 UTC and are excluded automatically on/after that date. Production also sets `REQUIRE_ACCESS_TOKEN=true`, requiring the private owner token and a non-default session secret. The deployment preserves unrelated environment variables and Secret Manager bindings.
 
 Trial-only routing is not a billing cap. Before rollout, verify the linked account's actual Free Trial status, remaining credit, credit scope and expiry in Cloud Billing. Set alerts against credit consumption without allowing promotional credits to hide spend. Alerts and service spend caps cannot promise zero out-of-pocket costs on an already-paid account. No account upgrade is authorized by this release.
+
+Production permits one active run and sets `TRIAL_CREDIT_EXPIRES_AT=2026-11-18T00:00:00Z`, before the verified credit expiry. In trial-only mode the cutoff blocks provider probes, new runs and subsequent model dispatches; already-started requests may finish. Invalid timestamps fail closed. This cutoff does not measure the remaining balance or stop hosting/storage charges. The billing configuration additionally has monthly service spend caps of INR 1,000 for Vertex AI and INR 500 for Cloud Run, with consumption alerts that exclude promotional credits. Service caps can overshoot and do not cover every service.
 
 The manual deployment script remains an operator path. Run the regression suite and production frontend build before using it. Check the deployed revision, health, sign-in, Connections, `/api/limits`, a bounded real run, interrupted-run recovery and research provenance after rollout. Use a prior Cloud Run revision for rollback if needed.
 

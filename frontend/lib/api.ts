@@ -287,6 +287,8 @@ export interface ProvidersResponse {
   needs_keys: boolean;
   demo_mode?: boolean;
   trial_credits_only?: boolean;
+  trial_credit_expires_at?: string | null;
+  trial_credit_window_error?: string | null;
   vertex?: VertexInfo;
   checked_at?: number | null;
   team_size?: number;

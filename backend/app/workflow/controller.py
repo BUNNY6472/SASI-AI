@@ -415,6 +415,9 @@ class Controller:
     def _eligible(self, run: Run) -> list[str]:
         """The run's team members that work right now, best first. If every one of them failed, the next best
         working models take over."""
+        window_error = self.registry.trial_credit_window_error()
+        if window_error:
+            raise BudgetExceeded(window_error)
         bad = self._unhealthy.get(run.id, set())
         working = [p for p in self.registry.eligible() if p not in bad]
         if not run.team:
@@ -442,6 +445,9 @@ class Controller:
 
     def _check_budget(self, run: Run, reserve: int = 0) -> None:
         """Optional caps on calls and tokens (0 means no cap). Time is the main limit."""
+        window_error = self.registry.trial_credit_window_error()
+        if window_error:
+            raise BudgetExceeded(window_error)
         s = self.settings
         if s.max_model_calls_per_run and run.usage.calls >= s.max_model_calls_per_run:
             raise BudgetExceeded(f"reached the limit of {s.max_model_calls_per_run} model calls for one run")

@@ -5,7 +5,7 @@ import asyncio
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from ..config import Settings
 from ..keys import hint
@@ -23,8 +23,12 @@ KEY_SEATS = ("claude", "gemini")  # models that can also use the provider's own 
 PROVIDERS = KEY_SEATS  # kept for older imports: the models with an API key
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _utc_date() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+    return _utc_now().date().isoformat()
 
 
 class ModelRegistry:
@@ -65,7 +69,26 @@ class ModelRegistry:
             return f"Vertex AI endpoints retired on {seat.retirement_date} (UTC). This model is unavailable."
         return None
 
+    def trial_credit_window_error(self) -> str | None:
+        if not self.settings.trial_credits_only:
+            return None
+        deadline = self.settings.trial_credit_expires_at.strip()
+        if not deadline:
+            return None  # no expiry is asserted; this is not a credit-balance check
+        try:
+            expires = datetime.fromisoformat(deadline)
+            if expires.tzinfo is None or expires.utcoffset() != timedelta(0):
+                raise ValueError("a UTC timestamp is required")
+        except (ValueError, OverflowError):
+            return "Trial credit expiry is invalid. All model access is disabled until a valid UTC deadline is configured."
+        if _utc_now() >= expires:
+            return f"Trial credit window ended at {deadline}. All model access is disabled."
+        return None
+
     def _trial_policy_error(self, provider: str) -> str | None:
+        window_error = self.trial_credit_window_error()
+        if window_error:
+            return window_error
         if self.settings.trial_credits_only and (provider != "gemini" or not self.settings.vertex_ai):
             return "Disabled by trial-credit-only policy: only Gemini through Vertex AI is allowed."
         return None

@@ -1,5 +1,6 @@
 """Trial-credit routing policy; no real provider or billing calls."""
 import asyncio
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,6 +9,10 @@ from app.config import Settings
 from app.gateway.base import ModelCall, ModelResult, ProviderError
 from app.gateway.registry import ModelRegistry
 from app.main import create_app
+from app.models import Run
+from app.store.memory import MemoryStore
+from app.workflow.controller import BudgetExceeded, Controller
+from app.workflow.router import PerformanceHistory
 
 
 class GeminiProbe:
@@ -133,3 +138,75 @@ def test_trial_policy_without_vertex_reports_connection_policy_instead_of_missin
         assert "Trial-credit-only policy" in result.json()["detail"]
         assert "Vertex Gemini" in result.json()["detail"]
         assert not made and not probe.calls
+
+
+@pytest.mark.parametrize("instant,blocked", [
+    ("2026-11-17T23:59:59+00:00", False),
+    ("2026-11-18T00:00:00+00:00", True),
+    ("2026-11-18T00:00:01+00:00", True),
+])
+def test_trial_expiry_blocks_all_construction_checks_and_selection_at_utc_deadline(monkeypatch, instant, blocked):
+    monkeypatch.setattr("app.gateway.registry._utc_now", lambda: datetime.fromisoformat(instant))
+    made, probe = install_factories(monkeypatch)
+    registry = ModelRegistry(Settings(_env_file=None, trial_credits_only=True, vertex_ai=True,
+                                       trial_credit_expires_at="2026-11-18T00:00:00Z"))
+    asyncio.run(registry.refresh())
+    asyncio.run(registry.recheck_failed())
+    if blocked:
+        assert not made and not probe.probes and not registry.eligible()
+        assert "Trial credit window ended" in registry.trial_credit_window_error()
+        assert all(card["policy_blocked"] and card["ok"] is False for card in registry.describe())
+    else:
+        assert made == ["gemini"] and probe.probes == 1 and registry.eligible() == ["gemini"]
+        assert registry.trial_credit_window_error() is None
+
+
+@pytest.mark.parametrize("invalid", ["not-a-date", "2026-11-18T00:00:00", "2026-11-18T05:30:00+05:30"])
+def test_invalid_trial_expiry_fails_closed_without_provider_checks(monkeypatch, invalid):
+    made, probe = install_factories(monkeypatch)
+    registry = ModelRegistry(Settings(_env_file=None, trial_credits_only=True, vertex_ai=True,
+                                       trial_credit_expires_at=invalid))
+    asyncio.run(registry.refresh())
+    assert not made and not probe.probes and not registry.eligible()
+    assert "expiry is invalid" in registry.trial_credit_window_error()
+
+
+def test_expiry_stops_an_existing_run_before_its_next_dispatch(monkeypatch):
+    now = [datetime(2026, 11, 17, 23, 59, 59, tzinfo=timezone.utc)]
+    monkeypatch.setattr("app.gateway.registry._utc_now", lambda: now[0])
+    made, probe = install_factories(monkeypatch)
+    settings = Settings(_env_file=None, trial_credits_only=True, vertex_ai=True,
+                        trial_credit_expires_at="2026-11-18T00:00:00Z")
+    registry = ModelRegistry(settings)
+    controller = Controller(settings, registry, MemoryStore(), PerformanceHistory())
+    run = Run(request="Keep working")
+    assert made == ["gemini"]
+    now[0] = datetime(2026, 11, 18, tzinfo=timezone.utc)
+    with pytest.raises(BudgetExceeded, match="Trial credit window ended"):
+        asyncio.run(controller._call_inner(run, "gemini", ModelCall(system="s", prompt="p", kind="task"), None))
+    assert probe.calls == 0 and run.usage.calls == 0
+    with pytest.raises(BudgetExceeded, match="Trial credit window ended"):
+        controller._eligible(run)
+
+
+def test_expired_trial_window_api_shows_cutoff_and_refuses_new_runs(monkeypatch):
+    monkeypatch.setattr("app.gateway.registry._utc_now", lambda: datetime(2026, 11, 18, tzinfo=timezone.utc))
+    made, probe = install_factories(monkeypatch)
+    cutoff = "2026-11-18T00:00:00Z"
+    app = create_app(Settings(_env_file=None, trial_credits_only=True, vertex_ai=True,
+                              trial_credit_expires_at=cutoff, static_dir="/nonexistent"))
+    with TestClient(app) as client:
+        providers = client.get("/api/providers?refresh=true").json()
+        assert providers["trial_credit_expires_at"] == cutoff
+        assert "Trial credit window ended" in providers["trial_credit_window_error"]
+        result = client.post("/api/runs", json={"request": "A new request"})
+        assert result.status_code == 403 and cutoff in result.json()["detail"]
+        assert not made and not probe.probes and not probe.calls
+
+
+def test_unset_expiry_does_not_assert_a_verified_window_and_nontrial_mode_ignores_it():
+    registry = ModelRegistry(Settings(_env_file=None, trial_credits_only=True, vertex_ai=False))
+    assert registry.settings.trial_credit_expires_at == "" and registry.trial_credit_window_error() is None
+    nontrial = ModelRegistry(Settings(_env_file=None, trial_credits_only=False, vertex_ai=False,
+                                       trial_credit_expires_at="invalid"))
+    assert nontrial.trial_credit_window_error() is None

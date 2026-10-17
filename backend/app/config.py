@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     # A saved Gemini API key remains a fallback behind its Vertex route.
     vertex_ai: bool = False
     trial_credits_only: bool = False  # only Vertex Gemini; block partner models and API-key routes
+    trial_credit_expires_at: str = ""  # optional ISO UTC cutoff; empty does not verify a credit balance
     vertex_claude_enabled: bool = False
     vertex_location: str = "global"  # Gemini and optional Vertex Claude
     vertex_claude_model: str = ""  # empty: same as claude_model

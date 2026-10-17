@@ -200,6 +200,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"providers": registry.describe(), "needs_keys": registry.live_count == 0 and not settings.allow_simulated and not settings.trial_credits_only,
                 "demo_mode": registry.live_count == 0 and settings.allow_simulated and not settings.trial_credits_only, "checked_at": registry.checked_at,
                 "trial_credits_only": settings.trial_credits_only,
+                "trial_credit_expires_at": settings.trial_credit_expires_at.strip() or None,
+                "trial_credit_window_error": registry.trial_credit_window_error(),
                 "vertex": {"on": registry.uses_vertex, "project": settings.gcp_project, "location": settings.vertex_location},
                 "team_size": settings.team_size}
 
@@ -371,6 +373,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ------------------------------------------------------------------ runs
 
     async def _create_run(body: CreateRun):
+        window_error = registry.trial_credit_window_error()
+        if window_error:
+            raise HTTPException(403, window_error)
         await registry.recheck_failed()  # a key that failed before may work again
         if not registry.eligible():
             if settings.trial_credits_only:

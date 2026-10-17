@@ -32,6 +32,12 @@ export default function Page() {
   const [needsKeys, setNeedsKeys] = useState(false);
   const [demoMode, setDemoMode] = useState(false);
   const [trialCreditsOnly, setTrialCreditsOnly] = useState(false);
+  const [trialCreditExpiresAt, setTrialCreditExpiresAt] = useState<
+    string | null
+  >(null);
+  const [trialCreditWindowError, setTrialCreditWindowError] = useState<
+    string | null
+  >(null);
   const [vertex, setVertex] = useState<VertexInfo | null>(null);
   const [recent, setRecent] = useState<RunSummary[]>([]);
   const [menu, setMenu] = useState(false);
@@ -75,6 +81,8 @@ export default function Page() {
       setNeedsKeys(p.needs_keys);
       setDemoMode(!!p.demo_mode);
       setTrialCreditsOnly(!!p.trial_credits_only);
+      setTrialCreditExpiresAt(p.trial_credit_expires_at ?? null);
+      setTrialCreditWindowError(p.trial_credit_window_error ?? null);
       setVertex(p.vertex ?? null);
       setNetworkError("");
     } catch (e) {
@@ -242,11 +250,33 @@ export default function Page() {
             </b>
           </div>
           <div className="topbar-note">
-            <span className="health-dot healthy" />
-            {trialCreditsOnly ? "Trial credits only" : "Your private workspace"}
+            <span
+              className={
+                "health-dot " +
+                (trialCreditsOnly && trialCreditWindowError ? "" : "healthy")
+              }
+            />
+            {trialCreditsOnly
+              ? trialCreditWindowError
+                ? "Trial access paused"
+                : "Trial credits only"
+              : "Your private workspace"}
           </div>
         </header>
         <main id="main-content" tabIndex={-1}>
+          {trialCreditsOnly &&
+            trialCreditWindowError &&
+            route.view !== "settings" && (
+              <div className="notice warn" role="status">
+                <div>
+                  <strong>Trial access paused</strong>
+                  <p>{trialCreditWindowError}</p>
+                  <button className="link-btn" onClick={() => go("/settings")}>
+                    View connections
+                  </button>
+                </div>
+              </div>
+            )}
           {networkError && (
             <div className="notice warn" role="status">
               {networkError}{" "}
@@ -277,6 +307,8 @@ export default function Page() {
               providers={providers}
               vertex={vertex}
               trialCreditsOnly={trialCreditsOnly}
+              trialCreditExpiresAt={trialCreditExpiresAt}
+              trialCreditWindowError={trialCreditWindowError}
               refresh={() => loadProviders(true)}
               reload={() => loadProviders(false)}
             />
