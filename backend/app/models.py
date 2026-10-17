@@ -135,5 +135,9 @@ class ApprovePlan(BaseModel):
     note: str = ""
 
 
+class SaveKey(BaseModel):
+    key: str  # validated in the endpoint so error replies never echo it
+
+
 class Login(BaseModel):
     code: str

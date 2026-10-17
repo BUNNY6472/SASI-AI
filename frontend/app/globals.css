@@ -245,3 +245,13 @@ details summary { cursor: pointer; color: var(--accent-2); font-size: 13px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* API keys */
+.warnbadge { cursor: pointer; background: rgba(255, 198, 92, 0.14); color: #ffe0a3; border-color: rgba(255, 198, 92, 0.45); font: inherit; font-size: 12px; font-weight: 600; }
+.keys-cta { display: flex; gap: 16px; align-items: center; justify-content: space-between; flex-wrap: wrap; border-color: rgba(255, 198, 92, 0.45); background: rgba(40, 30, 12, 0.85); }
+.keys-cta .btn { text-decoration: none; }
+.key-form { display: grid; gap: 8px; margin-top: 6px; }
+.key-form .row2 { display: flex; gap: 8px; flex-wrap: wrap; }
+.key-form input { padding: 10px 12px; font-size: 14px; }
+.key-form .btn { padding: 8px 14px; }
+.lock-note { padding: 14px 16px; color: var(--text-2); font-size: 14px; }

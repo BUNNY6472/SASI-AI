@@ -21,7 +21,7 @@ export default function Page() {
   const [route, setRoute] = useState<Route>({ view: "home" });
   const [auth, setAuth] = useState<"unknown" | "in" | "out">("unknown");
   const [providers, setProviders] = useState<ProviderStatus[]>([]);
-  const [demo, setDemo] = useState(false);
+  const [needsKeys, setNeedsKeys] = useState(false);
   const [liveRun, setLiveRun] = useState<Run | null>(null);
 
   useEffect(() => {
@@ -33,9 +33,9 @@ export default function Page() {
 
   const loadProviders = useCallback(async (refresh = false) => {
     try {
-      const p = await api<{ providers: ProviderStatus[]; demo_mode: boolean }>(`/api/providers${refresh ? "?refresh=true" : ""}`);
+      const p = await api<{ providers: ProviderStatus[]; needs_keys: boolean }>(`/api/providers${refresh ? "?refresh=true" : ""}`);
       setProviders(p.providers);
-      setDemo(p.demo_mode);
+      setNeedsKeys(p.needs_keys);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) setAuth("out");
     }
@@ -70,13 +70,13 @@ export default function Page() {
             <nav>
               <button className={route.view !== "settings" ? "nav on" : "nav"} onClick={() => go("/")}>Workspace</button>
               <button className={route.view === "settings" ? "nav on" : "nav"} onClick={() => go("/settings")}>Connections</button>
-              {demo && <span className="badge demo hide-sm">Demo mode</span>}
+              {needsKeys && route.view !== "settings" && <button className="badge warnbadge hide-sm" onClick={() => go("/settings")}>Add API keys</button>}
             </nav>
           </header>
           <main>
-            {route.view === "home" && <Workspace open={(id) => go(`/run/${id}`)} demo={demo} providers={providers} />}
+            {route.view === "home" && <Workspace open={(id) => go(`/run/${id}`)} needsKeys={needsKeys} providers={providers} />}
             {route.view === "run" && <RunView key={route.id} id={route.id} onRun={setLiveRun} back={() => go("/")} />}
-            {route.view === "settings" && <Connections providers={providers} refresh={() => loadProviders(true)} />}
+            {route.view === "settings" && <Connections providers={providers} refresh={() => loadProviders(true)} reload={() => loadProviders(false)} />}
           </main>
           <footer className="foot">Results are reviewed by independent models, not guaranteed correct. Check anything important.</footer>
         </div>

@@ -15,8 +15,9 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 
 from .config import Settings, get_settings
-from .gateway.registry import ModelRegistry
-from .models import TERMINAL, ApprovePlan, CreateRun, Login, Run
+from .gateway.registry import PROVIDERS, ModelRegistry
+from .keys import build_key_store
+from .models import TERMINAL, ApprovePlan, CreateRun, Login, Run, SaveKey
 from .store.memory import MemoryStore
 from .workflow.controller import Controller
 from .workflow.profiles import PROFILES
@@ -41,6 +42,7 @@ def build_store(settings: Settings):
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     registry = ModelRegistry(settings)
+    key_store = build_key_store(settings)
     store = build_store(settings)
     history = PerformanceHistory()
     controller = Controller(settings, registry, store, history)
@@ -48,6 +50,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        try:
+            registry.apply_keys(await key_store.load())
+        except Exception as e:  # noqa: BLE001 - app still starts; Connections shows what is missing
+            log.warning("could not load API keys: %s", type(e).__name__)
         runs = await store.load()
         # Rebuild routing history from accepted work on past runs.
         for run in runs:
@@ -118,7 +124,53 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def providers(refresh: bool = False):
         if refresh or not registry.status:
             await registry.refresh()
-        return {"providers": registry.describe(), "demo_mode": registry.live_count == 0, "checked_at": registry.checked_at}
+        return {"providers": registry.describe(), "needs_keys": registry.live_count == 0 and not settings.allow_simulated, "demo_mode": registry.live_count == 0 and settings.allow_simulated, "checked_at": registry.checked_at}
+
+    @app.get("/api/keys")
+    async def keys_status():
+        """Which providers have a key. Never returns the keys themselves."""
+        return [{"provider": p, "configured": p in registry.hints, "hint": registry.hints.get(p)} for p in PROVIDERS]
+
+    @app.put("/api/keys/{provider}")
+    async def save_key(provider: str, body: SaveKey):
+        if provider not in PROVIDERS:
+            raise HTTPException(404, "Unknown provider")
+        key = body.key.strip()
+        if not 10 <= len(key) <= 500 or any(c.isspace() for c in key):
+            raise HTTPException(400, "That does not look like an API key. Paste the whole key.")
+        try:
+            model = await registry.test_key(provider, key)
+        except Exception as e:  # noqa: BLE001 - tell the user the key did not work, without echoing it
+            raw = str(e).replace(key, "***")
+            low = raw.lower()
+            if any(t in low for t in ("401", "403", "authentication", "api key not valid", "invalid x-api-key", "incorrect api key", "permission")):
+                msg = "the provider rejected it. Check that you copied the whole key and that it is active."
+            elif any(t in low for t in ("429", "quota", "billing", "credit")):
+                msg = "the key is valid but the account has no credit or quota left. Add billing in the provider's console."
+            elif "timeout" in low or "timed out" in low:
+                msg = "the provider did not answer in time. Try again."
+            else:
+                msg = raw[:200]
+            raise HTTPException(400, f"That key did not work: {msg}") from e
+        try:
+            await key_store.save(provider, key)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not store key for %s: %s", provider, type(e).__name__)
+            raise HTTPException(500, "The key works, but it could not be saved. Re-run deploy/setup-gcp.sh, then try again.") from e
+        registry.set_adapter(provider, key, model)
+        return {"provider": provider, "configured": True, "hint": registry.hints.get(provider), "model": model}
+
+    @app.delete("/api/keys/{provider}")
+    async def delete_key(provider: str):
+        if provider not in PROVIDERS:
+            raise HTTPException(404, "Unknown provider")
+        try:
+            await key_store.delete(provider)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not delete key for %s: %s", provider, type(e).__name__)
+            raise HTTPException(500, "Could not remove the key.") from e
+        registry.remove(provider)
+        return {"provider": provider, "configured": False}
 
     @app.get("/api/profiles")
     async def profiles():
@@ -151,6 +203,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/runs")
     async def create_run(body: CreateRun):
+        if not registry.eligible():
+            raise HTTPException(400, "Add at least one API key on the Connections page first.")
         if controller.active_count() >= settings.max_concurrent_runs:
             raise HTTPException(429, f"Up to {settings.max_concurrent_runs} runs can be active at once. Wait for one to finish.")
         run = Run(request=body.request.strip(), materials=body.materials, profile=body.profile if body.profile in PROFILES else "general",

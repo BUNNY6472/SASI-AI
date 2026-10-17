@@ -108,6 +108,7 @@ export interface ProviderStatus {
   ok: boolean | null;
   model: string | null;
   error: string | null;
+  key_hint: string | null;
 }
 
 export interface Profile {

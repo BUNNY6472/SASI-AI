@@ -47,12 +47,6 @@ fi
 
 echo "== Deploying to Cloud Run"
 SECRETS="APP_ACCESS_CODE=APP_ACCESS_CODE:latest,SESSION_SECRET=SESSION_SECRET:latest"
-for name in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY; do
-  if gcloud secrets describe "$name" --project "$PROJECT_ID" >/dev/null 2>&1; then
-    SECRETS="${SECRETS},${name}=${name}:latest"
-    echo "  using $name"
-  fi
-done
 retry gcloud run deploy "$SERVICE" \
   --project "$PROJECT_ID" \
   --region "$REGION" \
@@ -65,7 +59,7 @@ retry gcloud run deploy "$SERVICE" \
   --memory 512Mi \
   --concurrency 80 \
   --timeout 3600 \
-  --set-env-vars "STORAGE_BACKEND=bigquery,GCP_PROJECT=${PROJECT_ID},BIGQUERY_DATASET=sasi_data" \
+  --set-env-vars "STORAGE_BACKEND=bigquery,KEY_STORE=secretmanager,GCP_PROJECT=${PROJECT_ID},BIGQUERY_DATASET=sasi_data" \
   --set-secrets "$SECRETS" \
   --quiet
 

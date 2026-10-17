@@ -10,7 +10,7 @@ const EXAMPLES = [
   { profile: "general", text: "Plan a 4-week launch for a new mobile app on a ₹50,000 budget." },
 ];
 
-export default function Workspace({ open, demo, providers }: { open: (id: string) => void; demo: boolean; providers: ProviderStatus[] }) {
+export default function Workspace({ open, needsKeys, providers }: { open: (id: string) => void; needsKeys: boolean; providers: ProviderStatus[] }) {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [request, setRequest] = useState("");
@@ -62,16 +62,19 @@ export default function Workspace({ open, demo, providers }: { open: (id: string
           {providers.map((p) => (
             <span key={p.provider} className="agent-pill">
               <AgentChip id={p.provider} />
-              <small>{p.connected ? (p.ok === false ? "error" : "connected") : "demo"}</small>
+              <small>{p.connected ? (p.ok === false ? "error" : "connected") : "no key"}</small>
             </span>
           ))}
         </div>
       </section>
 
-      {demo && (
-        <div className="notice">
-          <strong>Demo mode.</strong> No API keys are connected yet, so simulated agents run the full workflow. Add the keys in
-          Google Cloud Secret Manager and the real models take over automatically.
+      {needsKeys && (
+        <div className="notice keys-cta">
+          <div>
+            <strong>Add your API keys to start.</strong> Paste your Claude, ChatGPT and Gemini keys on the Connections page.
+            They are stored on the server and never shown again.
+          </div>
+          <a className="btn primary" href="#/settings">Add keys</a>
         </div>
       )}
 
@@ -108,7 +111,7 @@ export default function Workspace({ open, demo, providers }: { open: (id: string
             <input type="checkbox" checked={approval} onChange={(e) => setApproval(e.target.checked)} />
             <span>Let me approve the plan first</span>
           </label>
-          <button className="btn primary" disabled={busy || request.trim().length < 3}>
+          <button className="btn primary" disabled={busy || needsKeys || request.trim().length < 3} title={needsKeys ? "Add an API key first" : undefined}>
             {busy ? "Starting…" : "Start collaboration"}
           </button>
         </div>
@@ -136,7 +139,7 @@ export default function Workspace({ open, demo, providers }: { open: (id: string
               </div>
               <p>{r.request}</p>
               <div className="muted small">
-                {r.profile} · {r.tasks} tasks · {fmt(r.tokens)} tokens{r.simulated ? " · demo" : ""}
+                {r.profile} · {r.tasks} tasks · {fmt(r.tokens)} tokens{r.simulated ? " · test run" : ""}
               </div>
             </button>
           ))}

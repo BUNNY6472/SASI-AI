@@ -26,9 +26,11 @@ Rules that are enforced by code, not by model opinion:
 - Pasted reference material is passed to models as untrusted data, never as instructions.
 - Model output is sanitized before it is shown in the browser.
 
-## Demo mode
+## API keys
 
-With no API keys, each provider is replaced by a simulated agent so the whole workflow runs end to end. Outputs are clearly labelled. As soon as a key is added for a provider, the real model takes over for that provider. With at least one real key, simulated agents are not used.
+Keys are pasted on the app's **Connections** page. The backend checks each key against the provider, stores it in Google Secret Manager (or memory when running locally), and starts using it immediately. Keys are never returned to the browser or logged; only the last 4 characters are shown. Runs need at least one key. With one key, that model also reviews its own work and results are labelled *self-reviewed*; with all three, every step is checked by a different model.
+
+Simulated agents exist only for the automated tests (`ALLOW_SIMULATED=true`).
 
 ## Code map
 
@@ -56,7 +58,7 @@ The document calls its stack "replaceable choices". To start inside the free tie
 - **Project record:** BigQuery (`sasi_data.run_checkpoints`, created automatically) instead of PostgreSQL. Cloud SQL has no free tier. Each meaningful step appends a checkpoint row; an interrupted run can resume from it without redoing accepted work.
 - **Workflow:** a small asyncio controller instead of LangGraph plus a job queue. Same stages and checkpoints, fewer moving parts. It runs inside the web service, which is limited to one instance.
 - **Models:** the official Anthropic, OpenAI and Google Gen AI SDKs. Claude defaults to `claude-opus-5-5`; ChatGPT and Gemini pick the newest general model from the account's live model list. Pin any of them with `CLAUDE_MODEL`, `OPENAI_MODEL`, `GEMINI_MODEL`.
-- **Sign-in:** one shared access code for now. Google sign-in and per-user projects come later.
+- **Sign-in:** a private access code, so only you can use it. Locking it to your Google account (Identity-Aware Proxy) is an easy later step.
 
 Not in this release: file uploads, sandboxed code execution, web search, benchmark feeds, multiple users. These are later phases in the document.
 

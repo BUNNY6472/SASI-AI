@@ -1,0 +1,95 @@
+"""Where the model API keys live.
+
+Keys are entered on the Connections page, sent once over HTTPS, and stored on the
+server only. They are never returned to the browser or written to logs.
+
+- "secretmanager": Google Cloud Secret Manager (production on Cloud Run).
+- "env": environment variables plus in-memory changes (local development).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from .config import Settings
+
+log = logging.getLogger("sasi.keys")
+
+SECRET_NAMES = {"claude": "ANTHROPIC_API_KEY", "chatgpt": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
+
+
+def hint(key: str) -> str:
+    """A safe reminder of which key is stored: only the last 4 characters."""
+    return f"…{key[-4:]}" if len(key) >= 12 else "set"
+
+
+class EnvKeyStore:
+    def __init__(self, settings: Settings):
+        self._keys = {
+            "claude": settings.anthropic_api_key.strip(),
+            "chatgpt": settings.openai_api_key.strip(),
+            "gemini": settings.gemini_api_key.strip(),
+        }
+
+    async def load(self) -> dict[str, str]:
+        return {p: k for p, k in self._keys.items() if k}
+
+    async def save(self, provider: str, key: str) -> None:
+        self._keys[provider] = key
+
+    async def delete(self, provider: str) -> None:
+        self._keys[provider] = ""
+
+
+class SecretManagerKeyStore:
+    def __init__(self, project: str):
+        from google.cloud import secretmanager
+
+        self._client = secretmanager.SecretManagerServiceClient()
+        self._project = project
+
+    def _secret(self, provider: str) -> str:
+        return f"projects/{self._project}/secrets/{SECRET_NAMES[provider]}"
+
+    def _read(self, provider: str) -> str:
+        from google.api_core import exceptions
+
+        try:
+            resp = self._client.access_secret_version(name=f"{self._secret(provider)}/versions/latest")
+            return resp.payload.data.decode("utf-8").strip()
+        except (exceptions.NotFound, exceptions.FailedPrecondition):
+            return ""  # secret or version missing: provider not connected
+        except exceptions.PermissionDenied:
+            log.warning("no permission to read %s; run deploy/setup-gcp.sh", SECRET_NAMES[provider])
+            return ""
+
+    def _enabled_versions(self, provider: str) -> list[str]:
+        versions = self._client.list_secret_versions(parent=self._secret(provider), filter="state:ENABLED")
+        return [v.name for v in versions]
+
+    def _write(self, provider: str, key: str) -> None:
+        new = self._client.add_secret_version(parent=self._secret(provider), payload={"data": key.encode("utf-8")})
+        # Keep one version per key (Secret Manager free tier covers 6 active versions).
+        for name in self._enabled_versions(provider):
+            if name != new.name:
+                self._client.destroy_secret_version(name=name)
+
+    def _remove(self, provider: str) -> None:
+        for name in self._enabled_versions(provider):
+            self._client.destroy_secret_version(name=name)
+
+    async def load(self) -> dict[str, str]:
+        values = await asyncio.gather(*(asyncio.to_thread(self._read, p) for p in SECRET_NAMES))
+        return {p: v for p, v in zip(SECRET_NAMES, values) if v}
+
+    async def save(self, provider: str, key: str) -> None:
+        await asyncio.to_thread(self._write, provider, key)
+
+    async def delete(self, provider: str) -> None:
+        await asyncio.to_thread(self._remove, provider)
+
+
+def build_key_store(settings: Settings):
+    if settings.key_store == "secretmanager":
+        return SecretManagerKeyStore(settings.gcp_project)
+    return EnvKeyStore(settings)

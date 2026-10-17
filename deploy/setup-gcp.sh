@@ -9,7 +9,7 @@
 #   - service account sasi-deployer  (what GitHub Actions uses to deploy)
 #   - keyless GitHub login (Workload Identity Federation) limited to the BUNNY6472/SASI-AI repo
 #   - secrets APP_ACCESS_CODE and SESSION_SECRET (random values)
-# It does NOT add model API keys; use deploy/add-api-key.sh for those.
+# Model API keys are entered later on the app's Connections page.
 set -euo pipefail
 
 PROJECT_ID="${PROJECT_ID:-sasi-511906}"
@@ -105,6 +105,16 @@ new_secret() {
 ACCESS_CODE="sasi-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 new_secret APP_ACCESS_CODE "$ACCESS_CODE"
 new_secret SESSION_SECRET "$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+
+echo "== Places for the model API keys (you paste the keys on the app's Connections page)"
+for name in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY; do
+  gcloud secrets describe "$name" >/dev/null 2>&1 || \
+    gcloud secrets create "$name" --replication-policy automatic >/dev/null
+  # The app may add a new key version and remove old ones, for these three secrets only.
+  gcloud secrets add-iam-policy-binding "$name" --member "serviceAccount:$RUNTIME_SA" \
+    --role roles/secretmanager.secretVersionManager >/dev/null
+  echo "  $name ready"
+done
 
 echo
 echo "================ DONE ================"

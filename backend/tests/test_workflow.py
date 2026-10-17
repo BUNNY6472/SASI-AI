@@ -12,7 +12,8 @@ from app.workflow.prompts import parse_json
 
 
 def make_client(**overrides) -> TestClient:
-    settings = Settings(_env_file=None, simulated_delay=0.0, static_dir="/nonexistent", **overrides)
+    opts = {"allow_simulated": True, **overrides}
+    settings = Settings(_env_file=None, simulated_delay=0.0, static_dir="/nonexistent", **opts)
     return TestClient(create_app(settings))
 
 
@@ -101,3 +102,43 @@ def test_failing_provider_is_replaced():
         run = wait_for(client, run["id"], {"completed", "failed"})
         assert run["status"] == "completed", run.get("error")
         assert any(e["type"] == "provider_error" for e in run["events"])
+
+
+def test_real_mode_needs_keys_before_running():
+    with make_client(allow_simulated=False) as client:
+        p = client.get("/api/providers").json()
+        assert p["needs_keys"] is True
+        assert all(not x["connected"] for x in p["providers"])
+        r = client.post("/api/runs", json={"request": "Hello there"})
+        assert r.status_code == 400
+        assert "API key" in r.json()["detail"]
+
+
+def test_keys_saved_from_app_are_never_returned(monkeypatch):
+    with make_client(allow_simulated=False) as client:
+        registry = client.app.state.registry
+
+        async def fake_test(provider, key):
+            if key.endswith("bad-key-0000"):
+                raise RuntimeError(f"401 invalid key {key}")
+            return "model-x"
+
+        monkeypatch.setattr(registry, "test_key", fake_test)
+        secret = "sk-test-1234567890abcdWXYZ"
+        r = client.put("/api/keys/claude", json={"key": secret})
+        assert r.status_code == 200, r.text
+        assert secret not in r.text and r.json()["hint"] == "…WXYZ"
+
+        bad = client.put("/api/keys/gemini", json={"key": "sk-bad-key-0000"})
+        assert bad.status_code == 400 and "sk-bad-key-0000" not in bad.text
+
+        assert client.put("/api/keys/chatgpt", json={"key": "short"}).status_code == 400
+
+        for path in ("/api/keys", "/api/providers"):
+            assert secret not in client.get(path).text
+        provs = {p["provider"]: p for p in client.get("/api/providers").json()["providers"]}
+        assert provs["claude"]["connected"] and provs["claude"]["model"] == "model-x"
+        assert not provs["gemini"]["connected"]
+
+        assert client.delete("/api/keys/claude").status_code == 200
+        assert not any(p["configured"] for p in client.get("/api/keys").json())

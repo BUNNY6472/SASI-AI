@@ -72,7 +72,7 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
         <button className="btn ghost" onClick={back}>← Workspace</button>
         <div className="run-title">
           <StatusBadge status={run.status} />
-          {run.simulated && <span className="badge demo">Demo agents</span>}
+          {run.simulated && <span className="badge demo">Test agents</span>}
           <h1>{run.request}</h1>
         </div>
         <div className="run-actions">

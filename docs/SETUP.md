@@ -60,19 +60,11 @@ Get the access code to open the app:
 gcloud secrets versions access latest --secret APP_ACCESS_CODE
 ```
 
-The app starts in demo mode.
+The app asks for your API keys until at least one is added.
 
-## 5. Add the API keys (when you have them)
+## 5. Add the API keys in the app
 
-In Cloud Shell, once per provider:
-
-```bash
-bash deploy/add-api-key.sh claude
-bash deploy/add-api-key.sh chatgpt
-bash deploy/add-api-key.sh gemini
-```
-
-Then **Actions → Deploy to Cloud Run → Run workflow**. Open **Connections** in the app to see each model connected and which model version it uses.
+Open the app, go to **Connections**, and paste each key (Claude, ChatGPT, Gemini). SASI checks each key, stores it in Secret Manager and starts using it straight away. No redeploy is needed. Keys are never shown again; only their last 4 characters are.
 
 Where to get keys: Claude at console.anthropic.com, ChatGPT at platform.openai.com, Gemini at aistudio.google.com. Set a monthly spend limit in each provider's console too; those charges are billed by the providers, not by Google Cloud.
 

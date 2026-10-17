@@ -22,8 +22,11 @@ class Settings(BaseSettings):
     app_access_code: str = ""
     session_secret: str = "dev-only-change-me"
 
-    # Demo mode: simulated agents when no provider key is set.
-    allow_simulated: bool = True
+    # Where keys entered in the app are stored: "env" (local) or "secretmanager" (Cloud Run).
+    key_store: str = "env"
+
+    # Simulated agents for automated tests only. Off in the real app.
+    allow_simulated: bool = False
     simulated_delay: float = 0.6
 
     # Run limits (protect the budget).
