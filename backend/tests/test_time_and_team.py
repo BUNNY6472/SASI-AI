@@ -191,9 +191,10 @@ def test_the_clock_pauses_while_the_plan_waits_for_approval():
         assert run["used_s"] < 6 and used <= run["used_s"]
 
 
-def test_no_cap_on_calls_or_tokens_by_default():
+def test_time_and_resource_caps_are_bounded_by_default():
     s = Settings(_env_file=None)
-    assert s.max_model_calls_per_run == 0 and s.max_tokens_per_run == 0 and s.eris_max_tokens_per_run == 0
+    assert s.max_model_calls_per_run == 300
+    assert s.max_tokens_per_run == 2_400_000 and s.eris_max_tokens_per_run == 3_600_000
     assert s.run_time_limit_minutes == 60 and s.wrap_up_minutes == 5
     with make_client() as client:
         limits = client.get("/api/limits").json()

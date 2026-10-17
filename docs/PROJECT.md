@@ -1,7 +1,9 @@
 # SASI: the whole project in one page
 
+> Historical deployment snapshot. For the current implementation and its limitations, use [README](../README.md) and [quality and release notes](QUALITY_AND_RELEASE.md). The changes on `codex/sasi-quality-workspace` have not been deployed by this document; model review is not an executed test or proof of correctness.
+
 SASI is a web app where several AI models work on one question together. They each answer on their own,
-score each other's approaches, agree on a plan, split the work, review each other, and deliver one tested
+score each other's approaches, agree on a plan, split the work, review each other, and deliver one reviewed
 answer. It runs on Google Cloud in the project **sasi-511906**.
 
 *As of 17 October 2026. Code: branch `claude/sasi-multi-ai-app-c549ms`, latest change `20686af`.*

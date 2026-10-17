@@ -14,9 +14,17 @@ const META: Record<string, { name: string; color: string }> = {
 };
 
 /** Name and colour for any model id, including ones this screen has not heard of. */
-export function providerMeta(id: string | null | undefined): { name: string; color: string } {
+export function providerMeta(id: string | null | undefined): {
+  name: string;
+  color: string;
+} {
   if (!id) return { name: "Unknown", color: "#8a93a6" };
-  return META[id] || { name: id.charAt(0).toUpperCase() + id.slice(1), color: "#8a93a6" };
+  return (
+    META[id] || {
+      name: id.charAt(0).toUpperCase() + id.slice(1),
+      color: "#8a93a6",
+    }
+  );
 }
 
 export interface Review {
@@ -94,6 +102,7 @@ export interface Consensus {
 }
 
 export interface Judgement {
+  artifact_hash?: string;
   judge: string;
   model: string;
   score: number | null;
@@ -111,6 +120,12 @@ export interface LiveText {
 }
 
 export interface Run {
+  mode?: "adaptive" | "quick" | "deep";
+  evidence?: Evidence[];
+  research_status?: string;
+  research_summary?: string;
+  search_queries?: string[];
+  search_entry_html?: string;
   id: string;
   created_at: number;
   updated_at: number;
@@ -134,6 +149,9 @@ export interface Run {
   plan_review: Review | null;
   plan_approved: boolean;
   final: {
+    verification_status?: "unverified" | "reviewed" | "partial" | "failed";
+    artifact_hash?: string | null;
+    checks?: VerificationCheck[];
     output: string;
     integrator: string | null;
     evaluator: string | null;
@@ -149,7 +167,10 @@ export interface Run {
     calls: number;
     input_tokens: number;
     output_tokens: number;
-    by_provider: Record<string, { calls: number; input_tokens: number; output_tokens: number }>;
+    by_provider: Record<
+      string,
+      { calls: number; input_tokens: number; output_tokens: number }
+    >;
   };
   events: RunEvent[];
   error: string | null;
@@ -165,9 +186,32 @@ export interface Run {
   finished_at?: number | null;
 }
 
+export interface Evidence {
+  id: string;
+  url: string;
+  title: string;
+  excerpt: string;
+  retrieved_at: number | string;
+  source_kind: string;
+  requested_url?: string;
+  content_hash?: string;
+  truncated?: boolean;
+}
+
+export interface VerificationCheck {
+  id: string;
+  kind: string;
+  status: "pass" | "fail" | "unknown";
+  summary: string;
+  artifact_hash?: string | null;
+}
+
 /** Seconds of the run's time used so far. */
 export function elapsed(run: Run, nowS = Date.now() / 1000): number {
-  return (run.used_s || 0) + (run.clock_started_at ? Math.max(0, nowS - run.clock_started_at) : 0);
+  return (
+    (run.used_s || 0) +
+    (run.clock_started_at ? Math.max(0, nowS - run.clock_started_at) : 0)
+  );
 }
 
 export function clock(seconds: number): string {
@@ -175,10 +219,13 @@ export function clock(seconds: number): string {
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
-  return h ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}` : `${m}:${String(sec).padStart(2, "0")}`;
+  return h
+    ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
+    : `${m}:${String(sec).padStart(2, "0")}`;
 }
 
 export interface RunSummary {
+  mode?: "adaptive" | "quick" | "deep";
   id: string;
   created_at: number;
   request: string;
@@ -210,6 +257,10 @@ export interface ProviderStatus {
   ok: boolean | null;
   model: string | null;
   error: string | null;
+  /** Disabled by the server's billing policy, even if credentials exist. */
+  policy_blocked?: boolean;
+  /** Scheduled MaaS retirement date, in UTC (YYYY-MM-DD). */
+  retirement_date?: string | null;
   key_hint: string | null;
   /** How the model is reached right now: "vertex" (Google Cloud) or "key" (an API key). */
   via: "vertex" | "key" | null;
@@ -231,6 +282,16 @@ export interface VertexInfo {
   location: string;
 }
 
+export interface ProvidersResponse {
+  providers: ProviderStatus[];
+  needs_keys: boolean;
+  demo_mode?: boolean;
+  trial_credits_only?: boolean;
+  vertex?: VertexInfo;
+  checked_at?: number | null;
+  team_size?: number;
+}
+
 export interface Profile {
   key: string;
   name: string;
@@ -238,20 +299,30 @@ export interface Profile {
 }
 
 export class ApiError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(
+    public status: number,
+    message: string,
+  ) {
     super(message);
   }
 }
 
 /** Upload one file with progress. Returns its reference for the run. */
-export function uploadFile(file: File, onProgress: (pct: number) => void): Promise<FileRef> {
+export function uploadFile(
+  file: File,
+  onProgress: (pct: number) => void,
+): Promise<FileRef> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/files");
     xhr.withCredentials = true;
     xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
-    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
-    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(Math.round((e.loaded / e.total) * 100));
+    xhr.setRequestHeader(
+      "Content-Type",
+      file.type || "application/octet-stream",
+    );
+    xhr.upload.onprogress = (e) =>
+      e.lengthComputable && onProgress(Math.round((e.loaded / e.total) * 100));
     xhr.onload = () => {
       let body: { detail?: string } & Partial<FileRef> = {};
       try {
@@ -260,9 +331,19 @@ export function uploadFile(file: File, onProgress: (pct: number) => void): Promi
         /* not JSON */
       }
       if (xhr.status >= 200 && xhr.status < 300) resolve(body as FileRef);
-      else reject(new Error(typeof body.detail === "string" ? body.detail : xhr.status === 413 ? "File is too large." : `Upload failed (${xhr.status})`));
+      else
+        reject(
+          new Error(
+            typeof body.detail === "string"
+              ? body.detail
+              : xhr.status === 413
+                ? "File is too large."
+                : `Upload failed (${xhr.status})`,
+          ),
+        );
     };
-    xhr.onerror = () => reject(new Error("Upload failed. Check your connection."));
+    xhr.onerror = () =>
+      reject(new Error("Upload failed. Check your connection."));
     xhr.send(file);
   });
 }
@@ -283,7 +364,10 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     let msg = res.statusText;
     try {
       const body = await res.json();
-      msg = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      msg =
+        typeof body.detail === "string"
+          ? body.detail
+          : JSON.stringify(body.detail);
     } catch {
       /* keep status text */
     }
@@ -295,13 +379,16 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 /** Providers currently doing something in a run, so the 3D scene can light them up. */
 export function activeProviders(run: Run | null): string[] {
   if (!run) return [];
-  const out = new Set<string>(Object.values(run.live || {}).map((l) => l.provider));
+  const out = new Set<string>(
+    Object.values(run.live || {}).map((l) => l.provider),
+  );
   if (run.status === "planning" && run.events.length) {
     const last = [...run.events].reverse().find((e) => e.provider);
     if (last?.provider) out.add(last.provider);
   }
   for (const t of run.plan?.tasks || []) {
-    if ((t.status === "working" || t.status === "revising") && t.implementer) out.add(t.implementer);
+    if ((t.status === "working" || t.status === "revising") && t.implementer)
+      out.add(t.implementer);
     if (t.status === "reviewing" && t.reviewer) out.add(t.reviewer);
   }
   if (run.status === "reviewing_plan" || run.status === "integrating") {
@@ -312,6 +399,8 @@ export function activeProviders(run: Run | null): string[] {
 }
 
 export const STATUS_LABEL: Record<string, string> = {
+  researching: "Researching",
+  verifying: "Checking evidence",
   analyzing: "Analysing",
   cross_checking: "Comparing",
   planning: "Planning",

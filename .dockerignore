@@ -5,6 +5,12 @@ frontend/out
 **/.pytest_cache
 **/.venv
 .git
+gha-creds-*.json
 .env
 **/.env
 docs
+artifacts
+data
+**/*.db
+**/*.db-shm
+**/*.db-wal

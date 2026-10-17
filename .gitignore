@@ -1,4 +1,5 @@
 node_modules/
+gha-creds-*.json
 .next/
 out/
 __pycache__/
@@ -10,4 +11,9 @@ venv/
 .env.*
 !.env.example
 *.tsbuildinfo
+data/
+*.db
+*.db-shm
+*.db-wal
+artifacts/qa/
 next-env.d.ts

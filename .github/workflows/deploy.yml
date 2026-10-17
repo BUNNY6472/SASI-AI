@@ -1,11 +1,12 @@
 name: Deploy to Cloud Run
 
-# Deploys main to Google Cloud Run. Uses keyless Workload Identity Federation:
+# Deploys the exact main commit after all jobs in CI succeed. Uses keyless Workload Identity Federation:
 # no Google key file is stored in GitHub. Run deploy/setup-gcp.sh once first.
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
     branches: [main]
-  workflow_dispatch:
+    types: [completed]
 
 concurrency:
   group: deploy-production
@@ -18,14 +19,45 @@ env:
   REPOSITORY: sasi
 
 jobs:
-  deploy:
-    if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
+  eligibility:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_repository.full_name == github.repository &&
+          vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tested_sha: ${{ steps.commit.outputs.tested_sha }}
+    steps:
+      - name: Select successful CI commit still at main
+        id: commit
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tested = context.payload.workflow_run.head_sha;
+            const branch = await github.rest.repos.getBranch({...context.repo, branch: 'main'});
+            if (branch.data.commit.sha !== tested) {
+              core.notice('Skipping superseded CI commit; a newer main commit must pass its own CI.');
+              return;
+            }
+            core.setOutput('tested_sha', tested);
+
+  deploy:
+    needs: eligibility
+    if: ${{ needs.eligibility.outputs.tested_sha != '' }}
+    runs-on: ubuntu-latest
+    env:
+      TESTED_SHA: ${{ needs.eligibility.outputs.tested_sha }}
     permissions:
       contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.eligibility.outputs.tested_sha }}
+          persist-credentials: false
 
       - id: auth
         uses: google-github-actions/auth@v2
@@ -37,7 +69,8 @@ jobs:
 
       - name: Build and push image
         run: |
-          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${SERVICE}:${GITHUB_SHA::12}"
+          test "$(git rev-parse HEAD)" = "$TESTED_SHA"
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${SERVICE}:${TESTED_SHA}"
           gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
           docker build -t "$IMAGE" .
           docker push "$IMAGE"
@@ -54,13 +87,14 @@ jobs:
             --service-account "sasi-runtime@${PROJECT_ID}.iam.gserviceaccount.com" \
             --allow-unauthenticated \
             --min-instances 0 \
+            --no-cpu-throttling \
             --max-instances 1 \
             --cpu 1 \
             --memory 1Gi \
             --concurrency 80 \
             --timeout 3600 \
-            --set-env-vars "STORAGE_BACKEND=bigquery,KEY_STORE=secretmanager,GCP_PROJECT=${PROJECT_ID},BIGQUERY_DATASET=sasi_data,VERTEX_AI=true" \
-            --set-secrets "$SECRETS"
+            --update-env-vars "STORAGE_BACKEND=bigquery,KEY_STORE=secretmanager,GCP_PROJECT=${PROJECT_ID},BIGQUERY_DATASET=sasi_data,VERTEX_AI=true,VERTEX_CLAUDE_ENABLED=false,TRIAL_CREDITS_ONLY=true,REQUIRE_ACCESS_TOKEN=true,ALLOW_SIMULATED=false,OPEN_MODELS=glm+deepseek+qwen+kimi+minimax+gptoss,MAX_MODEL_CALLS_PER_RUN=300,MAX_TOKENS_PER_RUN=2400000,ERIS_MAX_TOKENS_PER_RUN=3600000" \
+            --update-secrets "$SECRETS"
 
       - name: Show URL
         run: |

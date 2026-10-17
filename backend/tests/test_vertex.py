@@ -463,21 +463,20 @@ def vertex_app(monkeypatch, **overrides) -> TestClient:
 
 def test_registry_orders_routes_per_model(monkeypatch):
     monkeypatch.setattr(ModelRegistry, "_make_vertex", lambda self, p: Fake(f"vertex-{p}"))
-    registry = ModelRegistry(Settings(_env_file=None, vertex_ai=True))
+    registry = ModelRegistry(Settings(_env_file=None, vertex_ai=True, vertex_claude_enabled=True, open_models="glm,deepseek"))
     registry.apply_keys({"claude": "sk-ant-1234567890", "chatgpt": "sk-openai-1234567890"})
     order = {p: [r.via for r in a.routes] for p, a in registry.adapters.items()}
-    assert order == {"claude": ["vertex", "key"], "gemini": ["vertex"], "glm": ["vertex"], "deepseek": ["vertex"],
-                     "qwen": ["vertex"], "kimi": ["vertex"]}, \
+    assert order == {"claude": ["vertex", "key"], "gemini": ["vertex"], "glm": ["vertex"], "deepseek": ["vertex"]}, \
         "Google Cloud first, the API key as the backup; open models run on Google Cloud only; no OpenAI key"
     registry.remove("claude")
     assert [r.via for r in registry.adapters["claude"].routes] == ["vertex"], "removing a key keeps the Google Cloud route"
 
 
 def test_with_vertex_on_runs_need_no_keys(monkeypatch):
-    with vertex_app(monkeypatch, allow_simulated=False, simulated_delay=0.0) as client:
+    with vertex_app(monkeypatch, vertex_claude_enabled=True, open_models="glm,deepseek", allow_simulated=False, simulated_delay=0.0) as client:
         providers = client.get("/api/providers?refresh=true").json()
         assert providers["needs_keys"] is False and providers["vertex"]["on"] is True
-        assert [p["provider"] for p in providers["providers"]] == ["claude", "gemini", "glm", "deepseek", "qwen", "kimi"]
+        assert [p["provider"] for p in providers["providers"]] == ["claude", "gemini", "glm", "deepseek"]
         for p in providers["providers"]:
             assert p["connected"] and p["has_key"] is False and p["via"] == "vertex"
             assert p["key_option"] is (p["tier"] == "frontier"), "only Claude and Gemini take an API key"
@@ -498,3 +497,51 @@ def test_with_vertex_on_runs_need_no_keys(monkeypatch):
 
         assert client.delete("/api/keys").status_code == 200
         assert client.get("/api/providers").json()["needs_keys"] is False, "removing keys leaves Vertex working"
+
+
+def test_vertex_defaults_to_cloud_gemini_and_open_models_with_key_only_claude(monkeypatch):
+    monkeypatch.setattr("app.gateway.registry._utc_date", lambda: "2026-10-20")
+    made_vertex, made_keys = {}, {}
+
+    def make_vertex(self, provider):
+        made_vertex[provider] = Fake(f"vertex-{provider}")
+        return made_vertex[provider]
+
+    def make_key(self, provider, key):
+        made_keys[provider] = Fake(f"key-{provider}")
+        return made_keys[provider]
+
+    monkeypatch.setattr(ModelRegistry, "_make_vertex", make_vertex)
+    monkeypatch.setattr(ModelRegistry, "_make", make_key)
+    settings = Settings(_env_file=None, vertex_ai=True, open_models="glm,qwen,deepseek")
+    assert settings.vertex_claude_enabled is False
+    registry = ModelRegistry(settings)
+    assert set(made_vertex) == {"gemini", "glm", "qwen", "deepseek"}
+    assert "claude" not in registry.adapters
+    assert registry.unavailable()["claude"] == "no key added"
+
+    registry.apply_keys({"claude": "test-claude-key", "gemini": "test-gemini-key"})
+    assert {p: [r.via for r in a.routes] for p, a in registry.adapters.items()} == {
+        "claude": ["key"], "gemini": ["vertex", "key"],
+        "glm": ["vertex"], "qwen": ["vertex"], "deepseek": ["vertex"],
+    }
+    call = ModelCall(system="s", prompt="p", kind="task")
+    for provider, adapter in registry.adapters.items():
+        result = run(adapter.generate(call))
+        expected = "key" if provider == "claude" else "vertex"
+        assert result.via == expected and result.model == f"{expected}-{provider}"
+    assert made_keys["gemini"].calls == 0, "Gemini prefers its Vertex route when both are configured"
+
+    made_vertex["gemini"].error = "HTTP 403: Vertex route unavailable"
+    result = run(registry.adapters["gemini"].generate(call))
+    assert result.via == "key" and made_keys["gemini"].calls == 1
+    registry.remove("claude")
+    assert "claude" not in registry.adapters, "removing the Claude key must not enable a Vertex route"
+    assert "gemini" in registry.adapters and registry.uses_vertex
+
+
+def test_claude_vertex_opt_in_does_not_enable_vertex_when_master_switch_is_off(monkeypatch):
+    made = []
+    monkeypatch.setattr(ModelRegistry, "_make_vertex", lambda self, p: made.append(p))
+    registry = ModelRegistry(Settings(_env_file=None, vertex_ai=False, vertex_claude_enabled=True))
+    assert not made and not registry.uses_vertex and not registry.adapters

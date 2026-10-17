@@ -1,0 +1,10 @@
+.gcloudignore
+.git
+gha-creds-*.json
+#!include:.gitignore
+artifacts/
+data/
+**/.env
+**/*.db
+**/*.db-shm
+**/*.db-wal

@@ -81,7 +81,7 @@ def test_dependency_cycles_are_broken():
 
 def test_failing_provider_is_replaced():
     """A provider that errors is skipped and its work is reassigned; the run still completes."""
-    with make_client() as client:
+    with make_client(open_models="glm,deepseek,qwen") as client:
         registry = client.app.state.registry
 
         class Broken:
@@ -180,7 +180,7 @@ def test_files_reach_the_whole_team_who_analyse_compare_and_delete():
         empty = client.post("/api/files", content=b"", headers={"X-File-Name": "x.csv", "Content-Type": "text/csv"})
         assert empty.status_code == 400
 
-        run = client.post("/api/runs", json={"request": "Analyse the sales data", "profile": "research",
+        run = client.post("/api/runs", json={"request": "Analyse the sales data", "profile": "research", "compare_all": True,
                                              "require_plan_approval": False, "file_ids": [f["id"], img["id"]]}).json()
         assert [x["name"] for x in run["files"]] == ["sales.csv", "chart.png"]
         run = wait_for(client, run["id"], {"completed", "failed"})
@@ -412,14 +412,14 @@ def test_models_build_one_answer_together_test_it_and_fix_it():
 
             adapter.generate = spy
 
-        run = client.post("/api/runs", json={"request": "Analyse churn and recommend one plan", "require_plan_approval": False}).json()
+        run = client.post("/api/runs", json={"request": "Analyse churn and recommend one plan", "require_plan_approval": False, "compare_all": True}).json()
         run = wait_for(client, run["id"], {"completed", "failed"})
         assert run["status"] == "completed", run.get("error")
 
         c = run["consensus"]
         assert c["best"] == "claude" and c["average"] == {"claude": 8.0, "gemini": 7.0, "glm": 6.0, "deepseek": 5.0}
         assert all(cc["scores"] for cc in run["cross_checks"])
-        assert all("<team_decision>" in x.prompt and "Claude's approach as the base" in x.prompt
+        assert all("<team_decision>" in x.prompt and "Claude's approach as the initial candidate" in x.prompt
                    for x in seen if x.kind in ("plan", "task", "integrate") and x.hints.get("task_title") != "Final fixes")
 
         final = run["final"]

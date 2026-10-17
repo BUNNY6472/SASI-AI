@@ -34,6 +34,46 @@ log = logging.getLogger("sasi")
 COOKIE = "sasi_session"
 SESSION_MAX_AGE = 7 * 24 * 3600
 OPEN_PATHS = {"/api/health", "/api/login", "/api/session", "/api/logout"}
+_EXTRACTION_WORKERS: set[asyncio.Task] = set()
+
+
+async def _prepare_upload(slots: asyncio.Semaphore, name: str, mime: str, data: bytes,
+                          timeout_s: float = 30):
+    """Bound response wait and parser concurrency; a timed-out thread is not killed.
+
+    The resource slot belongs to the actual worker, including after its caller
+    times out or disconnects. New uploads cannot exceed the parser limit.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    await asyncio.wait_for(slots.acquire(), timeout=timeout_s)
+
+    async def work():
+        thread = asyncio.create_task(asyncio.to_thread(files_mod.prepare, name, mime, data))
+        cancelled = False
+        try:
+            while not thread.done():
+                try:
+                    await asyncio.shield(thread)
+                except asyncio.CancelledError:
+                    cancelled = True
+            result = thread.result()
+            if cancelled:
+                raise asyncio.CancelledError
+            return result
+        finally:
+            slots.release()
+
+    task = asyncio.create_task(work())
+    _EXTRACTION_WORKERS.add(task)
+
+    def finished(done):
+        _EXTRACTION_WORKERS.discard(done)
+        if not done.cancelled():
+            done.exception()  # consume errors if the HTTP waiter already left
+
+    task.add_done_callback(finished)
+    return await asyncio.wait_for(asyncio.shield(task), timeout=max(0.001, deadline - loop.time()))
 
 
 def build_store(settings: Settings):
@@ -43,16 +83,29 @@ def build_store(settings: Settings):
 
         db = BigQuery(settings.gcp_project, settings.bigquery_dataset)
         return BigQueryStore(settings.gcp_project, settings.bigquery_dataset, db), BigQueryFileStore(db)
+    if settings.storage_backend == "sqlite":
+        from .store.sqlite import SQLiteDatabase, SQLiteFileStore, SQLiteStore
+        db = SQLiteDatabase(settings.sqlite_path)
+        return SQLiteStore(db), SQLiteFileStore(db)
+    if settings.storage_backend != "memory":
+        raise ValueError("Unknown storage backend")
     return MemoryStore(), FileStore()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
+    if settings.require_access_token:
+        if not settings.app_access_code.strip():
+            raise ValueError("REQUIRE_ACCESS_TOKEN requires a non-empty APP_ACCESS_CODE.")
+        if not settings.session_secret.strip() or settings.session_secret.strip() == "dev-only-change-me":
+            raise ValueError("REQUIRE_ACCESS_TOKEN requires a non-default SESSION_SECRET.")
     registry = ModelRegistry(settings)
     key_store = build_key_store(settings)
     store, file_store = build_store(settings)
     history = PerformanceHistory()
     controller = Controller(settings, registry, store, history, file_store)
+    admission = asyncio.Lock()
+    extraction_slots = asyncio.Semaphore(2)
     signer = URLSafeTimedSerializer(settings.session_secret, salt="sasi-session")
 
     @asynccontextmanager
@@ -68,8 +121,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 for a in t.attempts:
                     if a.review and a.review.verdict in ("pass", "revise", "block"):
                         history.record(a.provider, run.profile, a.review.verdict == "pass")
-        asyncio.create_task(registry.refresh())
-        yield
+        refresh_task = asyncio.create_task(registry.refresh())
+        try:
+            yield
+        finally:
+            refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
+            if hasattr(controller, "shutdown"):
+                await controller.shutdown()
 
     app = FastAPI(title="SASI", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
@@ -85,17 +144,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not token:
             return False
         try:
-            signer.loads(token, max_age=SESSION_MAX_AGE)
-            return True
+            return signer.loads(token, max_age=SESSION_MAX_AGE) == "ok"
         except BadSignature:
             return False
 
     @app.middleware("http")
     async def access_gate(request: Request, call_next):
         path = request.url.path
-        if path.startswith("/api/") and path not in OPEN_PATHS and not authed(request):
-            return JSONResponse({"detail": "Enter the access code to continue."}, status_code=401)
-        response = await call_next(request)
+        api_path = path == "/api" or path.startswith("/api/")
+        private_docs = settings.require_access_token and path in ("/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect")
+        if (api_path or private_docs) and path not in OPEN_PATHS and not authed(request):
+            response = JSONResponse({"detail": "Enter the access code to continue."}, status_code=401)
+        else:
+            response = await call_next(request)
+        if api_path or private_docs:
+            # Run data and attachments must not be reused from browser/proxy
+            # caches after logout or an owner-token/session-secret rotation.
+            response.headers["Cache-Control"] = "no-store"
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "same-origin")
         return response
@@ -117,7 +182,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not hmac.compare_digest(body.code.strip().encode(), settings.app_access_code.strip().encode()):
             await asyncio.sleep(1)  # slow down guessing
             raise HTTPException(401, "That access code is not right.")
-        secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+        secure = settings.require_access_token or request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
         response.set_cookie(COOKIE, signer.dumps("ok"), max_age=SESSION_MAX_AGE, httponly=True, samesite="strict", secure=secure)
         return {"authenticated": True}
 
@@ -132,8 +197,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def providers(refresh: bool = False):
         if refresh or not registry.status:
             await registry.refresh()
-        return {"providers": registry.describe(), "needs_keys": registry.live_count == 0 and not settings.allow_simulated,
-                "demo_mode": registry.live_count == 0 and settings.allow_simulated, "checked_at": registry.checked_at,
+        return {"providers": registry.describe(), "needs_keys": registry.live_count == 0 and not settings.allow_simulated and not settings.trial_credits_only,
+                "demo_mode": registry.live_count == 0 and settings.allow_simulated and not settings.trial_credits_only, "checked_at": registry.checked_at,
+                "trial_credits_only": settings.trial_credits_only,
                 "vertex": {"on": registry.uses_vertex, "project": settings.gcp_project, "location": settings.vertex_location},
                 "team_size": settings.team_size}
 
@@ -146,6 +212,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def save_key(provider: str, body: SaveKey):
         if provider not in KEY_SEATS:
             raise HTTPException(404, "SASI takes API keys for Claude and Gemini only. The open models run through Google Cloud.")
+        if settings.trial_credits_only:
+            raise HTTPException(403, "API-key routes are disabled by trial-credit-only policy. Existing keys are preserved; only Vertex Gemini is allowed.")
         key = body.key.strip()
         if not 10 <= len(key) <= 500 or any(c.isspace() for c in key):
             raise HTTPException(400, "That does not look like an API key. Paste the whole key.")
@@ -260,7 +328,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def upload_file(request: Request):
         """Upload one file as the raw request body. The name comes in the X-File-Name header."""
         name = unquote(request.headers.get("x-file-name", "file"))
-        declared = int(request.headers.get("content-length") or 0)
+        try:
+            declared = int(request.headers.get("content-length") or 0)
+        except ValueError:
+            raise HTTPException(400, "Invalid content length") from None
         if declared > files_mod.MAX_FILE_BYTES:
             raise HTTPException(413, f"'{name}' is larger than {files_mod.MAX_FILE_BYTES // (1024 * 1024)} MB.")
         chunks, size = [], 0
@@ -270,8 +341,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(413, f"'{name}' is larger than {files_mod.MAX_FILE_BYTES // (1024 * 1024)} MB.")
             chunks.append(chunk)
         try:
-            f = files_mod.prepare(name, request.headers.get("content-type", ""), b"".join(chunks))
+            f = await _prepare_upload(extraction_slots, name, request.headers.get("content-type", ""), b"".join(chunks))
             file_store.stage(f)
+        except TimeoutError:
+            raise HTTPException(422, "File processing exceeded its time limit. Try a smaller file.") from None
         except FileRejected as e:
             raise HTTPException(400, str(e)) from e
         return f.ref()
@@ -297,10 +370,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # ------------------------------------------------------------------ runs
 
-    @app.post("/api/runs")
-    async def create_run(body: CreateRun):
+    async def _create_run(body: CreateRun):
         await registry.recheck_failed()  # a key that failed before may work again
         if not registry.eligible():
+            if settings.trial_credits_only:
+                raise HTTPException(400, "Trial-credit-only policy requires a working Vertex Gemini connection. Check the Google Cloud project and Vertex AI settings.")
             if registry.live_count:
                 why = "; ".join(f"{name(p)}: {r}" for p, r in registry.unavailable().items())
                 if registry.uses_vertex:
@@ -322,14 +396,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             profile = detect_profile(body.request, body.materials, [f.name for f in files])
         run = Run(request=body.request.strip(), materials=body.materials, profile=profile, eris=eris,
                   require_plan_approval=body.require_plan_approval, compare_all=body.compare_all,
+                  mode=body.mode, time_limit_minutes=body.time_limit_minutes,
                   files=[FileRef(**f.ref()) for f in files])
         try:
             await file_store.attach(run.id, files)
         except Exception as e:  # noqa: BLE001
             log.warning("could not save files for run %s: %s", run.id, e)
+            for f in files:
+                file_store.stage(f)
             raise HTTPException(500, "The files could not be saved. Try again.") from e
-        await controller.start(run)
+        try:
+            await controller.start(run)
+        except Exception as e:
+            run.status = "failed"
+            run.error = "The initial checkpoint could not be saved. No model work was started."
+            for f in files:
+                file_store.stage(f)
+            log.warning("could not start run %s: %s", run.id, type(e).__name__)
+            raise HTTPException(503, run.error) from e
         return run.model_dump(mode="json")
+
+    @app.post("/api/runs")
+    async def create_run(body: CreateRun):
+        # Reserve capacity through asynchronous attachment/checkpoint writes.
+        async with admission:
+            return await _create_run(body)
 
     @app.delete("/api/runs/{run_id}")
     async def delete_run(run_id: str):
@@ -343,7 +434,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/runs")
     async def list_runs(limit: int = 50):
-        return [r.summary() for r in store.list(min(limit, 200))]
+        return [r.summary() for r in store.list(max(1, min(limit, 200)))]
 
     @app.get("/api/runs/{run_id}")
     async def read_run(run_id: str):
@@ -380,7 +471,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def resume(run_id: str):
         run = get_run(run_id)
         try:
-            await controller.resume(run)
+            async with admission:
+                if controller.active_count() >= settings.max_concurrent_runs:
+                    raise HTTPException(429, "All run slots are occupied. Wait for a run to finish.")
+                await controller.resume(run)
         except ValueError as e:
             raise HTTPException(409, str(e)) from e
         return run.model_dump(mode="json")
@@ -392,7 +486,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         async def stream():
             try:
+                initial_terminal = run.status in TERMINAL and not controller.is_active(run.id)
                 yield f"data: {json.dumps(run.model_dump(mode='json'))}\n\n"
+                if initial_terminal:
+                    return
                 while True:
                     if await request.is_disconnected():
                         break

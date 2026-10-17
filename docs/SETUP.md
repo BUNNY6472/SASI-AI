@@ -2,7 +2,9 @@
 
 Project: `sasi-511906` · Region: `us-central1` · Service: `sasi` on Cloud Run.
 
-You do steps 1 to 3 once. After that, every merge to `main` deploys automatically.
+You do steps 1 to 3 once. After that, a successful CI run for the current `main` commit triggers deployment of that exact tested commit. Failed CI does not deploy.
+
+The current deployment configuration scales to zero, caps instances at one and keeps CPU available outside requests while an instance exists. Usage can consume credits. It remains a single-process workflow service: scale-down or a restart interrupts work, and **Resume** continues from the last checkpoint. Trial-only deployment permits Vertex Gemini only and requires the private owner access token. See [the current release notes](QUALITY_AND_RELEASE.md) before deploying.
 
 ## Fastest: one command for a live link
 
@@ -16,7 +18,7 @@ The repository is private, so Cloud Shell must sign in to GitHub once before `gi
 
 To redeploy after changes: `cd ~/SASI-AI && git pull && bash deploy/deploy-now.sh`
 
-It sets everything up, builds the app on Cloud Build (inside the free tier), deploys it and prints the link and access code. Do step 1 below too, and step 3 if you want merges to deploy automatically.
+It sets up the resources, builds the app on Cloud Build, deploys it and prints the link. Sign in with your existing access code. Cloud Build and the running service may incur charges. Do step 1 below too, and step 3 if you want merges to deploy automatically.
 
 ## 1. Protect the budget (2 minutes)
 
@@ -26,7 +28,7 @@ Google Cloud console → **Billing** → **Budgets & alerts** → **Create budge
 - Amount: ₹20,000
 - Alerts at 50%, 90% and 100%
 
-Alerts only email you; they do not stop spending. The app's own guards also limit each run (40 model calls, 200,000 tokens) and Cloud Run is capped at one instance that scales to zero when idle.
+Alerts only email you; they do not stop spending. By default the app limits each run to 300 model calls and 2,400,000 reported tokens (3,600,000 for Eris), reserves estimated tokens before parallel calls, and enforces the selected time ceiling. These are resource guards, not a currency-denominated billing cap. Provider retries, search charges and differences in token accounting can affect the invoice. Cloud Run is capped at one instance with instance-based billing; it does not scale to zero with the checked-in deployment configuration.
 
 ## 2. Run the setup script in Cloud Shell (5 minutes)
 
@@ -78,13 +80,13 @@ Gemini works straight away. For the others, open [Vertex AI Model Garden](https:
 
 Then press **Check again** on the app's Connections page. Each run uses up to four of them: Claude and Gemini first, then the open models that suit the task. A model you don't enable is skipped and the next one takes its seat.
 
-Google's free trial can't use partner models such as Claude, and its credit doesn't pay for them; the open models may be treated the same way. Until the billing account is upgraded to a paid one, those may show "not working" on Connections. Claude then uses its API key instead, if you saved one. Gemini on Vertex AI is paid from the trial credit.
+Google's welcome credit excludes managed partner models and Gemini API usage through AI Studio. The deployment's `TRIAL_CREDITS_ONLY=true` blocks those routes and direct API-key fallbacks before any checks or generation. Only Vertex Gemini is enabled. Do not upgrade the account under a trial-only spending requirement. Verify actual remaining credit, scope and expiry in Billing; alerts do not impose an exact spending cap.
 
 ## 6. API keys (optional)
 
 Open the app, go to **Connections**, and paste a Claude or Gemini key. SASI checks each key, stores it in Secret Manager and starts using it straight away. No redeploy is needed. Keys are never shown again; only their last 4 characters are. The open models need no key.
 
-A key is the backup route for that model: Claude and Gemini use Vertex AI first and the key if Vertex fails.
+Outside trial-only mode, Claude uses its API key by default and Gemini uses Vertex first with an optional key fallback. Trial-only mode disables key entry and use; stored keys remain in Secret Manager for a later funded configuration.
 
 Where to get keys: Claude at console.anthropic.com, Gemini at aistudio.google.com. A Gemini key on AI Studio's free tier costs nothing (it has rate limits, and Google may use free-tier prompts to improve its products). Set a monthly spend limit in each provider's console too; those charges are billed by the providers, not by Google Cloud.
 
@@ -104,5 +106,5 @@ SASI writes to BigQuery with load jobs, which are free. Files count toward the 1
 ## Good to know
 
 - Each run has a one-hour limit. In the last 5 minutes SASI stops new work and delivers the complete result from what is done. The clock pauses while a plan waits for your approval. Change it with `EXTRA_ENV="RUN_TIME_LIMIT_MINUTES=90,WRAP_UP_MINUTES=8" bash deploy/deploy-now.sh`.
-- Keep a run's page open while it works. Cloud Run only gives the app CPU while a request is open, so closing the page pauses the run (its clock keeps going). If the instance shuts down, the run shows **Interrupted** and **Resume from checkpoint** continues it with the time it has left, without redoing accepted work.
+- Keep a run's page open while it works. The deployed configuration allows CPU outside requests, but the instance may still scale down or restart. Interrupted work can resume from its last durable checkpoint without redoing accepted tasks.
 - To change the access code: `printf 'new-code' | gcloud secrets versions add APP_ACCESS_CODE --data-file=-`, then redeploy.

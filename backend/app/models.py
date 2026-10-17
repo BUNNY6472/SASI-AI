@@ -95,6 +95,28 @@ class Judgement(BaseModel):
     gaps: list[str] = []
     round: int = 0  # 0 = first check, 1 = after the fixes
     at: float = Field(default_factory=now)
+    artifact_hash: str = ""
+    artifact_version: int = 0
+
+
+class CheckResult(BaseModel):
+    id: str
+    kind: str
+    status: Literal["pass", "fail", "unknown"]
+    summary: str
+    artifact_hash: str
+
+
+class SourceEvidence(BaseModel):
+    id: str
+    url: str
+    title: str = ""
+    excerpt: str = ""
+    retrieved_at: float = Field(default_factory=now)
+    source_kind: str = "web"
+    requested_url: str = ""
+    content_hash: str = ""
+    truncated: bool = False
 
 
 class FinalResult(BaseModel):
@@ -108,6 +130,10 @@ class FinalResult(BaseModel):
     judges: list[Judgement] = []
     fixes: int = 0  # rounds of fixes after the other models tested it
     best_approach: str | None = None  # whose approach the single solution was built on
+    verification_status: Literal["unverified", "reviewed", "partial", "failed"] = "unverified"
+    artifact_hash: str = ""
+    artifact_version: int = 0
+    checks: list[CheckResult] = Field(default_factory=list)
 
 
 class FileRef(BaseModel):
@@ -155,7 +181,16 @@ class Run(BaseModel):
     profile: str = "general"
     eris: bool = False  # Project Eris mode: every model follows the Eris Solver Guidebook, dry runs only
     require_plan_approval: bool = True
-    compare_all: bool = True
+    compare_all: bool | None = None  # explicit legacy setting; None lets the effort policy decide
+    mode: Literal["adaptive", "quick", "deep"] = "adaptive"
+    time_limit_minutes: float | None = Field(default=None, ge=5, le=60)
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+    search_queries: list[str] = Field(default_factory=list)
+    search_entry_html: str | None = None
+    research_summary: str = ""
+    research_status: str = "not_started"
+    call_duration_s: dict[str, float] = Field(default_factory=dict)
+    gap_tasks_added: int = 0
     files: list[FileRef] = []
     analyses: list[Opinion] = []
     cross_checks: list[Opinion] = []
@@ -210,6 +245,8 @@ class Run(BaseModel):
             "team": self.team,
             "elapsed_s": round(self.elapsed_s),
             "time_limit_s": self.time_limit_s,
+            "mode": self.mode,
+            "verification_status": self.final.verification_status if self.final else "unverified",
         }
 
 
@@ -218,7 +255,9 @@ class CreateRun(BaseModel):
     materials: str = Field(default="", max_length=60_000)
     profile: str = "auto"  # "auto" lets SASI pick the field from the request
     require_plan_approval: bool = True
-    compare_all: bool = True
+    compare_all: bool | None = None
+    mode: Literal["adaptive", "quick", "deep"] = "adaptive"
+    time_limit_minutes: float | None = Field(default=None, ge=5, le=60)
     eris: bool = False  # Project Eris switch
     file_ids: list[str] = Field(default=[], max_length=10)
 

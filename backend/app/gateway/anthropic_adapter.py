@@ -62,7 +62,7 @@ class ClaudeAdapter:
             max_tokens=reply_room(call, MAX_OUTPUT),  # thinking counts toward this, so leave room for the answer
             system=self._system(call),
             messages=[{"role": "user", "content": self._content(call)}],
-            output_config={"effort": "medium"},
+            output_config={"effort": call.reasoning_effort},
             # On a safety decline, let the API rerun on Anthropic's recommended fallback.
             betas=["server-side-fallback-2026-07-01"],
             extra_body={"fallbacks": "default"},

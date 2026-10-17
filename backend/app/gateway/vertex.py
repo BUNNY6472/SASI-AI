@@ -40,9 +40,11 @@ def _unique(models: list[str]) -> list[str]:
 def _why(code: int, text: str) -> str:
     """A plain hint for a refused open-model call."""
     low = text.lower()
-    if code == 429 or "quota" in low:
-        return (" This Google Cloud project has no quota left for this model; new and free-trial projects can start with"
-                " none. See IAM & Admin > Quotas, or upgrade the billing account.")
+    if code == 429:
+        return (" The provider is rate limiting this request or has insufficient shared capacity. Retry with backoff; "
+                "check the detailed quota and billing status if it persists.")
+    if "quota" in low:
+        return " Check the model's quota and usage in Google Cloud."
     if "billing" in low or "free trial" in low:
         return " Google Cloud billing does not allow this model yet: upgrade the free trial to a paid billing account."
     if code in (401, 403):

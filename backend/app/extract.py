@@ -1,8 +1,8 @@
 """Turn data and document files into text the models can read.
 
 Parquet, Excel, Word, PowerPoint, JSON, ZIP and gzip files are converted here,
-with a profile computed from the whole file so models understand all of it even
-when only the first part fits in a prompt. Anything else that looks like text is
+with explicit bounded sampling and coverage notes. Sampling is not a substitute
+for querying the original dataset. Anything else that looks like text is
 read as text; other binary files are kept with the run and described to the models.
 """
 from __future__ import annotations
@@ -14,10 +14,51 @@ import io
 import json
 import re
 import zipfile
+from contextlib import contextmanager
+from itertools import islice
 
 TEXT_LIMIT = 150_000  # characters per data file; models with smaller context windows get a trimmed copy (gateway/fit.py)
-MAX_INNER_BYTES = 25 * 1024 * 1024
+MAX_INNER_BYTES = 8 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 512
+MAX_PREVIEW_FILES = 20
+MAX_TEXT_BYTES = 2 * 1024 * 1024
+MAX_TABLE_ROWS = 5000
+MAX_COLUMNS = 80
+MAX_CELLS = 100_000
+MAX_CELL_CHARS = 2000
 SAMPLE_ROWS = 200
+
+
+class ExtractionLimit(ValueError):
+    """The file exceeds the bounded preview reader's resource limits."""
+
+
+@contextmanager
+def _archive(data: bytes):
+    # Inspect the bounded end record before ZipFile allocates every member's metadata.
+    end = data.rfind(b"PK\x05\x06", max(0, len(data) - 65557))
+    if end < 0 or end + 22 > len(data):
+        raise ExtractionLimit("ZIP end record is missing or incomplete")
+    count = int.from_bytes(data[end + 10:end + 12], "little")
+    directory_bytes = int.from_bytes(data[end + 12:end + 16], "little")
+    if count > MAX_ARCHIVE_ENTRIES or directory_bytes > MAX_INNER_BYTES:
+        raise ExtractionLimit("Archive has too many entries or oversized metadata")
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        infos = z.infolist()
+        if len(infos) > MAX_ARCHIVE_ENTRIES or sum(i.file_size for i in infos) > MAX_ARCHIVE_BYTES:
+            raise ExtractionLimit("Archive exceeds the entry or 32 MiB expansion limit")
+        if any(i.file_size > MAX_INNER_BYTES or i.flag_bits & 1 for i in infos):
+            raise ExtractionLimit("Archive contains an encrypted or oversized member (8 MiB maximum)")
+        yield z
+
+
+def _member(z: zipfile.ZipFile, name) -> bytes:
+    with z.open(name) as source:
+        data = source.read(MAX_INNER_BYTES + 1)
+    if len(data) > MAX_INNER_BYTES:
+        raise ExtractionLimit("Archive member exceeds the expansion limit")
+    return data
 
 TEXT_EXT = {
     ".csv", ".tsv", ".txt", ".md", ".markdown", ".json", ".jsonl", ".ndjson", ".geojson", ".xml", ".log", ".yaml", ".yml",
@@ -85,7 +126,7 @@ def profile_rows(header: list[str], body: list[list]) -> str:
     """Per-column profile of a table: type, count, min, max, mean, distinct values."""
     lines = [f"Rows: {len(body)} (plus header). Columns: {len(header)}."]
     for i, col in enumerate(header[:80]):
-        vals = ["" if i >= len(r) or r[i] is None else str(r[i]) for r in body]
+        vals = ["" if i >= len(r) or r[i] is None else _cell(r[i]) for r in body]
         filled = [v for v in vals if v.strip()]
         nums = [n for n in (_num(v) for v in filled) if n is not None]
         if filled and len(nums) >= 0.9 * len(filled):
@@ -102,12 +143,15 @@ def profile_rows(header: list[str], body: list[list]) -> str:
 
 def profile_table(text: str, delimiter: str) -> str:
     try:
-        rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+        source = csv.reader(io.StringIO(text), delimiter=delimiter)
+        header = next(source, [])
+        limit = min(MAX_TABLE_ROWS, MAX_CELLS // max(1, min(len(header), MAX_COLUMNS)))
+        rows = [[_cell(v) for v in row[:MAX_COLUMNS]] for row in islice(source, limit)]
     except csv.Error:
         return ""
-    if len(rows) < 2:
+    if not rows:
         return ""
-    return profile_rows(rows[0], rows[1:])
+    return f"Preview profile: at most {limit:,} rows and {MAX_COLUMNS} columns; may omit data.\n" + profile_rows(header[:MAX_COLUMNS], rows)
 
 
 def _rows_to_csv(header: list, rows: list[list]) -> str:
@@ -123,8 +167,22 @@ def parquet_text(data: bytes) -> str:
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
 
-    table = pq.read_table(io.BytesIO(data))
-    lines = [f"Parquet table. Rows: {table.num_rows:,}. Columns: {table.num_columns}."]
+    if len(data) < 12 or int.from_bytes(data[-8:-4], "little") > MAX_TEXT_BYTES:
+        raise ExtractionLimit("Parquet metadata exceeds the preview limit")
+    source = pq.ParquetFile(io.BytesIO(data), thrift_string_size_limit=MAX_TEXT_BYTES,
+                            thrift_container_size_limit=100_000)
+    meta = source.metadata
+    if meta.num_row_groups > MAX_ARCHIVE_ENTRIES or meta.num_columns > 1024:
+        raise ExtractionLimit("Parquet has too many row groups or columns")
+    if sum(meta.row_group(i).total_byte_size for i in range(meta.num_row_groups)) > MAX_ARCHIVE_BYTES:
+        raise ExtractionLimit("Parquet exceeds the 32 MiB declared expansion limit")
+    columns = source.schema_arrow.names[:MAX_COLUMNS]
+    batch = next(source.iter_batches(batch_size=SAMPLE_ROWS, columns=columns, use_threads=False), None)
+    if batch is None:
+        return f"Parquet table. Rows: {meta.num_rows:,}. Columns: {meta.num_columns}. No rows."
+    table = pa.Table.from_batches([batch])
+    lines = [f"Parquet table. Rows: {meta.num_rows:,}. Columns: {meta.num_columns}.",
+             f"Preview statistics cover only the first {table.num_rows} rows and {len(columns)} columns; not the whole dataset."]
     for name, col in zip(table.column_names[:80], table.columns[:80]):
         t = col.type
         info = f"- {name} ({t}): nulls {col.null_count:,}"
@@ -154,29 +212,35 @@ def _cell(v) -> str:
         return ""
     if isinstance(v, (dict, list)):
         return json.dumps(v, default=str)[:500]
-    return str(v)
+    return str(v)[:MAX_CELL_CHARS]
 
 
 def excel_text(data: bytes) -> str:
     import openpyxl
 
-    wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    with _archive(data):
+        pass  # Validate all workbook members before openpyxl expands shared strings/XML.
+    wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True, keep_links=False)
     parts = [f"Excel workbook with {len(wb.sheetnames)} sheet(s): {', '.join(wb.sheetnames[:20])}"]
-    for ws in wb.worksheets[:10]:
-        rows = []
-        for row in ws.iter_rows(values_only=True):
-            if len(rows) > 100_000:
-                break
-            if any(c is not None for c in row):
-                rows.append([_cell(c) for c in row])
-        if not rows:
-            parts.append(f"\n## Sheet '{ws.title}': empty")
-            continue
-        header, body = rows[0], rows[1:]
-        parts.append(f"\n## Sheet '{ws.title}'\n{profile_rows([str(h) for h in header], body)}\n\nFirst rows (CSV):\n"
-                     + _rows_to_csv(header, body[:SAMPLE_ROWS]))
-    wb.close()
-    return "\n".join(parts)
+    try:
+        for ws in wb.worksheets[:10]:
+            columns = max(1, min(ws.max_column or MAX_COLUMNS, MAX_COLUMNS))
+            limit = min(MAX_TABLE_ROWS, MAX_CELLS // columns)
+            rows = []
+            for row in ws.iter_rows(max_row=limit, max_col=columns, values_only=True):
+                if any(c is not None for c in row):
+                    rows.append([_cell(c) for c in row])
+            if not rows:
+                parts.append(f"\n## Sheet '{ws.title}': no nonempty rows in the bounded preview")
+                continue
+            header, body = rows[0], rows[1:]
+            parts.append(clip(f"\n## Sheet '{ws.title}'\nPreview: first {limit} physical rows, {columns} columns; formulas use cached values.\n"
+                              f"{profile_rows([str(h) for h in header], body)}\n\nFirst rows (CSV):\n"
+                              + _rows_to_csv(header, body[:SAMPLE_ROWS]), TEXT_LIMIT // 10))
+    finally:
+        wb.close()
+    parts.append("Only the first 10 sheets are inspected. Preview statistics may omit data; formulas were not recalculated.")
+    return clip("\n".join(parts))
 
 
 # ---------------------------------------------------------------- documents
@@ -192,19 +256,22 @@ def _xml_text(xml: str, para_tag: str, text_tag: str) -> str:
 
 
 def docx_text(data: bytes) -> str:
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
-        xml = z.read("word/document.xml").decode("utf-8", errors="replace")
+    with _archive(data) as z:
+        xml = _member(z, "word/document.xml").decode("utf-8", errors="replace")
     return "Word document text:\n" + _xml_text(xml, "w:p", "w:t")
 
 
 def pptx_text(data: bytes) -> str:
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
+    with _archive(data) as z:
         slides = sorted((n for n in z.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", n)),
                         key=lambda n: int(re.findall(r"\d+", n)[-1]))
         out = [f"PowerPoint with {len(slides)} slides."]
-        for i, n in enumerate(slides, 1):
-            out.append(f"\n## Slide {i}\n" + _xml_text(z.read(n).decode("utf-8", errors="replace"), "a:p", "a:t"))
-    return "\n".join(out)
+        for i, n in enumerate(slides[:100], 1):
+            out.append(clip(f"\n## Slide {i}\n" + _xml_text(_member(z, n).decode("utf-8", errors="replace"), "a:p", "a:t"), TEXT_LIMIT // 10))
+            if sum(map(len, out)) >= TEXT_LIMIT:
+                break
+        out.append("Text-only preview, limited to 100 slides and the text budget; figures and speaker notes are not inspected.")
+    return clip("\n".join(out))
 
 
 def json_text(text: str, name: str) -> str:
@@ -240,12 +307,12 @@ def json_text(text: str, name: str) -> str:
 
 
 def zip_text(data: bytes, depth: int = 0) -> str:
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
+    with _archive(data) as z:
         infos = [i for i in z.infolist() if not i.is_dir()]
         out = [f"ZIP archive with {len(infos)} files:"]
         out += [f"- {i.filename} ({i.file_size / 1024:.0f} KB)" for i in infos[:300]]
         budget = TEXT_LIMIT
-        for i in infos:
+        for i in infos[:MAX_PREVIEW_FILES]:
             if budget <= 2000 or depth > 0:
                 break
             if i.file_size > MAX_INNER_BYTES or i.filename.startswith(("__MACOSX/", ".")):
@@ -253,13 +320,13 @@ def zip_text(data: bytes, depth: int = 0) -> str:
             ext = ext_of(i.filename)
             if ext not in TEXT_EXT and ext not in CONVERTERS:
                 continue
-            with z.open(i) as fh:
-                inner = fh.read(MAX_INNER_BYTES + 1)
+            inner = _member(z, i)
             text, ok = to_text(i.filename, inner, depth + 1)
             if ok:
                 piece = clip(text, budget)
                 out.append(f"\n<file name=\"{i.filename}\">\n{piece}\n</file>")
                 budget -= len(piece)
+        out.append(f"Archive preview inspects at most {MAX_PREVIEW_FILES} entries and the text budget; nested ZIP contents are not expanded.")
     return "\n".join(out)
 
 
@@ -268,6 +335,8 @@ def zip_text(data: bytes, depth: int = 0) -> str:
 
 def to_text(name: str, data: bytes, depth: int = 0) -> tuple[str, bool]:
     """Return (text for the models, readable). readable=False means the file is binary we cannot convert."""
+    if depth > 2:
+        raise ExtractionLimit("Nested archive depth exceeds the preview limit")
     ext = ext_of(name)
     if ext in (".parquet", ".pq") or data[:4] == b"PAR1":
         return parquet_text(data), True
@@ -282,14 +351,17 @@ def to_text(name: str, data: bytes, depth: int = 0) -> tuple[str, bool]:
     if ext == ".gz" and depth < 2:
         with gzip.open(io.BytesIO(data)) as fh:
             inner = fh.read(MAX_INNER_BYTES + 1)
+        if len(inner) > MAX_INNER_BYTES:
+            raise ExtractionLimit("Gzip expands beyond the 8 MiB preview limit")
         return to_text(name[:-3], inner, depth + 1)
     if ext in TEXT_EXT or looks_like_text(data):
-        text = decode(data)
+        text = decode(data[:MAX_TEXT_BYTES])
+        note = f"\n[Preview reads only the first {MAX_TEXT_BYTES:,} of {len(data):,} bytes.]" if len(data) > MAX_TEXT_BYTES else ""
         if ext in (".json", ".jsonl", ".ndjson", ".geojson", ".ipynb"):
-            return json_text(text, name), True
+            return clip(json_text(text, name)) + note, True
         if ext in (".csv", ".tsv"):
             profile = profile_table(text, "\t" if ext == ".tsv" else ",")
             if profile:
-                return f"Data profile (computed from the whole file):\n{profile}\n\n{text}", True
-        return text, True
+                return clip(f"Data preview (bounded sample):\n{profile}\n\n{text}") + note, True
+        return clip(text) + note, True
     return "", False

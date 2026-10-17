@@ -15,19 +15,23 @@ class Settings(BaseSettings):
     claude_model: str = "claude-opus-5-5"
     gemini_model: str = ""
 
-    # Google Cloud Vertex AI. When on, the app's own service account calls the models (billed to the Google Cloud
-    # project), so no API keys are needed. A saved Claude or Gemini API key stays as the other route for that model.
+    # Gemini and open models use the app's Google Cloud service account when Vertex AI is on.
+    # Claude uses its own API key unless its separate Vertex route is explicitly enabled.
+    # A saved Gemini API key remains a fallback behind its Vertex route.
     vertex_ai: bool = False
-    vertex_location: str = "global"  # Claude and Gemini
+    trial_credits_only: bool = False  # only Vertex Gemini; block partner models and API-key routes
+    vertex_claude_enabled: bool = False
+    vertex_location: str = "global"  # Gemini and optional Vertex Claude
     vertex_claude_model: str = ""  # empty: same as claude_model
     vertex_gemini_model: str = "gemini-4-argon"
     # Open models on Vertex AI that may join a team (ids from gateway/catalog.py), best first.
-    open_models: str = "glm,deepseek,qwen,kimi"
+    open_models: str = "glm,deepseek,qwen,kimi,minimax,gptoss"
     # Models per run: the working frontier models (Claude, Gemini) first, then the open models that suit the task.
     team_size: int = 4
 
     # Access control: everyone must enter this code before using the app.
     # Empty disables the gate (local development only).
+    require_access_token: bool = False  # production must never start with an open gate
     app_access_code: str = ""
     session_secret: str = "dev-only-change-me"
 
@@ -43,9 +47,9 @@ class Settings(BaseSettings):
     run_time_limit_minutes: float = 60
     wrap_up_minutes: float = 5
     # Optional caps; 0 means no cap.
-    max_model_calls_per_run: int = 0
-    max_tokens_per_run: int = 0
-    eris_max_tokens_per_run: int = 0
+    max_model_calls_per_run: int = 300
+    max_tokens_per_run: int = 2_400_000
+    eris_max_tokens_per_run: int = 3_600_000
     # Longest answer one call may write (thinking gets extra room on top). Eris runs write whole training scripts.
     max_output_tokens_per_call: int = 16_000
     eris_max_output_tokens_per_call: int = 32_000
@@ -53,11 +57,18 @@ class Settings(BaseSettings):
     max_revisions_per_task: int = 2
     max_final_fix_rounds: int = 2  # the other models test the final result; the integrator fixes what they find
     max_concurrent_runs: int = 3
+    max_gap_tasks_per_run: int = 1
+    max_replans_per_run: int = 1
+    # Research uses the existing Gemini connection; retrieved pages never become instructions.
+    enable_web_research: bool = True
+    research_timeout_seconds: float = 45
+    research_max_sources: int = 6
 
     # Storage.
-    storage_backend: str = "memory"  # "memory" or "bigquery"
+    storage_backend: str = "memory"  # "memory" (tests), "sqlite" (local), or "bigquery" (cloud)
     gcp_project: str = ""
     bigquery_dataset: str = "sasi_data"
+    sqlite_path: str = "data/sasi.db"
 
     # Static frontend directory (built Next.js export).
     static_dir: str = "static"

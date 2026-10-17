@@ -9,8 +9,8 @@ control what happens next:
   integrate -> the other models test the result and it is fixed -> deliver with
   evidence, limitations and usage.
 
-Time is a run's limit, not tokens or calls. Every call is bounded by the time
-left, each stage gets a share so one slow model cannot hold the run up, and in
+Time, tokens and calls bound a run. Every call is bounded by the time
+left; measured latency reserves time for synthesis and review, and in
 the last minutes (the wrap-up) SASI stops new work and delivers the complete
 result from what is done. The clock pauses while a plan waits for approval.
 
@@ -20,10 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError
 
 from .. import files as files_mod
 from ..config import Settings
@@ -33,20 +37,47 @@ from ..gateway.base import ModelCall, ModelResult, ProviderError, reply_room
 from ..gateway.catalog import name, reads, seat
 from ..gateway.registry import FRONTIER, ModelRegistry
 from ..gateway.routes import VIA, lasting_problem
-from ..models import (TERMINAL, Attempt, Consensus, Event, FinalResult, Judgement, LiveText, Opinion, Plan, Review, Run,
+from ..models import (TERMINAL, Attempt, CheckResult, Consensus, Event, FinalResult, Judgement, LiveText, Opinion, Plan, Review, Run,
                       Task, now)
 from ..store.base import RunStore
-from . import eris, prompts
+from . import eris, policy, prompts
 from .profiles import AUTO_FIELDS, get_profile
 from .router import PerformanceHistory, Router
 
 log = logging.getLogger("sasi.controller")
 
-# Shares of a run's time limit. Analyses and cross-checks stop waiting for a slow model after their share, and
-# task work stops early enough to leave FINISH_SHARE for writing and testing the final result.
-ANALYSIS_SHARE = 0.20
-CROSS_CHECK_SHARE = 0.10
-FINISH_SHARE = 0.25
+class ReviewPayload(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+    verdict: Literal["pass", "revise", "block", "accept"]
+    score: float = Field(ge=0, le=10)
+    findings: list[str]
+
+
+class JudgementPayload(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+    meets_criteria: StrictBool
+    score: float = Field(ge=0, le=10)
+    must_fix: list[str]
+    gaps: list[str]
+    limitations: list[str]
+
+
+class PlanTaskPayload(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+    id: str = Field(min_length=1, max_length=20, pattern=r"^[A-Za-z0-9_-]+$")
+    title: str = Field(min_length=1, max_length=200)
+    description: str = Field(min_length=1, max_length=4000)
+    depends_on: list[str]
+
+
+class PlanPayload(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+    field: Literal["software", "research", "general"] | None = None
+    goal: str = Field(min_length=1)
+    assumptions: list[str]
+    deliverables: list[str] = Field(min_length=1)
+    success_criteria: list[str] = Field(min_length=1)
+    tasks: list[PlanTaskPayload] = Field(min_length=1)
 
 
 def joined(names: list[str]) -> str:
@@ -90,9 +121,195 @@ class Controller:
         self._stage_end: dict[str, float] = {}  # run id -> when the current stage's share of time ends
         self._partial: dict[str, str] = {}  # run id -> a final result that was cut off by the time limit
         self._trim_noted: set[tuple[str, str]] = set()
+        self._token_reservations: dict[str, int] = {}
+        self._shutting_down = False
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ lifecycle
+
+    async def shutdown(self) -> None:
+        """Stop active work and persist an honest, resumable interruption state."""
+        self._shutting_down = True
+        active = [t for t in self._tasks.values() if not t.done()]
+        for task in active:
+            task.cancel()
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
+
+    async def _gather_evidence(self, run: Run, files: list[StoredFile]) -> None:
+        """Evidence collection extension point; model prose is never source evidence."""
+        from ..gateway.research import search
+        from ..models import SourceEvidence
+        from ..tools import collect_evidence
+
+        if run.research_status not in ("not_started", "collecting"):
+            return  # resume uses the same timestamped evidence, not a different answer's sources
+        run.research_status = "collecting"
+        self._event(run, "research", "Collecting supplied evidence and checking whether public research is needed.")
+        await self._publish(run)
+        remaining, _ = self._time_left(run)
+        budget = min(12.0, max(0.1, (remaining - policy.finish_reserve(run)) if remaining is not None else 12.0))
+        supplied = await collect_evidence("" if run.eris else run.request, "" if run.eris else run.materials,
+                                          files, deadline_s=budget, max_sources=self.settings.research_max_sources)
+        by_url = {e.url: e for e in run.evidence}
+        for item in supplied["items"]:
+            try:
+                evidence = SourceEvidence.model_validate(item)
+            except (ValidationError, ValueError, TypeError):
+                self._event(run, "evidence_unavailable", "A retrieved source record was invalid and was excluded from evidence.")
+                continue
+            by_url[evidence.url] = evidence
+        run.evidence = list(by_url.values())
+        for issue in supplied["issues"][:6]:
+            self._event(run, "evidence_unavailable", f"Could not retrieve {issue.get('url', 'source')}: {issue.get('summary', 'unavailable')}")
+        needs_search = (not run.eris and (run.profile == "research" or bool(re.search(
+            r"\b(search|browse|research|latest|today|current|recent|sources|literature)\b", run.request, re.I))))
+        if run.eris or not needs_search:
+            run.research_status = "supplied_only" if run.evidence else "not_needed"
+            await self._publish(run, checkpoint=True)
+            return
+        adapter = self.registry.adapters.get("gemini")
+        if not self.settings.enable_web_research or adapter is None or getattr(adapter, "simulated", False):
+            run.research_status = "unavailable"
+            self._event(run, "research_unavailable", "Public web discovery is unavailable. Only supplied evidence can be used; current facts remain unverified.")
+            await self._publish(run, checkpoint=True)
+            return
+        remaining, _ = self._time_left(run)
+        timeout = self.settings.research_timeout_seconds
+        if remaining is not None:
+            timeout = min(timeout, max(0, remaining - policy.finish_reserve(run)))
+        if timeout < 3:
+            run.research_status = "partial"
+            self._event(run, "research_unavailable", "Public search skipped to preserve time for the answer and its review.")
+            await self._publish(run, checkpoint=True)
+            return
+        reserve = fitting.tokens(run.request) + 12_000
+        try:
+            self._check_budget(run, reserve)
+        except BudgetExceeded:
+            run.research_status = "partial"
+            self._event(run, "research_unavailable", "Public search skipped because the remaining token or call budget is too small.")
+            return
+        self._token_reservations[run.id] = self._token_reservations.get(run.id, 0) + reserve
+        def charge_attempt() -> None:
+            # Each route can make a billable request, including a failed fallback.
+            self._check_budget(run)
+            run.usage.calls += 1
+            run.usage.by_provider.setdefault("gemini", {"calls": 0, "input_tokens": 0, "output_tokens": 0})["calls"] += 1
+
+        def charge_result(result: ModelResult) -> None:
+            run.usage.input_tokens += result.input_tokens
+            run.usage.output_tokens += result.output_tokens
+            bp = run.usage.by_provider.setdefault("gemini", {"calls": 0, "input_tokens": 0, "output_tokens": 0})
+            bp["input_tokens"] += result.input_tokens
+            bp["output_tokens"] += result.output_tokens
+            self._record(run, ModelCall(system="", prompt=run.request, kind="research"), result)
+
+        started = time.monotonic()
+        self._event(run, "research", "Searching public sources with Gemini and Google Search. Attachments are not sent to this search call.")
+        await self._publish(run)
+        try:
+            research = await asyncio.wait_for(search(
+                adapter, run.request, max_sources=self.settings.research_max_sources,
+                on_attempt=charge_attempt, on_result=charge_result), timeout=timeout)
+            result = research.result
+            policy.observe(run, "research", time.monotonic() - started)
+            run.search_queries = research.queries
+            run.search_entry_html = research.search_entry_html
+            valid_search = []
+            for item in research.evidence:
+                try:
+                    evidence = SourceEvidence.model_validate(item)
+                except (ValidationError, ValueError, TypeError):
+                    self._event(run, "evidence_unavailable", "A search source record was invalid and was excluded from evidence.")
+                    continue
+                valid_search.append(evidence)
+                by_url.setdefault(evidence.url, evidence)
+            # Ungrounded or invalid-source text is never promoted into the evidence brief.
+            run.research_summary = result.text if valid_search else ""
+            run.evidence = list(by_url.values())
+            run.research_status = "complete" if valid_search else "partial"
+            self._event(run, "research", f"Search returned {len(valid_search)} usable source links. Source coverage does not establish that every claim is correct.")
+        except (ProviderError, asyncio.TimeoutError, ValidationError, ValueError, TypeError, KeyError) as exc:
+            run.research_status = "unavailable"
+            self._event(run, "research_unavailable", "Public search did not finish: " + (str(exc)[:300] or "time limit reached") + ". Supplied evidence is still available.")
+        finally:
+            self._token_reservations[run.id] = max(0, self._token_reservations.get(run.id, 0) - reserve)
+        await self._publish(run, checkpoint=True)
+
+    @staticmethod
+    def _stamp_final(final: FinalResult) -> None:
+        current = hashlib.sha256(final.output.encode("utf-8")).hexdigest()
+        if current != final.artifact_hash:
+            final.artifact_hash = current
+            final.artifact_version += 1
+            final.score = final.meets_criteria = final.evaluator = None
+            final.verification_status = "unverified"
+
+    async def _verify_final(self, run: Run) -> None:
+        """Bind verification to the actual bytes. Deterministic checks plug in here."""
+        if run.final:
+            self._stamp_final(run.final)
+            from ..verification import verify_output
+
+            checks = verify_output(run.final.output, [e.model_dump() for e in run.evidence], artifact=run.solution or {})
+            if not run.solution:
+                checks = [c for c in checks if c["kind"] != "execution"]
+            has_web_evidence = any(e.source_kind in ("web", "google_search") for e in run.evidence)
+            if run.profile != "research" and not has_web_evidence and not re.search(r"https?://", run.final.output):
+                checks = [c for c in checks if c["kind"] != "citations"]
+            # Re-run deterministic checks on every version; keep past model reviews as history.
+            run.final.checks = [c for c in run.final.checks if c.kind == "model_review"] + [CheckResult.model_validate(c) for c in checks]
+            if run.research_status in ("unavailable", "partial"):
+                limitation = "Public research was unavailable or incomplete; current factual claims require further checking."
+                if limitation not in run.final.limitations:
+                    run.final.limitations.append(limitation)
+            self._refresh_final_assessment(run, run.final)
+
+    @staticmethod
+    def _current_artifact_hashes(run: Run, final: FinalResult) -> set[str]:
+        hashes = {final.artifact_hash}
+        solution = run.solution
+        if solution and run.final is final:
+            hashes.add(hashlib.sha256(solution["code"].encode("utf-8")).hexdigest())
+        return hashes
+
+    def _refresh_final_assessment(self, run: Run, final: FinalResult) -> None:
+        self._stamp_final(final)
+        current = [j for j in final.judges if j.artifact_hash == final.artifact_hash]
+        if current:
+            last_round = max(j.round for j in current)
+            current = [j for j in current if j.round == last_round]
+        scores = [j.score for j in current if j.score is not None]
+        final.score = round(sum(scores) / len(scores), 1) if scores else None
+        verdicts = [j.meets_criteria for j in current]
+        final.meets_criteria = (False if False in verdicts else True if verdicts and all(v is True for v in verdicts) else None)
+        final.evaluator = current[0].judge if current else None
+        final.gaps = (["Still to fix: " + m for j in current for m in j.must_fix]
+                      + [g for j in current for g in j.gaps])[:12]
+        current_review_ids: set[str] = set()
+        for j in current:
+            check = CheckResult(id=f"review:{j.judge}:{j.round}:{j.artifact_hash[:12]}", kind="model_review",
+                                status="fail" if j.meets_criteria is False or j.must_fix else
+                                "pass" if j.meets_criteria is True else "unknown",
+                                summary="; ".join(j.must_fix + j.gaps) or "Model opinion against the supplied criteria; not an executed test.",
+                                artifact_hash=j.artifact_hash)
+            current_review_ids.add(check.id)
+            final.checks = [c for c in final.checks if c.id != check.id] + [check]
+        current_hashes = self._current_artifact_hashes(run, final)
+        checks = [c for c in final.checks if c.artifact_hash in current_hashes
+                  and (c.kind != "model_review" or c.id in current_review_ids)]
+        unfinished = any(t.status != "accepted" for t in run.plan.tasks) if run.plan else False
+        independent = [j for j in current if j.judge != final.integrator and j.meets_criteria is True]
+        if any(c.status == "fail" for c in checks):
+            final.meets_criteria = False
+            final.verification_status = "failed"
+        elif unfinished or any(c.status == "unknown" for c in checks):
+            final.verification_status = "partial"
+        elif independent and final.meets_criteria is True:
+            final.verification_status = "reviewed"
+        else:
+            final.verification_status = "unverified"
 
     def active_count(self) -> int:
         return sum(1 for t in self._tasks.values() if not t.done())
@@ -119,8 +336,12 @@ class Controller:
 
     def _set_limit(self, run: Run) -> None:
         limit = max(0.0, self.settings.run_time_limit_minutes * 60)
+        if run.time_limit_minutes is not None:
+            requested = run.time_limit_minutes * 60
+            limit = min(limit, requested) if limit else requested
         run.time_limit_s = limit
-        run.wrap_up_s = min(max(0.0, self.settings.wrap_up_minutes * 60), limit / 4) if limit else 0.0
+        run.wrap_up_s = min(max(0.0, self.settings.wrap_up_minutes * 60), limit / 4,
+                            1.4 * policy.expected_seconds(run, "wrap_up") + 15) if limit else 0.0
 
     def _launch(self, run: Run) -> None:
         self._approvals.setdefault(run.id, asyncio.Event())
@@ -172,6 +393,10 @@ class Controller:
     async def _publish(self, run: Run, checkpoint: bool = False) -> None:
         run.updated_at = now()
         await self.store.save(run, checkpoint=checkpoint)
+        self._notify(run)
+
+    def _notify(self, run: Run) -> None:
+        """Wake clients even when durable storage is unavailable; this never claims a save."""
         for q in list(self._subscribers.get(run.id, ())):
             if q.full():
                 try:
@@ -215,14 +440,14 @@ class Controller:
             run.team.append(spare)
         return spare
 
-    def _check_budget(self, run: Run) -> None:
+    def _check_budget(self, run: Run, reserve: int = 0) -> None:
         """Optional caps on calls and tokens (0 means no cap). Time is the main limit."""
         s = self.settings
         if s.max_model_calls_per_run and run.usage.calls >= s.max_model_calls_per_run:
             raise BudgetExceeded(f"reached the limit of {s.max_model_calls_per_run} model calls for one run")
         limit = s.eris_max_tokens_per_run if run.eris else s.max_tokens_per_run
-        if limit and run.usage.total_tokens >= limit:
-            raise BudgetExceeded(f"reached the limit of {limit:,} tokens for one run")
+        if limit and run.usage.total_tokens + self._token_reservations.get(run.id, 0) + reserve >= limit:
+            raise BudgetExceeded(f"the next call and in-flight reservations would exceed the {limit:,}-token run limit")
 
     # ------------------------------------------------------------------ the clock
 
@@ -245,7 +470,7 @@ class Controller:
             return
         t = now()
         run.clock_started_at = t
-        run.deadline_at = t + max(run.time_limit_s - run.used_s, run.wrap_up_s + 2 * self._min_call(run))
+        run.deadline_at = t + max(0.0, run.time_limit_s - run.used_s)
 
     @staticmethod
     def _clock_stop(run: Run) -> None:
@@ -270,10 +495,6 @@ class Controller:
     def _has_time(self, run: Run, seconds: float) -> bool:
         left, _ = self._time_left(run)
         return left is None or left >= seconds
-
-    @staticmethod
-    def _share(run: Run, fraction: float) -> float | None:
-        return run.time_limit_s * fraction if run.time_limit_s else None
 
     def _out_cap(self, run: Run) -> int:
         """Longest answer one call may write. Eris runs need room for a whole training script."""
@@ -345,20 +566,34 @@ class Controller:
         again = shrunk = roomier = 0
         while True:
             left, scope = self._time_left(run)
+            call.reasoning_effort = policy.reasoning_effort(run, call.kind, left)
             timeout: float = base_timeout
             if left is not None:
                 if left < self._min_call(run):
                     raise OutOfTime(scope)
                 timeout = min(timeout, left)
-            self._check_budget(run)
             self._fit(run, provider, call, model_max)
+            reserve = fitting.measure(call, reads(provider)) + reply_room(call, model_max)
+            self._check_budget(run, reserve)
+            self._token_reservations[run.id] = self._token_reservations.get(run.id, 0) + reserve
             run.usage.calls += 1
             if live:
                 self._live(run, call, provider, *live)
+            started = time.monotonic()
             try:
                 result = await asyncio.wait_for(adapter.generate(call), timeout=timeout)
                 if not result.text.strip():  # adapters raise for this already; an empty answer is never recorded
                     raise ProviderError(provider, "the model returned no answer text", retryable=True)
+                stop = result.stop_reason.lower()
+                if ("max" in stop and "token" in stop) or "length" in stop:
+                    # A nonempty prefix is still incomplete, especially for code and JSON.
+                    run.usage.input_tokens += result.input_tokens
+                    run.usage.output_tokens += result.output_tokens
+                    bp = run.usage.by_provider.setdefault(provider, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
+                    bp["calls"] += 1
+                    bp["input_tokens"] += result.input_tokens
+                    bp["output_tokens"] += result.output_tokens
+                    raise ProviderError(provider, "the response was truncated by its output limit", retryable=True)
             except ProviderError as e:
                 last = e
                 stated = fitting.context_error(str(e))
@@ -368,11 +603,11 @@ class Controller:
                     self._event(run, "retry", f"{name(provider)} said the input was too long, so SASI trimmed it to fit "
                                 f"{limit:,} tokens and is trying again", provider)
                     continue
-                if "no answer text" in str(e) and roomier < 1:
+                if ("no answer text" in str(e) or "truncated" in str(e)) and roomier < 1:
                     roomier += 1
                     call.max_output_tokens = min(int(call.max_output_tokens * 1.5) + 2_000, model_max)
-                    self._event(run, "retry", f"{name(provider)} wrote no answer (it can spend its whole allowance "
-                                "thinking), so SASI is asking again with more room", provider)
+                    self._event(run, "retry", f"{name(provider)} did not finish its answer, so SASI is asking again "
+                                "with more output room", provider)
                     continue
                 if e.retryable and again < 1:
                     again += 1
@@ -388,7 +623,10 @@ class Controller:
                     again += 1
                     continue
                 break
+            finally:
+                self._token_reservations[run.id] = max(0, self._token_reservations.get(run.id, 0) - reserve)
             u = run.usage
+            policy.observe(run, call.kind, time.monotonic() - started)
             u.input_tokens += result.input_tokens
             u.output_tokens += result.output_tokens
             bp = u.by_provider.setdefault(provider, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
@@ -472,14 +710,20 @@ class Controller:
             try:
                 files = await self.files.get(run.id) if run.files else []
                 self._note_team(run, self._estimate(run, files))
+                await self._gather_evidence(run, files)
                 await self._publish(run)
-                if run.compare_all and not any(a.output for a in run.analyses):
+                effort = policy.allocate(run, len(self._eligible(run)), self.settings.max_tasks_per_plan)
+                self._event(run, "effort", f"{effort.reason}; {effort.analysts} initial analyst(s)")
+                if effort.analysts and not any(a.output for a in run.analyses):
                     run.analyses = []
                     await self._analyze(run, files)
-                if run.compare_all and not run.cross_checks:
+                if effort.cross_check and not run.cross_checks:
                     await self._cross_check(run)
                 if not run.plan or not run.plan.tasks:
                     await self._plan(run, load, files)
+                if (run.plan_review and run.plan_review.verdict != "accept"
+                        and not run.plan_approved and not run.require_plan_approval):
+                    raise ValueError("The saved plan did not pass review; resume cannot bypass that gate.")
                 if run.require_plan_approval and not run.plan_approved:
                     run.status = "awaiting_approval"
                     self._clock_stop(run)  # the clock pauses while the plan waits for the user
@@ -495,8 +739,9 @@ class Controller:
             except OutOfTime:
                 await self._wrap_up(run)
         except asyncio.CancelledError:
-            run.status = "cancelled"
-            self._event(run, "cancelled", "Run cancelled. Accepted work is kept.")
+            run.status = "interrupted" if self._shutting_down else "cancelled"
+            self._event(run, run.status, "Application stopped; accepted work is kept for resume." if self._shutting_down
+                        else "Run cancelled. Accepted work is kept.")
         except BudgetExceeded as e:
             run.status = "budget_stopped"
             run.error = str(e)
@@ -515,11 +760,19 @@ class Controller:
             self._stage_end.pop(run.id, None)
             self._partial.pop(run.id, None)
             self._trim_noted = {k for k in self._trim_noted if k[0] != run.id}
+            self._token_reservations.pop(run.id, None)
             self._clock_stop(run)
             if run.status in TERMINAL:
                 run.finished_at = now()
             run.live = {}
-            await self._publish(run, checkpoint=True)
+            try:
+                await self._publish(run, checkpoint=True)
+            except Exception as e:
+                log.exception("could not checkpoint run %s", run.id)
+                run.status = "failed"
+                run.error = f"Durable checkpoint failed: {type(e).__name__}. The latest work may not survive a restart."
+                self._event(run, "failed", run.error)
+                self._notify(run)
 
     # ------------------------------------------------------------------ independent analyses and cross-checks
 
@@ -552,6 +805,8 @@ class Controller:
     async def _analyze(self, run: Run, files: list[StoredFile]) -> None:
         """Every model on the team studies the request and files on its own, at the same time."""
         providers = self._eligible(run)
+        effort = policy.allocate(run, len(providers), self.settings.max_tasks_per_plan)
+        providers = providers[:effort.analysts]
         profile = get_profile(run.profile)
         run.status = "analyzing"
         what = "the request and files" if files else "the request"
@@ -559,6 +814,7 @@ class Controller:
                     f"{'are' if len(providers) > 1 else 'is'} analysing {what} independently, at the same time")
         await self._publish(run)
         system, prompt = prompts.analysis_prompt(run.request, run.materials, files_mod.describe(files), profile)
+        prompt += prompts.evidence_block(run.evidence)
 
         async def one(p: str) -> None:
             call = ModelCall(system, prompt, "analysis", self._out_cap(run),
@@ -571,7 +827,7 @@ class Controller:
                 run.analyses.append(Opinion(provider=p, error=str(e).removeprefix(f"{p}: ")))
             await self._publish(run)
 
-        cap = self._share(run, ANALYSIS_SHARE)
+        cap = policy.stage_allowance(run, "analysis", self._time_left(run)[0])
         stopped = await self._together({p: one(p) for p in providers}, cap, lambda: any(a.output for a in run.analyses))
         for p in stopped:
             run.analyses.append(Opinion(provider=p, error=f"still writing after {cap / 60:.0f} minutes, the time set for "
@@ -609,7 +865,7 @@ class Controller:
                 run.cross_checks.append(Opinion(provider=a.provider, error=str(e).removeprefix(f"{a.provider}: ")))
             await self._publish(run)
 
-        cap = self._share(run, CROSS_CHECK_SHARE)
+        cap = policy.stage_allowance(run, "cross_check", self._time_left(run)[0])
         stopped = await self._together({a.provider: one(a) for a in ok}, cap,
                                        lambda: any(c.output for c in run.cross_checks))
         for p in stopped:
@@ -650,8 +906,10 @@ class Controller:
         self._event(run, "stage", "Understanding the request and drafting a plan")
         await self._publish(run)
 
-        shared = prompts.findings_block(run.analyses, run.cross_checks) + prompts.consensus_block(run.consensus)
-        system, prompt = prompts.plan_prompt(run.request, run.materials, profile, self.settings.max_tasks_per_plan,
+        shared = (prompts.findings_block(run.analyses, run.cross_checks) + prompts.consensus_block(run.consensus)
+                  + prompts.evidence_block(run.evidence))
+        task_limit = policy.allocate(run, len(self._eligible(run)), self.settings.max_tasks_per_plan).task_limit
+        system, prompt = prompts.plan_prompt(run.request, run.materials, profile, task_limit,
                                              shared + ("\n\n" + files_mod.describe(files or []) if files else ""),
                                              self._task_minutes(run))
         planner, result, reason = await self._call_any(
@@ -671,16 +929,18 @@ class Controller:
         run.status = "reviewing_plan"
         await self._publish(run)
         for round_ in range(2):
-            system, prompt = prompts.plan_review_prompt(run.request, plan, profile)
+            system, prompt = prompts.plan_review_prompt(run.request, plan, profile,
+                                                        prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence))
             reviewer, rres, _ = await self._call_any(
-                run, "plan reviewer", ModelCall(system, prompt, "plan_review", 2500, {"request": run.request}),
+                run, "plan reviewer", ModelCall(system, prompt, "plan_review", 2500, {"request": run.request},
+                                                 attachments=files or []),
                 load, exclude={planner})
             review = self._parse_review(rres.text, reviewer, rres.model, default="accept")
             run.plan_review = review
             self._event(run, "plan_review", f"{name(reviewer)} reviewed the plan: {review.verdict}", reviewer)
             if review.verdict != "revise" or round_ == 1:
                 break
-            system, prompt = prompts.plan_revise_prompt(run.request, plan, review.findings, profile, self.settings.max_tasks_per_plan,
+            system, prompt = prompts.plan_revise_prompt(run.request, plan, review.findings, profile, task_limit,
                                                         self._task_minutes(run))
             try:
                 result = await self._call(run, planner, ModelCall(system, prompt, "plan", 4000, {"request": run.request}))
@@ -691,6 +951,8 @@ class Controller:
             revised.version = plan.version + 1
             plan = run.plan = revised
             self._event(run, "plan", f"{name(planner)} revised the plan (v{plan.version})", planner)
+        if run.plan_review and run.plan_review.verdict != "accept" and not run.require_plan_approval:
+            raise ValueError("The plan did not pass review after revision; no task work was started.")
         await self._publish(run, checkpoint=True)
 
     def _task_minutes(self, run: Run) -> float | None:
@@ -698,14 +960,20 @@ class Controller:
         if not run.time_limit_s:
             return None
         left = run.time_limit_s - run.elapsed_s - run.wrap_up_s
-        return max(1.0, (left - run.time_limit_s * FINISH_SHARE) / 60)
+        return max(0.0, (left - policy.finish_reserve(run)) / 60)
 
     def _parse_plan(self, text: str, run: Run) -> Plan:
-        data = prompts.parse_json(text) or {}
+        try:
+            data = PlanPayload.model_validate(prompts.parse_json(text)).model_dump()
+        except (ValidationError, ValueError, TypeError):
+            data = {}
         tasks_raw = data.get("tasks") or []
+        if len({t["id"] for t in tasks_raw}) != len(tasks_raw):
+            tasks_raw = []  # duplicate task identities cannot define a reliable dependency graph
         tasks: list[Task] = []
         seen: set[str] = set()
-        for i, t in enumerate(tasks_raw[: self.settings.max_tasks_per_plan]):
+        task_limit = policy.allocate(run, len(run.team) or 1, self.settings.max_tasks_per_plan).task_limit
+        for i, t in enumerate(tasks_raw[:task_limit]):
             if not isinstance(t, dict):
                 continue
             tid = re.sub(r"[^A-Za-z0-9_-]", "", str(t.get("id") or f"t{i + 1}"))[:20] or f"t{i + 1}"
@@ -716,11 +984,15 @@ class Controller:
                               description=str(t.get("description") or "")[:4000],
                               depends_on=[str(d) for d in (t.get("depends_on") or []) if isinstance(d, (str, int))]))
         ids = {t.id for t in tasks}
-        for t in tasks:
-            t.depends_on = [d for d in t.depends_on if d in ids and d != t.id]
-        self._break_cycles(tasks)
+        if any(d not in ids or d == t.id for t in tasks for d in t.depends_on):
+            tasks = []
+        else:
+            edges = sum(len(t.depends_on) for t in tasks)
+            self._break_cycles(tasks)
+            if sum(len(t.depends_on) for t in tasks) != edges:
+                tasks = []  # never silently reinterpret a cyclic dependency graph
         if not tasks:
-            self._event(run, "plan_fallback", "The plan could not be read; using a single-task plan")
+            self._event(run, "plan_fallback", "The plan schema or dependencies were invalid; a complete-request task must pass plan review")
             tasks = [Task(id="t1", title="Complete the request", description=run.request)]
 
         def strs(key: str) -> list[str]:
@@ -751,18 +1023,16 @@ class Controller:
                 visit(t.id)
 
     def _parse_review(self, text: str, reviewer: str, model: str, default: str) -> Review:
-        data = prompts.parse_json(text)
-        if not data:
-            # An unreadable review is not a pass.
-            return Review(reviewer=reviewer, model=model, verdict="revise" if default == "pass" else default,
-                          findings=["Reviewer reply was not valid JSON: " + text[:300]])
-        verdict = str(data.get("verdict", default)).lower().strip()
-        if verdict not in ("pass", "revise", "block", "accept"):
-            verdict = default
-        score = data.get("score")
-        return Review(reviewer=reviewer, model=model, verdict=verdict,
-                      score=float(score) if isinstance(score, (int, float)) else None,
-                      findings=[str(f) for f in (data.get("findings") or [])][:12])
+        try:
+            data = ReviewPayload.model_validate(prompts.parse_json(text))
+            allowed = {"accept", "revise"} if default == "accept" else {"pass", "revise", "block"}
+            if data.verdict not in allowed:
+                raise ValueError("verdict is invalid for this review stage")
+        except (ValidationError, ValueError, TypeError):
+            return Review(reviewer=reviewer, model=model, verdict="revise",
+                          findings=["The review was invalid or incomplete and cannot approve this work. Recheck the requirements and return the required schema."])
+        return Review(reviewer=reviewer, model=model, verdict=data.verdict,
+                      score=data.score, findings=data.findings[:12])
 
     async def _run_tasks(self, run: Run, load: dict[str, int], files: list[StoredFile] | None = None) -> None:
         plan = run.plan
@@ -770,9 +1040,9 @@ class Controller:
         if run.deadline_at:
             # Task work stops early enough to leave time for writing and testing the final result.
             work_end = run.deadline_at - run.wrap_up_s
-            reserve = self._share(run, FINISH_SHARE) or 0.0
+            reserve = policy.finish_reserve(run)
             left = work_end - now()
-            self._stage_end[run.id] = work_end - min(reserve, left / 2)
+            self._stage_end[run.id] = work_end - min(reserve, max(0.0, left - self._min_call(run)))
         try:
             while True:
                 by_id = {t.id: t for t in plan.tasks}
@@ -830,11 +1100,11 @@ class Controller:
         return task.output or next((a.output for a in reversed(task.attempts) if a.output), "")
 
     async def _review_call(self, run: Run, reviewer: str, implementer: str, load: dict[str, int], system: str,
-                           prompt: str, task: Task, revision: int) -> Review:
+                           prompt: str, task: Task, revision: int, files: list[StoredFile] | None = None) -> Review:
         """An independent review of one attempt. If the reviewer fails, another model reviews it."""
         hints = {"request": run.request, "task_id": task.id, "task_title": task.title, "is_revision": revision > 0}
         try:
-            rres = await self._call(run, reviewer, ModelCall(system, prompt, "review", 2500, hints))
+            rres = await self._call(run, reviewer, ModelCall(system, prompt, "review", 2500, hints, attachments=files or []))
             return self._parse_review(rres.text, reviewer, rres.model, default="pass")
         except ProviderError:
             alt = [p for p in self._eligible(run) if p not in (implementer, reviewer)]
@@ -843,7 +1113,7 @@ class Controller:
             reviewer = self.router.pick(alt, run.profile, load, "reviewer", kind="review").provider
             task.reviewer = reviewer
             try:
-                rres = await self._call(run, reviewer, ModelCall(system, prompt, "review", 2500, hints))
+                rres = await self._call(run, reviewer, ModelCall(system, prompt, "review", 2500, hints, attachments=files or []))
             except ProviderError:
                 return Review(reviewer="none", verdict="revise", findings=["No independent reviewer was available"])
             return self._parse_review(rres.text, reviewer, rres.model, default="pass")
@@ -852,10 +1122,13 @@ class Controller:
         plan = run.plan
         assert plan is not None
         profile = get_profile(run.profile)
-        shared = prompts.findings_block(run.analyses, run.cross_checks, limit=4000) + prompts.consensus_block(run.consensus)
+        shared = (prompts.findings_block(run.analyses, run.cross_checks, limit=4000) + prompts.consensus_block(run.consensus)
+                  + prompts.evidence_block(run.evidence))
         task_files = self._task_files(run, files)
         deps = [t for t in plan.tasks if t.id in task.depends_on]
         tried_implementers: set[str] = set()
+        previous: str | None = self._draft(task) or None
+        findings: list[str] = [f for a in task.attempts if a.review for f in a.review.findings][-12:]
 
         # Up to two implementers (original + one reassignment), each with bounded revisions.
         for assignment in range(2):
@@ -870,13 +1143,11 @@ class Controller:
             if assignment:
                 self._event(run, "reassigned", f"'{task.title}' reassigned to {name(implementer)}", implementer, task.id)
 
-            previous: str | None = None
-            findings: list[str] = []
             for revision in range(self.settings.max_revisions_per_task + 1):
                 task.status = "working" if revision == 0 else "revising"
                 self._event(run, "working", f"{name(implementer)} is {'revising' if revision else 'working on'} '{task.title}'", implementer, task.id)
                 await self._publish(run)
-                system, prompt = prompts.task_prompt(plan, task, deps, profile, run.materials, findings, previous, shared)
+                system, prompt = prompts.task_prompt(plan, task, deps, profile, run.materials, findings, previous, shared, run.request)
                 try:
                     result = await self._call(run, implementer, ModelCall(
                         system, prompt, "task", self._out_cap(run),
@@ -891,8 +1162,11 @@ class Controller:
                 task.status = "reviewing"
                 self._event(run, "reviewing", f"{name(reviewer)} is reviewing '{task.title}'", reviewer, task.id)
                 await self._publish(run)
-                system, prompt = prompts.review_prompt(plan, task, result.text, profile)
-                review = await self._review_call(run, reviewer, implementer, load, system, prompt, task, revision)
+                context = (f"Original user request:\n{run.request}" + prompts.materials_block(run.materials)
+                           + prompts.evidence_block(run.evidence)
+                           + "\n\nAccepted dependencies:\n" + "\n\n".join(f"{d.id}: {d.output}" for d in deps))
+                system, prompt = prompts.review_prompt(plan, task, result.text, profile, context)
+                review = await self._review_call(run, reviewer, implementer, load, system, prompt, task, revision, task_files)
                 reviewer = task.reviewer or reviewer
                 attempt.review = review
                 self._event(run, "review", f"{name(review.reviewer)}: {review.verdict} on '{task.title}'", review.reviewer, task.id)
@@ -906,9 +1180,9 @@ class Controller:
                     await self._publish(run, checkpoint=True)
                     return
                 self.history.record(implementer, run.profile, False)
+                previous, findings = result.text, review.findings
                 if review.verdict == "block":
                     break
-                previous, findings = result.text, review.findings
 
         task.status = "needs_human_review"
         self._event(run, "needs_human_review", f"'{task.title}' did not pass review within the retry limit; its latest draft "
@@ -918,27 +1192,30 @@ class Controller:
     async def _judge(self, run: Run, plan: Plan, output: str, profile, judges: list[str], round_: int) -> list[Judgement]:
         """Each judge tests the final result on its own, at the same time. A judge that fails or runs out of time
         is left out of that round."""
-        system, prompt = prompts.final_eval_prompt(run.request, plan, output, profile)
+        system, prompt = prompts.final_eval_prompt(run.request, plan, output, profile,
+                                                  prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence))
         final = run.final
         assert final is not None
+        artifact_hash = hashlib.sha256(output.encode("utf-8")).hexdigest()
+        artifact_version = final.artifact_version
+        files = await self.files.get(run.id) if run.files else []
 
         async def one(p: str) -> Judgement | None:
             try:
                 res = await self._call(run, p, ModelCall(system, prompt, "final_eval", 3000,
-                                                         {"request": run.request, "round": round_}))
+                                                         {"request": run.request, "round": round_}, attachments=files))
             except (ProviderError, OutOfTime):
                 return None
-            data = prompts.parse_json(res.text) or {}
-            score = data.get("score")
-
-            def strs(key: str) -> list[str]:
-                return [str(x) for x in (data.get(key) or []) if isinstance(x, (str, int, float))][:10]
-
-            j = Judgement(judge=p, model=res.model, round=round_,
-                          score=max(0.0, min(10.0, float(score))) if isinstance(score, (int, float)) and not isinstance(score, bool) else None,
-                          meets_criteria=bool(data["meets_criteria"]) if "meets_criteria" in data else None,
-                          must_fix=strs("must_fix"), gaps=strs("gaps") or ([] if data else ["Its test reply could not be read."]))
-            for x in strs("limitations"):
+            try:
+                data = JudgementPayload.model_validate(prompts.parse_json(res.text))
+            except (ValidationError, ValueError, TypeError):
+                data = None
+            j = Judgement(judge=p, model=res.model, round=round_, artifact_hash=artifact_hash,
+                          artifact_version=artifact_version, score=data.score if data else None,
+                          meets_criteria=data.meets_criteria if data else None,
+                          must_fix=data.must_fix[:10] if data else [],
+                          gaps=data.gaps[:10] if data else ["The review was invalid or incomplete; it cannot verify this artifact."])
+            for x in data.limitations[:10] if data else []:
                 if x not in final.limitations:
                     final.limitations.append(x)
             self._event(run, "judged", f"{name(p)} scored the result {j.score if j.score is not None else 'n/a'}/10"
@@ -969,7 +1246,8 @@ class Controller:
         self._event(run, "stage", f"Writing the final result from {len(accepted)} accepted output{'s' if len(accepted) != 1 else ''}"
                     + (f" and {len(drafts)} unreviewed draft{'s' if len(drafts) != 1 else ''}" if drafts else ""))
         await self._publish(run)
-        shared = prompts.findings_block(run.analyses, run.cross_checks, limit=3000) + prompts.consensus_block(run.consensus)
+        shared = (prompts.findings_block(run.analyses, run.cross_checks, limit=3000) + prompts.consensus_block(run.consensus)
+                  + prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence))
         system, prompt = prompts.integrate_prompt(run.request, plan, accepted, missing, profile, shared, drafts)
         started = time.monotonic()
         integrator, result, _ = await self._call_any(run, "integrator", ModelCall(
@@ -980,12 +1258,16 @@ class Controller:
         final = FinalResult(output=result.text, integrator=integrator,
                             best_approach=run.consensus.best if run.consensus else None)
         run.final = final  # shown while the other models test it
+        await self._verify_final(run)
         self._event(run, "integrated", f"{name(integrator)} wrote the single combined result", integrator)
         await self._publish(run, checkpoint=True)
 
         # Every other model tests the one result; the integrator fixes what they find, then they score it again,
         # as long as the time allows.
         judges = [p for p in self._eligible(run) if p != integrator] or [integrator]
+        if run.compare_all is not True and (run.mode == "quick" or
+                                            (run.mode == "adaptive" and not policy.complex_request(run))):
+            judges = judges[:1]
         sections = [(t.title, t.output) for t in accepted]
         latest: list[Judgement] = []
         tested = True
@@ -1003,6 +1285,12 @@ class Controller:
                 latest = judged
                 final.judges.extend(judged)
             must = list(dict.fromkeys(m for j in judged for m in j.must_fix))
+            current_hashes = self._current_artifact_hashes(run, final)
+            must.extend(c.summary for c in final.checks if c.artifact_hash in current_hashes
+                        and c.kind != "model_review" and c.status == "fail" and c.summary not in must)
+            for j in judged:
+                if j.meets_criteria is False and not j.must_fix:
+                    must.append("The reviewer marked success criteria unmet. Recheck every criterion and correct the unmet requirements.")
             if not must or round_ == self.settings.max_final_fix_rounds:
                 break
             if not self._has_time(run, took * 1.3 + 3 * self._min_call(run)):
@@ -1012,6 +1300,9 @@ class Controller:
                         "the other models found", integrator)
             await self._publish(run)
             system, prompt = prompts.fix_prompt(run.request, plan, final.output, must, profile)
+            extra = await self._expand_for_gaps(run, load, must)
+            prompt += (prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence)
+                       + ("\n\nNew independently reviewed gap investigation:\n" + extra if extra else ""))
             try:
                 fixed = await self._call(run, integrator, ModelCall(
                     system, prompt, "integrate", self._out_cap(run),
@@ -1024,16 +1315,12 @@ class Controller:
                 break
             final.output = fixed.text
             final.fixes += 1
+            await self._verify_final(run)
             self._partial.pop(run.id, None)
             await self._publish(run, checkpoint=True)
 
-        scores = [j.score for j in latest if j.score is not None]
-        final.score = round(sum(scores) / len(scores), 1) if scores else None
-        verdicts = [j.meets_criteria for j in latest if j.meets_criteria is not None]
-        final.meets_criteria = all(verdicts) if verdicts else None
-        final.evaluator = latest[0].judge if latest else None
-        still = list(dict.fromkeys(m for j in latest for m in j.must_fix))
-        final.gaps = (["Still to fix: " + m for m in still] + list(dict.fromkeys(g for j in latest for g in j.gaps)))[:12]
+        self._refresh_final_assessment(run, final)
+        latest = [j for j in latest if j.artifact_hash == final.artifact_hash]
         if not latest and tested:
             final.limitations.append("No other model was available to test and score the final result.")
         elif latest and judges == [integrator]:
@@ -1047,7 +1334,7 @@ class Controller:
             final.limitations.insert(0, "No task finished, so this was written from the models' analyses.")
         if any(t.assurance == "self-reviewed" for t in accepted):
             final.limitations.append("Some work was reviewed by the same model that wrote it, because no other model was available.")
-        final.limitations.append("Assurance level: evidence-reviewed by independent models, not objectively tested. Check important results yourself.")
+        final.limitations.append("Model reviews are opinions, not executed tests. See the checks for exactly what was verified on this artifact.")
         final.limitations = list(dict.fromkeys(final.limitations))[:14]
         who = joined(list(dict.fromkeys(name(j.judge) for j in latest))) if latest else "no other model"
         self._deliver(run, final, f"Delivered one result, scored {final.score if final.score is not None else 'n/a'}/10 by {who}"
@@ -1055,10 +1342,36 @@ class Controller:
 
     def _deliver(self, run: Run, final: FinalResult, message: str) -> None:
         run.final = final
+        self._refresh_final_assessment(run, final)
         run.status = "completed"
         if run.time_limit_s:
             message += f", in {run.elapsed_s / 60:.0f} of {run.time_limit_s / 60:.0f} min"
         self._event(run, "completed", message, final.evaluator or final.integrator)
+
+    async def _expand_for_gaps(self, run: Run, load: dict[str, int], findings: list[str]) -> str:
+        """Spend remaining effort on one bounded, independently reviewed investigation."""
+        maximum = max(0, min(getattr(self.settings, "max_gap_tasks_per_run", 1),
+                             getattr(self.settings, "max_replans_per_run", 1)))
+        if (not run.plan or run.mode == "quick" or not policy.complex_request(run)
+                or run.gap_tasks_added >= maximum or not findings):
+            return ""
+        needed = (policy.expected_seconds(run, "task") + policy.expected_seconds(run, "review")
+                  + policy.finish_reserve(run))
+        if not self._has_time(run, needed):
+            return ""
+        run.gap_tasks_added += 1
+        tid = f"gap{run.gap_tasks_added}"
+        while any(t.id == tid for t in run.plan.tasks):
+            tid += "x"
+        task = Task(id=tid, title="Investigate unresolved verification gaps",
+                    description="Resolve these specific findings using the supplied evidence. Distinguish what is supported "
+                    "from what remains unknown; do not invent tool results.\n- " + "\n- ".join(findings[:5]))
+        run.plan.tasks.append(task)
+        run.plan.version += 1
+        self._event(run, "replan", "Added one investigation because review found unresolved requirements", task_id=task.id)
+        files = await self.files.get(run.id) if run.files else []
+        await self._run_task(run, task, load, files)
+        return task.output if task.status == "accepted" else ""
 
     # ------------------------------------------------------------------ wrap-up
 
@@ -1073,8 +1386,7 @@ class Controller:
             final.limitations.insert(0, "The run reached its time limit, so the result was delivered as it stood"
                                      + (" after the last round of fixes." if final.fixes else "."))
             final.limitations = list(dict.fromkeys(final.limitations))[:14]
-            scores = [j.score for j in final.judges if j.score is not None]
-            final.score = final.score if final.score is not None else (round(sum(scores) / len(scores), 1) if scores else None)
+            await self._verify_final(run)
             self._deliver(run, final, "Time limit reached: delivered the final result as it stood")
             return
 
@@ -1100,6 +1412,7 @@ class Controller:
         system, prompt = prompts.wrap_up_prompt(
             run.request, plan, profile, max(1.0, (left or 60) / 60), "", accepted, drafts,
             run.analyses, prompts.consensus_block(run.consensus))
+        prompt += prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence)
         for p in writers:
             if not self._has_time(run, self._min_call(run)):
                 break
@@ -1119,6 +1432,8 @@ class Controller:
             if undone:
                 final.limitations.append("Not started before the time limit: " + ", ".join(undone))
             final.limitations.append("Assurance level: not tested. Check it before you rely on it.")
+            run.final = final
+            await self._verify_final(run)
             self._deliver(run, final, f"Time limit reached: {name(p)} wrote the complete final result from the work done")
             return
 
@@ -1136,4 +1451,6 @@ class Controller:
         final = FinalResult(output=best, limitations=[(
             "The time limit was reached before the parts could be merged, so this is the team's work as it stood, "
             "section by section. Nothing here was tested.")])
+        run.final = final
+        await self._verify_final(run)
         self._deliver(run, final, "Time limit reached: delivered the team's work as it stood")

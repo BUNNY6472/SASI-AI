@@ -26,6 +26,7 @@ class Seat:
     vision_models: tuple[str, ...] = ()  # which of vertex_models read images; the older ones get text only
     key: str = ""  # "anthropic" or "gemini" when the provider's own API key is another route
     about: str = ""
+    retirement_date: str | None = None  # YYYY-MM-DD; unavailable from this date in UTC
 
 
 SEATS: dict[str, Seat] = {s.id: s for s in [
@@ -37,22 +38,24 @@ SEATS: dict[str, Seat] = {s.id: s for s in [
     # GLM 5.2 and DeepSeek V4.1 Flash read 1M tokens (their Model Garden cards). If an older fallback model is
     # used, its smaller window is learned from its first "too long" error.
     Seat("glm", "GLM", "open", 1_000_000, 32_000, ("code", "reasoning", "agentic", "long"), frozenset({"text"}),
-         ("zai-org/glm-5.2-maas", "zai-org/glm-5-maas", "zai-org/glm-4.7-maas"), ("global", "us-central1"),
+         ("zai-org/glm-5.2-maas",), ("global",),
          about="Z.ai GLM 5.2, a leading open model for coding and long agentic work, with a 1M-token context"),
     Seat("deepseek", "DeepSeek", "open", 1_000_000, 32_000, ("code", "reasoning", "long", "vision"),
          frozenset({"image", "text"}),
-         ("deepseek-ai/deepseek-v4.1-flash-maas", "deepseek-ai/deepseek-v3.2-maas", "deepseek-ai/deepseek-v3.1-maas"),
-         ("global", "us-central1"), vision_models=("deepseek-ai/deepseek-v4.1-flash-maas",),
+         ("deepseek-ai/deepseek-v4.1-flash-maas",),
+         ("global",), vision_models=("deepseek-ai/deepseek-v4.1-flash-maas",),
          about="DeepSeek V4.1 Flash, the newest DeepSeek model, with a 1M-token context; it also reads images"),
-    Seat("qwen", "Qwen", "open", 262_144, 32_000, ("code",), frozenset({"text"}),
+    Seat("qwen", "Qwen", "open", 262_144, 16_384, ("code",), frozenset({"text"}),
          ("qwen/qwen3-coder-480b-a35b-instruct-maas", "qwen/qwen3-235b-a22b-instruct-2507-maas"), ("global", "us-south1"),
-         about="Qwen3 Coder, a strong open coding model"),
+         about="Qwen3 Coder, a strong open coding model", retirement_date="2026-10-21"),
     Seat("kimi", "Kimi", "open", 262_144, 32_000, ("reasoning", "agentic"), frozenset({"text"}),
-         ("moonshotai/kimi-k2-thinking-maas",), ("global",), about="Kimi K2 Thinking, an open reasoning model"),
+         ("moonshotai/kimi-k2-thinking-maas",), ("global",), about="Kimi K2 Thinking, an open reasoning model",
+         retirement_date="2026-10-21"),
     Seat("minimax", "MiniMax", "open", 196_608, 32_000, ("code", "agentic"), frozenset({"text"}),
-         ("minimaxai/minimax-m2-maas",), ("global",), about="MiniMax M2, an open agentic coding model"),
+         ("minimaxai/minimax-m2-maas",), ("global",), about="MiniMax M2, an open agentic coding model",
+         retirement_date="2026-10-21"),
     Seat("gptoss", "gpt-oss", "open", 131_072, 32_000, ("reasoning",), frozenset({"text"}),
-         ("openai/gpt-oss-120b-maas",), ("us-central1", "global"), about="OpenAI's open-weight gpt-oss-120b"),
+         ("openai/gpt-oss-120b-maas",), ("global", "us-central1"), about="OpenAI's open-weight gpt-oss-120b"),
 ]}
 
 # Old runs may name models that are no longer on the team.

@@ -68,21 +68,21 @@ deploy_service() {
   --service-account "sasi-runtime@${PROJECT_ID}.iam.gserviceaccount.com" \
   --allow-unauthenticated \
   --min-instances 0 \
+  --no-cpu-throttling \
   --max-instances 1 \
   --cpu 1 \
   --memory 1Gi \
   --concurrency 80 \
   --timeout 3600 \
-  --set-env-vars "STORAGE_BACKEND=bigquery,KEY_STORE=secretmanager,GCP_PROJECT=${PROJECT_ID},BIGQUERY_DATASET=sasi_data,VERTEX_AI=true${EXTRA_ENV:+,$EXTRA_ENV}" \
-  --set-secrets "$SECRETS" \
+  --update-env-vars "STORAGE_BACKEND=bigquery,KEY_STORE=secretmanager,GCP_PROJECT=${PROJECT_ID},BIGQUERY_DATASET=sasi_data,VERTEX_AI=true,VERTEX_CLAUDE_ENABLED=false,TRIAL_CREDITS_ONLY=true,REQUIRE_ACCESS_TOKEN=true,ALLOW_SIMULATED=false,OPEN_MODELS=glm+deepseek+qwen+kimi+minimax+gptoss,MAX_MODEL_CALLS_PER_RUN=300,MAX_TOKENS_PER_RUN=2400000,ERIS_MAX_TOKENS_PER_RUN=3600000${EXTRA_ENV:+,$EXTRA_ENV}" \
+  --update-secrets "$SECRETS" \
   --quiet
 }
 retry deploy_service
 
 URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" --region "$REGION" --format 'value(status.url)')
-CODE=$(gcloud secrets versions access latest --secret APP_ACCESS_CODE --project "$PROJECT_ID")
 echo
 echo "=============================================="
 echo " SASI is live: $URL"
-echo " Access code:  $CODE"
+echo " Sign in with your existing SASI access code."
 echo "=============================================="

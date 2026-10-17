@@ -32,6 +32,19 @@ CHUNK = 4 * 1024 * 1024
 TOMBSTONE_SEQ = 1_000_000_000
 
 
+async def _finish_write(fn) -> bool:
+    """Keep the caller's write lock until its cloud-write thread has finished."""
+    task = asyncio.create_task(asyncio.to_thread(fn))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()  # surface a failed write even if cancellation arrived meanwhile
+    return cancelled
+
+
 class BigQuery:
     """Thin shared client with table setup and load-job writes."""
 
@@ -134,12 +147,15 @@ class BigQueryStore(MemoryStore):
 
         try:
             runs = await asyncio.to_thread(_load)
-        except Exception as e:  # noqa: BLE001 - app still works without history
+        except Exception as e:
             log.warning("could not load history from BigQuery: %s", e)
-            return []
+            raise RuntimeError("Run history is unavailable; refusing to start with an empty history.") from e
         for run in runs:
             if run.status not in TERMINAL:
                 # The process stopped mid-run. Keep accepted work; offer resume.
+                if run.clock_started_at:
+                    run.used_s += max(0, min(run.updated_at, time.time()) - run.clock_started_at)
+                run.clock_started_at = run.deadline_at = None
                 run.status = "interrupted"
             run.live = {}
             await super().save(run)
@@ -151,31 +167,36 @@ class BigQueryStore(MemoryStore):
         await super().save(run)
         if not checkpoint:
             return
-        seq = self._seq.get(run.id, 0) + 1
-        self._seq[run.id] = seq
-        row = {
-            "run_id": run.id,
-            "seq": seq,
-            "status": run.status,
-            "profile": run.profile,
-            "request": run.request[:2000],
-            "total_tokens": run.usage.total_tokens,
-            "snapshot": run.model_dump(mode="json", exclude={"live"}),
-            "created_at": time.time(),
-        }
-        outputs = self.outputs.pop(run.id, [])
+        async with self._lock:  # include actual thread lifetime, even after caller cancellation
+            seq = self._seq.get(run.id, 0) + 1
+            self._seq[run.id] = seq
+            row = {
+                "run_id": run.id,
+                "seq": seq,
+                "status": run.status,
+                "profile": run.profile,
+                "request": run.request[:2000],
+                "total_tokens": run.usage.total_tokens,
+                "snapshot": run.model_dump(mode="json", exclude={"live"}),
+                "created_at": time.time(),
+            }
+            # Retain the queue until both writes succeed. An ambiguous cloud
+            # response can still produce duplicate append rows on retry.
+            outputs = list(self.outputs.get(run.id, []))
 
-        def _write() -> None:
-            self.db.load_rows(CHECKPOINTS, [row])
-            self.db.load_rows(OUTPUTS, outputs)
+            def _write() -> None:
+                self.db.load_rows(CHECKPOINTS, [row])
+                self.db.load_rows(OUTPUTS, outputs)
 
-        try:
-            async with self._lock:  # keep load jobs for one table in order
-                await asyncio.to_thread(_write)
-        except Exception as e:  # noqa: BLE001 - never fail a run because history failed
-            log.warning("could not checkpoint run %s: %s", run.id, e)
-            if run.id not in self._pending_delete:
-                self.outputs.setdefault(run.id, [])[:0] = outputs  # try again with the next checkpoint
+            try:
+                cancelled = await _finish_write(_write)
+            except Exception as e:
+                log.warning("could not checkpoint run %s: %s", run.id, e)
+                raise RuntimeError("The checkpoint could not be saved. Work has stopped to preserve recoverability.") from e
+            if outputs and run.id in self.outputs:
+                del self.outputs[run.id][:len(outputs)]
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def delete_run(self, run_id: str) -> str:
         await super().delete_run(run_id)

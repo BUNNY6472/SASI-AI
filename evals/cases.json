@@ -1,0 +1,54 @@
+[
+  {
+    "id": "invoice-rounding",
+    "kind": "objective",
+    "request": "Calculate an invoice: 24 items at 17.50 each, a 12% discount on goods, tax of 8% on discounted goods only, and shipping of 18.40. Round the tax to cents using conventional half-up rounding before adding shipping. Return exactly one JSON object with string field total, and no other text.",
+    "materials": "All monetary amounts use the same currency. Shipping is not taxable.",
+    "oracle": {"kind": "json_equals", "expected": {"total": "417.57"}},
+    "rationale": "Goods 420.00; discounted goods 369.60; tax 29.568 rounds to 29.57; total 417.57."
+  },
+  {
+    "id": "inventory-aggregation",
+    "kind": "objective",
+    "request": "Using all rows in the supplied CSV, sum signed units by SKU. Ignore the price column. Return exactly the JSON object mapping A and B to their integer totals, with no Markdown or explanation.",
+    "materials": "sku,units,price\nA,10,2\nB,7,3\nA,-3,2\nB,-1,3\nA,5,2\nB,1,3",
+    "oracle": {"kind": "json_equals", "expected": {"A": 12, "B": 7}},
+    "rationale": "A = 10 - 3 + 5 = 12; B = 7 - 1 + 1 = 7."
+  },
+  {
+    "id": "dependency-schedule",
+    "kind": "objective",
+    "request": "Find the minimum completion time and critical path of this dependency graph with unlimited parallel workers. Tasks cannot be interrupted. A takes 3 hours with no dependencies. B takes 4 hours after A. C takes 2 hours after A. D takes 5 hours after both B and C. Return exactly JSON with makespan (integer hours) and critical_path (array of task names), without other text.",
+    "materials": "All durations are deterministic and dependencies finish before the dependent task can start.",
+    "oracle": {"kind": "json_equals", "expected": {"makespan": 12, "critical_path": ["A", "B", "D"]}},
+    "rationale": "A ends 3, B ends 7, C ends 5, D ends 12."
+  },
+  {
+    "id": "strict-output-format",
+    "kind": "objective",
+    "request": "Sort these three words alphabetically: jade, amber, cobalt. Reply with exactly the three lowercase words separated by single spaces. Include no punctuation, heading, code fence or explanation.",
+    "materials": "",
+    "oracle": {"kind": "exact_text", "expected": "amber cobalt jade"},
+    "rationale": "Deterministic format compliance; surrounding whitespace is ignored by the oracle."
+  },
+  {
+    "id": "amended-record",
+    "kind": "objective",
+    "request": "Which approved project budget is currently effective according to the records? Later signed amendments supersede earlier signed approvals; drafts have no authority. Return exactly JSON with budget (integer) and record (string record ID), with no other text.",
+    "materials": "R1: signed approval, 2026-01-10, budget 120000. R2: signed amendment, 2026-01-12, budget 90000. R3: unsigned draft, 2026-01-15, proposed budget 150000.",
+    "oracle": {"kind": "json_equals", "expected": {"budget": 90000, "record": "R2"}},
+    "rationale": "R2 is the latest authoritative signed record; R3 is a draft."
+  },
+  {
+    "id": "research-durable-runs",
+    "kind": "human_review",
+    "request": "Research a reliable design for a web app with hour-long AI tasks and optional human approval. Users must be able to close the browser. Compare request-bound execution, job workers and durable orchestration. Cite current official documentation, distinguish retrieved evidence from assumptions, explain retries and idempotency, and state remaining limitations. Do not claim that any architecture guarantees no lost work.",
+    "materials": "Starting primary sources: https://docs.cloud.google.com/run/docs/container-contract and https://docs.cloud.google.com/run/docs/configuring/task-timeout and https://docs.cloud.google.com/workflows/docs/overview",
+    "rubric": [
+      "Verify every material platform claim against the cited official page as retrieved on the run date; record contradictory or missing support.",
+      "Check the design handles browser disconnect, worker restart, retry duplication, approval waiting, cancellation and atomic acceptance of completed work.",
+      "Check the proposed components fit hour-long work, and cost, operational burden and unsupported guarantees are stated.",
+      "Judge whether the recommendation follows from the evidence and clearly separates known behavior, inference and unresolved questions."
+    ]
+  }
+]

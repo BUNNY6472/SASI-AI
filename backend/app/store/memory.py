@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..models import Run
+from ..models import TERMINAL, Run
 
 
 class MemoryStore:
@@ -17,7 +17,8 @@ class MemoryStore:
     async def save(self, run: Run, checkpoint: bool = False) -> None:
         self._runs[run.id] = run
         if len(self._runs) > self._max:
-            oldest = sorted(self._runs.values(), key=lambda r: r.updated_at)[: len(self._runs) - self._max]
+            oldest = sorted((r for r in self._runs.values() if r.status in TERMINAL),
+                            key=lambda r: r.updated_at)[: len(self._runs) - self._max]
             for r in oldest:
                 self._runs.pop(r.id, None)
 

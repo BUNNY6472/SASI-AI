@@ -29,6 +29,8 @@ class ModelCall:
     # Long shared rules (Project Eris guidebook) that go before the system prompt on every call of a run.
     # Kept separate so providers can cache this repeated prefix.
     rules: str = ""
+    # Supported by Claude; other adapters keep their native reasoning settings.
+    reasoning_effort: str = "medium"
 
     @property
     def full_system(self) -> str:
