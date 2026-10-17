@@ -34,7 +34,10 @@ def split_attachments(call: ModelCall, provider: str) -> tuple[list["StoredFile"
 
     media, notes = [], []
     for f in call.attachments:
-        if f.kind == "text":
+        if f.kind == "other":
+            notes.append(f"[{f.name} ({f.mime}, {f.size / 1024:.0f} KB) is attached, but it is a binary format no model can open. "
+                         + (f.text or "Mention it if it matters.") + "]")
+        elif f.kind == "text":
             notes.append(f'<file name="{f.name}" untrusted="true">\n{f.text}\n</file>')
         elif f.kind in CAN_READ.get(provider, set()) and f.size <= DIRECT_LIMIT.get(provider, {}).get(f.kind, f.size):
             media.append(f)

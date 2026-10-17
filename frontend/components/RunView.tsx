@@ -121,7 +121,7 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
         <div className="file-strip">
           {run.files.map((f) => (
             <a key={f.id} className="file-chip glass" href={`/api/runs/${run.id}/files/${f.id}`} target="_blank" rel="noreferrer" title={f.name}>
-              {f.kind === "image" ? <img src={`/api/runs/${run.id}/files/${f.id}`} alt="" /> : <span className="file-kind">{f.kind}</span>}
+              {f.kind === "image" ? <img src={`/api/runs/${run.id}/files/${f.id}`} alt="" /> : <span className="file-kind">{f.name.includes(".") ? f.name.split(".").pop()!.slice(0, 8) : f.kind}</span>}
               <span className="file-name">{f.name}</span>
               <small className="muted">{fileSize(f.size)}</small>
             </a>

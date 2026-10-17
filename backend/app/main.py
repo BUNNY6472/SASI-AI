@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 
+from . import extract
 from . import files as files_mod
 from .config import Settings, get_settings
 from .files import FileRejected, FileStore
@@ -242,7 +243,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not f:
             raise HTTPException(404, "File not found")
         inline = f.kind in ("image", "video", "audio", "pdf")
-        return Response(f.data, media_type=f.mime if inline else "text/plain; charset=utf-8", headers={
+        media = f.mime if inline else "text/plain; charset=utf-8" if extract.looks_like_text(f.data) else "application/octet-stream"
+        return Response(f.data, media_type=media, headers={
             "Content-Disposition": f"{'inline' if inline else 'attachment'}; filename*=UTF-8''{quote(f.name)}",
             "Content-Security-Policy": "sandbox; default-src 'none'; img-src 'self'; media-src 'self'",
             "Cache-Control": "private, max-age=3600",

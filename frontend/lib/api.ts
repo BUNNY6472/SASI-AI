@@ -61,7 +61,7 @@ export interface FileRef {
   id: string;
   name: string;
   mime: string;
-  kind: "image" | "video" | "audio" | "pdf" | "text";
+  kind: "image" | "video" | "audio" | "pdf" | "text" | "other";
   size: number;
 }
 

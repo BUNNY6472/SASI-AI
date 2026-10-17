@@ -4,7 +4,6 @@ import { DragEvent, FormEvent, useEffect, useRef, useState } from "react";
 import { api, fileSize, ProviderStatus, Run, RunSummary, uploadFile } from "@/lib/api";
 import { AgentChip, StatusBadge, fmt, timeAgo } from "./ui";
 
-const ACCEPT = "image/*,video/*,audio/*,.pdf,.csv,.tsv,.txt,.md,.json,.jsonl,.xml,.yaml,.yml,.log,.sql,.py,.js,.ts";
 
 interface Attachment {
   key: string;
@@ -16,7 +15,7 @@ interface Attachment {
   error?: string;
 }
 
-const KIND_ICON: Record<string, string> = { image: "🖼", video: "🎬", audio: "🎧", pdf: "📄", text: "📊" };
+const KIND_ICON: Record<string, string> = { image: "🖼", video: "🎬", audio: "🎧", pdf: "📄", text: "📊", other: "📦" };
 
 const EXAMPLES = [
   "Compare solar and wind power for a small farm in Andhra Pradesh: costs, payback and risks.",
@@ -160,7 +159,7 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
             ))}
           </div>
         )}
-        <input ref={picker} type="file" multiple accept={ACCEPT} hidden onChange={(e) => { addFiles(e.target.files); e.target.value = ""; }} />
+        <input ref={picker} type="file" multiple hidden onChange={(e) => { addFiles(e.target.files); e.target.value = ""; }} />
         <div className="composer-row">
           <button type="button" className="btn ghost" onClick={() => picker.current?.click()}>📎 Attach files</button>
           <button type="button" className="btn ghost" onClick={() => setShowMaterials((v) => !v)}>
@@ -178,7 +177,7 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
             {busy ? "Starting…" : uploading ? "Uploading…" : "Start collaboration"}
           </button>
         </div>
-        <p className="small muted drop-hint">Drop images, videos, audio, PDFs or CSV files here. Up to 10 files, 25 MB each.</p>
+        <p className="small muted drop-hint">Drop any files here: images, video, audio, PDF, CSV, JSON, Parquet, Excel, Word, ZIP, code and more. Up to 10 files, 25 MB each.</p>
         {error && <p className="error">{error}</p>}
         {!request && (
           <div className="examples">

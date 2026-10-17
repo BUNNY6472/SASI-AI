@@ -1,4 +1,8 @@
-"""Files people attach to a run: images, video, audio, PDFs and data (CSV, text, JSON).
+"""Files people attach to a run. Any type is accepted.
+
+Images, PDFs, video and audio go to the models that can open them directly.
+Data and documents (CSV, JSON, Parquet, Excel, Word, PowerPoint, ZIP, code, text)
+are converted to text in extract.py. Other binary files are kept and described.
 
 Uploads are staged in memory until the run starts, then saved with the run
 (in BigQuery on Cloud Run) so every model reads the same files and a deleted
@@ -7,13 +11,13 @@ run takes its files with it.
 from __future__ import annotations
 
 import base64
-import csv
-import io
 import logging
 import mimetypes
 import time
 import uuid
 from dataclasses import dataclass, field
+
+from . import extract
 
 log = logging.getLogger("sasi.files")
 
@@ -27,7 +31,6 @@ IMAGE = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 VIDEO = {"video/mp4", "video/quicktime", "video/webm", "video/mpeg", "video/x-msvideo", "video/3gpp"}
 AUDIO = {"audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav", "audio/ogg", "audio/aac", "audio/flac", "audio/mp4", "audio/x-m4a"}
 PDF = {"application/pdf"}
-TEXT_EXT = {".csv", ".tsv", ".txt", ".md", ".json", ".jsonl", ".xml", ".log", ".yaml", ".yml", ".py", ".js", ".ts", ".html", ".sql"}
 EXTRA_TYPES = {".csv": "text/csv", ".tsv": "text/tab-separated-values", ".md": "text/markdown", ".jsonl": "application/jsonl",
                ".m4a": "audio/mp4", ".webm": "video/webm", ".mov": "video/quicktime", ".yaml": "text/yaml", ".yml": "text/yaml"}
 
@@ -54,7 +57,7 @@ class StoredFile:
     id: str
     name: str
     mime: str
-    kind: str  # image | video | audio | pdf | text
+    kind: str  # image | video | audio | pdf | text | other
     size: int
     data: bytes
     text: str = ""  # what goes into a prompt for text files (with a data profile for CSV)
@@ -74,13 +77,11 @@ def _ext(name: str) -> str:
 
 
 def classify(name: str, mime: str) -> tuple[str, str]:
-    """Return (kind, mime) or raise FileRejected."""
+    """Return (kind, mime). Media the models read natively keeps its own kind; everything else is converted later."""
     ext = _ext(name)
     mime = (mime or "").split(";")[0].strip().lower()
     if not mime or mime == "application/octet-stream":
-        mime = EXTRA_TYPES.get(ext) or mimetypes.guess_type(name)[0] or ""
-    if ext == ".svg" or mime in ("image/svg+xml", "text/html") and ext not in TEXT_EXT:
-        raise FileRejected("SVG and HTML files are not accepted. Upload a PNG, JPG or PDF instead.")
+        mime = EXTRA_TYPES.get(ext) or mimetypes.guess_type(name)[0] or "application/octet-stream"
     if mime in IMAGE:
         return "image", mime
     if mime in VIDEO or ext in (".mp4", ".mov", ".webm", ".mpeg", ".avi", ".3gp"):
@@ -89,55 +90,11 @@ def classify(name: str, mime: str) -> tuple[str, str]:
         return "audio", "audio/mp4" if mime in ("audio/x-m4a",) else (mime if mime in AUDIO else "audio/mpeg")
     if mime in PDF or ext == ".pdf":
         return "pdf", "application/pdf"
-    if ext in TEXT_EXT or mime.startswith("text/") or mime in ("application/json", "application/jsonl", "application/xml"):
-        return "text", EXTRA_TYPES.get(ext) or (mime if mime.startswith("text/") else "text/plain")
-    raise FileRejected(
-        f"'{name}' is not a supported type. Use images (PNG, JPG, WEBP), video (MP4, MOV, WEBM), audio (MP3, WAV, M4A), "
-        "PDF, or data files (CSV, TSV, TXT, MD, JSON)."
-    )
-
-
-def _decode(data: bytes) -> str:
-    for enc in ("utf-8-sig", "utf-16", "latin-1"):
-        try:
-            return data.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
-def _num(v: str) -> float | None:
-    try:
-        return float(v.replace(",", "")) if v.strip() else None
-    except ValueError:
-        return None
-
-
-def profile_table(text: str, delimiter: str) -> str:
-    """A short data profile so models know the whole table even when only part fits in a prompt."""
-    try:
-        rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
-    except csv.Error:
-        return ""
-    if len(rows) < 2:
-        return ""
-    header, body = rows[0], rows[1:]
-    lines = [f"Rows: {len(body)} (plus header). Columns: {len(header)}."]
-    for i, col in enumerate(header[:60]):
-        vals = [r[i] for r in body if i < len(r)]
-        filled = [v for v in vals if v.strip()]
-        nums = [n for n in (_num(v) for v in filled) if n is not None]
-        if filled and len(nums) >= 0.9 * len(filled):
-            mean = sum(nums) / len(nums)
-            lines.append(f"- {col}: numeric, {len(filled)} values, min {min(nums):g}, max {max(nums):g}, mean {mean:.4g}, empty {len(vals) - len(filled)}")
-        else:
-            distinct = len(set(filled))
-            sample = ", ".join(sorted(set(filled))[:5])
-            lines.append(f"- {col}: text, {len(filled)} values, {distinct} distinct (e.g. {sample[:120]}), empty {len(vals) - len(filled)}")
-    return "\n".join(lines)
+    return "text", mime
 
 
 def prepare(name: str, mime: str, data: bytes) -> StoredFile:
+    """Accept any file. Data and documents become text the models read; unknown binary files are kept and described."""
     name = (name or "file").replace("/", "_").replace("\\", "_").strip()[:180] or "file"
     if not data:
         raise FileRejected(f"'{name}' is empty.")
@@ -145,19 +102,27 @@ def prepare(name: str, mime: str, data: bytes) -> StoredFile:
         raise FileRejected(f"'{name}' is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB. Trim or compress it first.")
     kind, mime = classify(name, mime)
     f = StoredFile(id=uuid.uuid4().hex[:16], name=name, mime=mime, kind=kind, size=len(data), data=data)
-    if kind == "text":
-        text = _decode(data)
-        ext = _ext(name)
-        profile = profile_table(text, "\t" if ext == ".tsv" else ",") if ext in (".csv", ".tsv") else ""
-        body = text if len(text) <= TEXT_LIMIT else text[:TEXT_LIMIT] + f"\n[... truncated: showing {TEXT_LIMIT:,} of {len(text):,} characters]"
-        f.text = (f"Data profile (computed from the whole file):\n{profile}\n\n" if profile else "") + body
+    if kind != "text":
+        return f
+    try:
+        text, readable = extract.to_text(name, data)
+    except Exception as e:  # noqa: BLE001 - a damaged file is still kept, and the models are told
+        log.info("could not convert %s: %s", name, e)
+        f.kind = "other"
+        f.text = f"[{name} could not be read: {type(e).__name__}: {str(e)[:200]}]"
+        return f
+    if not readable:
+        f.kind = "other"
+        return f
+    f.text = extract.clip(text)
     return f
 
 
 def describe(files: list[StoredFile]) -> str:
     if not files:
         return ""
-    lines = [f"- {f.name} ({f.kind}, {f.size / 1024:.0f} KB)" for f in files]
+    label = {"text": "data/text, converted for reading", "other": "binary, no model can open it"}
+    lines = [f"- {f.name} ({label.get(f.kind, f.kind)}, {f.size / 1024:.0f} KB)" for f in files]
     return "Attached files:\n" + "\n".join(lines)
 
 

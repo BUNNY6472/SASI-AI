@@ -1,6 +1,6 @@
 # SASI
 
-Claude, ChatGPT and Gemini working as one team. You ask once, in one box, and attach any files (images, video, audio, PDFs, CSV and other data). All three models analyse it on their own at the same time, read and check each other's analyses, then SASI plans the work, splits it across the models, has each piece checked by a different model, and delivers one combined result that shows where the models agreed and disagreed.
+Claude, ChatGPT and Gemini working as one team. You ask once, in one box, and attach any files (images, video, audio, PDFs, CSV, JSON, Parquet, Excel, Word, ZIP, code and more). All three models analyse it on their own at the same time, read and check each other's analyses, then SASI plans the work, splits it across the models, has each piece checked by a different model, and delivers one combined result that shows where the models agreed and disagreed.
 
 This release builds the design in the *Multi-Model Collaboration App* architecture document. SASI picks the field (software engineering, research and analysis, or general) from the request itself, and the planner confirms or corrects it.
 
@@ -30,7 +30,17 @@ Rules that are enforced by code, not by model opinion:
 
 ## Files and the project record
 
-Files are uploaded from the composer (button or drag and drop), up to 10 per run and 25 MB each. Images and PDFs go to every model; video and audio go to Gemini, and the other models work from Gemini's analysis of them. CSV and other data files are sent as text with a profile of every column (counts, min, max, mean).
+Any file type can be attached from the composer (button or drag and drop), up to 10 per run and 25 MB each.
+
+- Images and PDFs go to every model. Video and audio go to Gemini, and the other models work from Gemini's analysis of them.
+- Data and documents are converted to text in `backend/app/extract.py`:
+  - CSV, TSV, JSON, JSON Lines and Parquet.
+  - Excel (`.xlsx`) and Word (`.docx`).
+  - PowerPoint (`.pptx`) and Jupyter notebooks.
+  - ZIP and gzip, including the files inside them.
+  - Code, text, markdown, SVG and HTML.
+- Tables come with a profile computed from the whole file: rows, columns, and per column the type, nulls, min, max, mean and distinct values.
+- Other binary files are kept with the run, and the models are told they exist.
 
 On Cloud Run everything for a run is kept in BigQuery (dataset `sasi_data`): `run_checkpoints` (run state), `run_outputs` (every model's analysis, cross-check, task work, review and final result, ready to compare with SQL) and `run_files` (the files, in chunks). **Delete** on a finished run removes it from all three tables.
 

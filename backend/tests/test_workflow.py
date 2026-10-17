@@ -153,8 +153,8 @@ def test_files_all_three_analyse_compare_and_delete():
         f = up.json()
         assert f["kind"] == "text"
         img = client.post("/api/files", content=b"\x89PNG\r\n\x1a\nfake", headers={"X-File-Name": "chart.png", "Content-Type": "image/png"}).json()
-        bad = client.post("/api/files", content=b"<svg/>", headers={"X-File-Name": "x.svg", "Content-Type": "image/svg+xml"})
-        assert bad.status_code == 400
+        empty = client.post("/api/files", content=b"", headers={"X-File-Name": "x.csv", "Content-Type": "text/csv"})
+        assert empty.status_code == 400
 
         run = client.post("/api/runs", json={"request": "Analyse the sales data", "profile": "research",
                                              "require_plan_approval": False, "file_ids": [f["id"], img["id"]]}).json()
@@ -189,8 +189,51 @@ def test_csv_profile_and_type_checks():
     f = prepare("data.csv", "", b"a,b\n1,x\n3,y\n")
     assert "Rows: 2" in f.text and "min 1, max 3" in f.text
     with pytest.raises(FileRejected):
-        prepare("tool.exe", "application/octet-stream", b"MZ")
+        prepare("empty.csv", "", b"")
+    exe = prepare("tool.exe", "application/octet-stream", b"MZ\x00\x01\x02")
+    assert exe.kind == "other", "any type is accepted and kept"
     assert prepare("clip.mov", "", b"0000").kind == "video"
+    assert prepare("logo.svg", "image/svg+xml", b"<svg/>").kind == "text"
+
+
+def test_data_and_document_files_become_readable_text():
+    import io
+    import json
+    import zipfile
+
+    import openpyxl
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from app.files import prepare
+
+    buf = io.BytesIO()
+    pq.write_table(pa.table({"city": ["Hyd", "Vizag", "Hyd"], "sales": [10.5, 20.0, 30.0]}), buf)
+    f = prepare("sales.parquet", "", buf.getvalue())
+    assert f.kind == "text" and "Rows: 3" in f.text and "max 30" in f.text and "Vizag" in f.text
+
+    wb = openpyxl.Workbook()
+    wb.active.append(["item", "qty"])
+    wb.active.append(["pen", 4])
+    xbuf = io.BytesIO()
+    wb.save(xbuf)
+    f = prepare("stock.xlsx", "", xbuf.getvalue())
+    assert "Sheet" in f.text and "pen" in f.text and "max 4" in f.text
+
+    f = prepare("data.json", "application/json", json.dumps([{"a": 1, "b": "x"}, {"a": 5, "b": "y"}]).encode())
+    assert "2 items" in f.text and "max 5" in f.text
+
+    dbuf = io.BytesIO()
+    with zipfile.ZipFile(dbuf, "w") as z:
+        z.writestr("word/document.xml", '<w:document><w:p><w:r><w:t>Hello</w:t></w:r><w:r><w:t xml:space="preserve"> SASI</w:t></w:r></w:p></w:document>')
+    assert "Hello SASI" in prepare("note.docx", "", dbuf.getvalue()).text
+
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w") as z:
+        z.writestr("inner/a.csv", "x,y\n1,2\n")
+        z.writestr("inner/b.parquet", buf.getvalue())
+    f = prepare("bundle.zip", "", zbuf.getvalue())
+    assert "inner/a.csv" in f.text and "Vizag" in f.text
 
 
 def test_cannot_delete_a_running_run():
