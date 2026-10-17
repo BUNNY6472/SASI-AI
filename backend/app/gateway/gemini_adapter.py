@@ -90,7 +90,7 @@ class GeminiAdapter:
 
     async def generate(self, call: ModelCall) -> ModelResult:
         model = await self.resolve_model()
-        config = types.GenerateContentConfig(system_instruction=call.system, max_output_tokens=call.max_output_tokens)
+        config = types.GenerateContentConfig(system_instruction=call.full_system, max_output_tokens=call.max_output_tokens)
         try:
             contents = await self._contents(call)
             if call.on_text:

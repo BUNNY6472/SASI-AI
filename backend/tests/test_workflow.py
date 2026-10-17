@@ -326,3 +326,54 @@ def test_field_is_detected_from_the_request():
         run = client.post("/api/runs", json={"request": "Write a FastAPI backend with a database schema", "require_plan_approval": True}).json()
         assert run["profile"] == "software"
         client.post(f"/api/runs/{run['id']}/cancel")
+
+
+def test_project_eris_mode_gives_every_model_the_guidebook_and_dry_runs_only():
+    """With the Eris switch on, every call carries the guidebook, the comparison checks the rules, and the planner can't change the field."""
+    import json as _json
+
+    from app.workflow import eris
+
+    assert "A10G" in eris.GUIDEBOOK and "1.5 hours" in eris.GUIDEBOOK and "Passing the Determinism Check" in eris.GUIDEBOOK
+    assert "DRY RUNS ONLY" in eris.RULES and eris.GUIDEBOOK in eris.RULES
+
+    with make_client() as client:
+        registry = client.app.state.registry
+        seen: list[ModelCall] = []
+        for adapter in registry.adapters.values():
+            original = adapter.generate
+
+            async def spy(call: ModelCall, original=original) -> ModelResult:
+                seen.append(call)
+                result = await original(call)
+                if call.kind == "plan":  # a planner that tries to re-label the job must not switch Eris off
+                    data = _json.loads(result.text)
+                    data["field"] = "software"
+                    result.text = _json.dumps(data)
+                return result
+
+            adapter.generate = spy
+
+        up = client.post("/api/files", content=b"id,feature,target\n1,0.5,1\n2,0.1,0\n",
+                         headers={"X-File-Name": "train.csv", "Content-Type": "text/csv"}).json()
+        run = client.post("/api/runs", json={"request": "Build a solution for this tabular Eris challenge", "eris": True,
+                                             "require_plan_approval": False, "file_ids": [up["id"]]}).json()
+        assert run["eris"] is True and run["profile"] == "eris"
+        run = wait_for(client, run["id"], {"completed", "failed"})
+        assert run["status"] == "completed", run.get("error")
+        assert run["profile"] == "eris", "the planner cannot switch Eris mode off"
+
+        assert seen and all(c.rules == eris.RULES for c in seen), "every model call carries the guidebook"
+        kinds = {c.kind for c in seen}
+        assert {"analysis", "cross_check", "plan", "plan_review", "task", "review", "integrate", "final_eval"} <= kinds, kinds
+        assert all("## Eris rule check" in c.prompt for c in seen if c.kind == "cross_check")
+        assert all("Eris rule" in c.prompt for c in seen if c.kind == "review")
+        assert all("exactly ONE complete solution.py" in c.prompt and "## Dry run" in c.prompt for c in seen if c.kind == "integrate")
+        assert all(c.max_output_tokens > 4000 for c in seen if c.kind in ("task", "integrate")), "room for a whole script"
+        assert client.get("/api/runs").json()[0]["eris"] is True
+
+        seen.clear()
+        normal = client.post("/api/runs", json={"request": "Plan a launch", "require_plan_approval": False}).json()
+        assert normal["eris"] is False and normal["profile"] != "eris"
+        wait_for(client, normal["id"], {"completed", "failed"})
+        assert seen and not any(c.rules for c in seen), "normal runs are unchanged"

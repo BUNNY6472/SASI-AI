@@ -87,6 +87,7 @@ export interface Run {
   request: string;
   materials: string;
   profile: string;
+  eris: boolean;
   require_plan_approval: boolean;
   compare_all: boolean;
   files: FileRef[];
@@ -122,6 +123,7 @@ export interface RunSummary {
   created_at: number;
   request: string;
   profile: string;
+  eris?: boolean;
   status: string;
   simulated: boolean;
   tasks: number;

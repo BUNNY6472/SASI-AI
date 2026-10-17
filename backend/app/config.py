@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     max_model_calls_per_run: int = 60
     max_output_tokens_per_call: int = 4000
     max_tokens_per_run: int = 500_000
+    # Project Eris runs carry the full guidebook and whole training scripts, so they get more room.
+    eris_max_tokens_per_run: int = 1_000_000
+    eris_max_output_tokens_per_call: int = 12_000
     max_tasks_per_plan: int = 5
     max_revisions_per_task: int = 1
     max_concurrent_runs: int = 3

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 from ..models import Plan, Task
+from . import eris
 from .profiles import FieldProfile
 
 BASE_SYSTEM = (
@@ -23,6 +24,10 @@ def materials_block(materials: str) -> str:
 
 
 NAMES = {"claude": "Claude", "chatgpt": "ChatGPT", "gemini": "Gemini"}
+
+
+def is_eris(profile: FieldProfile) -> bool:
+    return profile.key == "eris"
 
 
 def findings_block(analyses: list, cross_checks: list, limit: int = 6000) -> str:
@@ -47,13 +52,28 @@ def analysis_prompt(request: str, materials: str, files_text: str, profile: Fiel
     system = (f"{BASE_SYSTEM}\nRole: INDEPENDENT ANALYST in the '{profile.name}' field. The other models are analysing the "
               "same request and files at the same time without seeing your work; afterwards you will all compare results. "
               f"{profile.work}")
-    prompt = (
-        f"User request:\n{request}{materials_block(materials)}\n\n{files_text}\n\n"
-        "Study the request and every attached file you can open. Give your own independent analysis:\n"
+    steps = (
         "1. What the files contain (key facts, numbers, what you see or hear), file by file.\n"
         "2. Your answer or findings for the request, with the evidence from the files.\n"
         "3. How confident you are, what is uncertain, and what you could not check.\n"
-        "Be specific and quote figures. Use Markdown with short headings."
+    )
+    if is_eris(profile):
+        steps = (
+            "1. The challenge: task, target, metric, id column and the exact submission.csv format, plus any rule in the "
+            "challenge's own description that overrides the guidebook.\n"
+            "2. The data, file by file: shapes, columns, types, missing values, class balance and anything that looks synthetic.\n"
+            "3. Which kind of Eris challenge this is (tabular, NLP, CV, RAG, fine-tuning, from-scratch, bio/chem) and the "
+            "guidebook rules that apply to it.\n"
+            "4. Your proposed approach: the model trained or fine-tuned in the script, validation, HPO inside the script "
+            "(fixed seed, fixed trials), and fixed epochs that fit 1.5 hours on an A10G.\n"
+            "5. Rule traps to avoid (grey areas, determinism, test-set use) and the dry-run plan.\n"
+            "6. How confident you are and what you could not check.\n"
+        )
+    prompt = (
+        f"User request:\n{request}{materials_block(materials)}\n\n{files_text}\n\n"
+        "Study the request and every attached file you can open. Give your own independent analysis:\n"
+        + steps
+        + "Be specific and quote figures. Use Markdown with short headings."
     )
     return system, prompt
 
@@ -72,6 +92,15 @@ def cross_check_prompt(request: str, own, others: list, profile: FieldProfile) -
         "## Best combined answer\nA short statement of what the team should conclude.\n"
         "## Confidence\nHigh, medium or low, with one line of reasoning."
     )
+    if is_eris(profile):
+        names = ", ".join(["you"] + [NAMES.get(o.provider, o.provider) for o in others])
+        prompt += (
+            "\n## Eris rule check\nJudge every analysis, yours included, against the Eris rules. Write a Markdown table "
+            f"with one row per rule and one column per model ({names}). Each cell is pass, fail or unclear, with a few words "
+            "on why for every fail or unclear. Rules:\n" + eris.checklist()
+            + "\nThen say which approach is the most compliant, and what must change in the others. A brilliant approach "
+            "that breaks a rule is not the best combined answer."
+        )
     return system, prompt
 
 
@@ -96,7 +125,10 @@ def plan_review_prompt(request: str, plan: Plan, profile: FieldProfile) -> tuple
     prompt = (
         f"User request:\n{request}\n\nProposed plan:\n{plan_json(plan)}\n\n"
         "Check: does the plan cover the request; are dependencies right; are success criteria testable; "
-        "are assumptions reasonable? Use verdict 'accept' if it is good enough to execute, or 'revise' if it must change.\n\n"
+        "are assumptions reasonable? Use verdict 'accept' if it is good enough to execute, or 'revise' if it must change.\n"
+        + ("Also check that the plan leads to ONE complete end-to-end solution.py and that no task would break an Eris "
+           "rule or ask for a full end-to-end run. Any such problem means 'revise'.\n" if is_eris(profile) else "")
+        + "\n"
         f"{JSON_ONLY} Schema:\n"
         '{"verdict": "accept" | "revise", "score": 0-10, "findings": [str]}'
     )
@@ -137,7 +169,11 @@ def review_prompt(plan: Plan, task: Task, output: str, profile: FieldProfile) ->
     prompt = (
         f"Overall goal: {plan.goal}\n\nTask ({task.id}): {task.title}\n{task.description}\n\n"
         f"<work_to_review>\n{output}\n</work_to_review>\n\nChecks:\n- " + "\n- ".join(profile.review_checks)
-        + "\n\nVerdict 'pass' if acceptable as-is, 'revise' if fixable problems remain, 'block' only if it is fundamentally wrong or unsafe.\n\n"
+        + "\n\nVerdict 'pass' if acceptable as-is, 'revise' if fixable problems remain, 'block' only if it is fundamentally wrong or unsafe.\n"
+        + ("Any Eris rule that fails or is unclear means 'revise'; name the rule in findings. Use 'block' for a banned approach "
+           "(external or synthetic data, GitHub or pip installs, self-fine-tuned weights, rule-based logic with no training).\n"
+           if is_eris(profile) else "")
+        + "\n"
         f"{JSON_ONLY} Schema:\n"
         '{"verdict": "pass" | "revise" | "block", "score": 0-10, "findings": [str]}'
     )
@@ -154,6 +190,11 @@ def integrate_prompt(request: str, plan: Plan, accepted: list[Task], missing: li
         + parts + missing_text + shared
         + ("\n\nInclude a section '## How the models compared' with a short table: each important point, what each model "
            "concluded, and which conclusion the final answer keeps and why." if shared else "")
+        + ("\n\nProject Eris: the deliverable must contain exactly ONE complete solution.py in a single fenced block, copied "
+           "in full from the accepted work with any reviewed fixes applied, with no placeholders, flags or switches. After it, "
+           "give '## Dry run' (edits to a copy named dry_run.py and what to check), '## Eris rule check' (a table: rule, "
+           "pass or fail or unclear, why), '## Expected runtime on an A10G', and grey areas or risks. Never tell the user "
+           "to run the full end-to-end training." if is_eris(profile) else "")
         + f"\n\nMerge these into the final deliverable. Remove duplication, resolve inconsistencies, keep everything that is correct. "
         f"Do not add new unreviewed claims beyond light connecting text. End with a short 'Limitations' section.\nOutput format: {profile.output_format}"
     )

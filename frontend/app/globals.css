@@ -293,3 +293,23 @@ details summary { cursor: pointer; color: var(--accent-2); font-size: 13px; }
   .attach-name { max-width: 140px; }
 }
 .badge.field { background: rgba(176, 107, 255, 0.14); color: #e2ccff; border-color: rgba(176, 107, 255, 0.4); }
+
+/* Project Eris switch */
+.eris-bar { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; padding: 10px 14px; border-radius: 14px;
+  border: 1px dashed var(--border); background: rgba(8, 6, 28, 0.35); transition: border-color 0.25s, background 0.25s, box-shadow 0.25s; }
+.eris-bar.on { border: 1px solid rgba(255, 198, 92, 0.55); background: linear-gradient(120deg, rgba(255, 198, 92, 0.12), rgba(246, 162, 107, 0.06));
+  box-shadow: 0 0 0 1px rgba(255, 198, 92, 0.12), 0 10px 30px rgba(255, 170, 60, 0.12); }
+.eris-note { color: var(--text-2); flex: 1 1 260px; }
+.eris-bar.on .eris-note { color: #ffe3b0; }
+.switch { position: relative; display: inline-flex; align-items: center; gap: 10px; cursor: pointer; font-weight: 600; color: var(--text); }
+.switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.switch-track { position: relative; width: 44px; height: 24px; border-radius: 999px; background: rgba(160, 146, 255, 0.18);
+  border: 1px solid var(--border-strong); transition: background 0.25s; flex: none; }
+.switch-thumb { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #d7d0ff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4); transition: transform 0.25s, background 0.25s; }
+.switch input:checked + .switch-track { background: linear-gradient(135deg, #ffc65c, #f6a26b); border-color: rgba(255, 198, 92, 0.8); }
+.switch input:checked + .switch-track .switch-thumb { transform: translateX(20px); background: #fff7e6; }
+.switch input:focus-visible + .switch-track { box-shadow: 0 0 0 4px rgba(255, 198, 92, 0.3); }
+.composer.eris-on { border-color: rgba(255, 198, 92, 0.4); }
+.badge.eris { background: rgba(255, 198, 92, 0.14); color: #ffe3b0; border-color: rgba(255, 198, 92, 0.5); }
+@media (prefers-reduced-motion: reduce) { .switch-track, .switch-thumb, .eris-bar { transition: none; } }

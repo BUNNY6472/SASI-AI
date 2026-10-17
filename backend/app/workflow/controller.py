@@ -24,8 +24,8 @@ from ..gateway.base import ModelCall, ModelResult, ProviderError
 from ..gateway.registry import ModelRegistry
 from ..models import TERMINAL, Attempt, Event, FinalResult, LiveText, Opinion, Plan, Review, Run, Task, now
 from ..store.base import RunStore
-from . import prompts
-from .profiles import PROFILES, get_profile
+from . import eris, prompts
+from .profiles import AUTO_FIELDS, get_profile
 from .router import PerformanceHistory, Router
 
 log = logging.getLogger("sasi.controller")
@@ -157,8 +157,14 @@ class Controller:
         s = self.settings
         if run.usage.calls >= s.max_model_calls_per_run:
             raise BudgetExceeded(f"reached the limit of {s.max_model_calls_per_run} model calls for one run")
-        if run.usage.total_tokens >= s.max_tokens_per_run:
-            raise BudgetExceeded(f"reached the limit of {s.max_tokens_per_run:,} tokens for one run")
+        limit = s.eris_max_tokens_per_run if run.eris else s.max_tokens_per_run
+        if run.usage.total_tokens >= limit:
+            raise BudgetExceeded(f"reached the limit of {limit:,} tokens for one run")
+
+    def _out_cap(self, run: Run) -> int:
+        """Longest answer one call may write. Eris runs need room for a whole training script."""
+        s = self.settings
+        return s.eris_max_output_tokens_per_call if run.eris else s.max_output_tokens_per_call
 
     def _live(self, run: Run, call: ModelCall, provider: str, key: str, label: str) -> None:
         """Stream this call's text to the screen while the model writes it."""
@@ -195,7 +201,10 @@ class Controller:
 
     async def _call_inner(self, run: Run, provider: str, call: ModelCall, live: tuple[str, str] | None) -> ModelResult:
         adapter = self.registry.adapters[provider]
-        call.max_output_tokens = min(call.max_output_tokens, self.settings.max_output_tokens_per_call)
+        call.max_output_tokens = min(call.max_output_tokens, self._out_cap(run))
+        if run.eris:
+            call.rules = eris.RULES  # every model, on every step, follows the Eris guidebook
+        timeout = 600 if (call.attachments or run.eris) else 300
         last: Exception | None = None
         for attempt in range(2):
             self._check_budget(run)
@@ -203,7 +212,7 @@ class Controller:
             if live:
                 self._live(run, call, provider, *live)
             try:
-                result = await asyncio.wait_for(adapter.generate(call), timeout=600 if call.attachments else 300)
+                result = await asyncio.wait_for(adapter.generate(call), timeout=timeout)
             except ProviderError as e:
                 last = e
                 if e.retryable and attempt == 0:
@@ -212,7 +221,7 @@ class Controller:
                     continue
                 break
             except asyncio.TimeoutError as e:
-                last = ProviderError(provider, "timed out after 300s", retryable=True)
+                last = ProviderError(provider, f"timed out after {timeout}s", retryable=True)
                 if attempt == 0:
                     continue
                 break
@@ -311,7 +320,7 @@ class Controller:
         system, prompt = prompts.analysis_prompt(run.request, run.materials, files_mod.describe(files), profile)
 
         async def one(p: str) -> None:
-            call = ModelCall(system, prompt, "analysis", self.settings.max_output_tokens_per_call,
+            call = ModelCall(system, prompt, "analysis", self._out_cap(run),
                              {"request": run.request, "task_title": "Independent analysis"}, attachments=files)
             try:
                 res = await self._call(run, p, call, live=(f"analysis:{p}", "Independent analysis"))
@@ -339,7 +348,7 @@ class Controller:
         async def one(a: Opinion) -> None:
             others = [o for o in run.analyses if o.output and o.provider != a.provider]
             system, prompt = prompts.cross_check_prompt(run.request, a, others, profile)
-            call = ModelCall(system, prompt, "cross_check", min(3000, self.settings.max_output_tokens_per_call),
+            call = ModelCall(system, prompt, "cross_check", min(5000 if run.eris else 3000, self._out_cap(run)),
                              {"request": run.request, "task_title": "Cross-check"})
             try:
                 res = await self._call(run, a.provider, call, live=(f"cross:{a.provider}", "Cross-check"))
@@ -375,7 +384,7 @@ class Controller:
         plan.planner = planner
         run.plan = plan
         field = str((prompts.parse_json(result.text) or {}).get("field") or "").lower()
-        if field in PROFILES and field != run.profile:
+        if not run.eris and field in AUTO_FIELDS and field != run.profile:
             run.profile = field
             profile = get_profile(field)
             self._event(run, "field", f"{NAMES[planner]} judged this to be {profile.name.lower()} work, so the rest of the run uses that approach", planner)
@@ -526,7 +535,7 @@ class Controller:
                 system, prompt = prompts.task_prompt(plan, task, deps, profile, run.materials, findings, previous, shared)
                 try:
                     result = await self._call(run, implementer, ModelCall(
-                        system, prompt, "task", self.settings.max_output_tokens_per_call,
+                        system, prompt, "task", self._out_cap(run),
                         {"request": run.request, "task_title": task.title, "task_id": task.id, "is_revision": revision > 0},
                         attachments=task_files), live=(f"task:{task.id}", task.title))
                 except ProviderError as e:
@@ -593,7 +602,7 @@ class Controller:
         shared = prompts.findings_block(run.analyses, run.cross_checks, limit=3000)
         system, prompt = prompts.integrate_prompt(run.request, plan, accepted, missing, profile, shared)
         integrator, result, reason = await self._call_any(run, "integrator", ModelCall(
-            system, prompt, "integrate", self.settings.max_output_tokens_per_call,
+            system, prompt, "integrate", self._out_cap(run),
             {"request": run.request, "sections": [(t.title, t.output) for t in accepted]}), load,
             live=("final", "Final result"))
         final = FinalResult(output=result.text, integrator=integrator)

@@ -26,6 +26,13 @@ class ModelCall:
     attachments: list["StoredFile"] = field(default_factory=list)
     # Called with each piece of text as the model writes it, so the screen updates live.
     on_text: Callable[[str], Awaitable[None]] | None = None
+    # Long shared rules (Project Eris guidebook) that go before the system prompt on every call of a run.
+    # Kept separate so providers can cache this repeated prefix.
+    rules: str = ""
+
+    @property
+    def full_system(self) -> str:
+        return f"{self.rules}\n\n{self.system}" if self.rules else self.system
 
 
 def split_attachments(call: ModelCall, provider: str) -> tuple[list["StoredFile"], str]:

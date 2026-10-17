@@ -49,6 +49,48 @@ PROFILES: dict[str, FieldProfile] = {
             output_format="Structured Markdown report with headings, key findings first, and a limitations section.",
         ),
         FieldProfile(
+            key="eris",
+            name="Project Eris ML",
+            description="ML challenge solutions that follow the Eris Solver Guidebook, checked with dry runs only.",
+            planning=(
+                "This is a Project Eris ML challenge. Plan an Eris-compliant solution: understand the data, metric and "
+                "submission format; choose a model that is genuinely trained or fine-tuned inside the script, with any HPO "
+                "inside it (fixed seed, fixed number of trials) and fixed epochs that fit 1.5 hours on an A10G. Exactly ONE "
+                "task writes the complete solution.py; other tasks can analyse the data and design the approach before it, "
+                "and one task after it writes the dry-run steps and checks the script rule by rule."
+            ),
+            work=(
+                "Follow every Eris rule. Write complete, runnable Python in fenced blocks with file names, never fragments "
+                "or placeholders. Put the seed template at the top, use only libraries in the Kaggle Docker image, and give "
+                "dry-run steps instead of asking for a full run."
+            ),
+            review_checks=[
+                "Does it do what the challenge asks, using only the challenge data?",
+                "Does the code run as written, without bugs, missing pieces or a malformed submission.csv?",
+                *[f"Eris rule: {c}" for c in [
+                    "real training or fine-tuning inside the script",
+                    "no hardcoded values or offline-found hyperparameters; HPO inside the script with a fixed seed and a fixed number of trials",
+                    "one end-to-end script from raw data to submission.csv; no cached artifacts or self-fine-tuned weights",
+                    "no external or synthetic data; only Kaggle Docker image libraries; no pip or GitHub installs",
+                    "test set only for one-sample or one-batch inference",
+                    "determinism: all seeds set; no clock or machine checks; no try/except fallbacks; no switches or debug flags",
+                    "fixed epochs or steps that fit 1.5 hours on an A10G",
+                    "the guidebook's domain rules for this kind of challenge",
+                    "dry runs only: no instruction to run the full end-to-end training",
+                ]],
+            ],
+            final_checks=[
+                "One complete end-to-end solution.py that writes a complete submission.csv",
+                "Every Eris rule passes (training, hardcoding, data, libraries, test set, determinism, runtime, domain rules)",
+                "Dry-run steps are given and the full end-to-end run is not requested",
+                "Grey areas and the expected runtime on an A10G are stated",
+            ],
+            output_format=(
+                "Markdown: the approach in a few lines, the complete solution.py in one fenced block, '## Dry run' steps, "
+                "'## Eris rule check' as a table (rule, pass or fail or unclear, why), the expected runtime on an A10G, and grey areas or risks."
+            ),
+        ),
+        FieldProfile(
             key="general",
             name="General",
             description="Product, business, planning and anything else.",
@@ -64,6 +106,10 @@ PROFILES: dict[str, FieldProfile] = {
         ),
     ]
 }
+
+
+# Fields the planner can choose. Project Eris is only ever chosen by the user's switch.
+AUTO_FIELDS = ("software", "research", "general")
 
 
 def get_profile(key: str) -> FieldProfile:

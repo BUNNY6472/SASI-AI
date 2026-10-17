@@ -24,7 +24,7 @@ from .keys import build_key_store
 from .models import TERMINAL, ApprovePlan, CreateRun, FileRef, Login, Run, SaveKey
 from .store.memory import MemoryStore
 from .workflow.controller import Controller
-from .workflow.profiles import PROFILES, detect_profile
+from .workflow.profiles import AUTO_FIELDS, PROFILES, detect_profile
 from .workflow.router import PerformanceHistory
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -203,6 +203,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "max_model_calls_per_run": s.max_model_calls_per_run,
             "max_tokens_per_run": s.max_tokens_per_run,
+            "eris_max_tokens_per_run": s.eris_max_tokens_per_run,
             "max_output_tokens_per_call": s.max_output_tokens_per_call,
             "max_tasks_per_plan": s.max_tasks_per_plan,
             "max_revisions_per_task": s.max_revisions_per_task,
@@ -277,8 +278,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             files = file_store.take(body.file_ids)
         except FileRejected as e:
             raise HTTPException(400, str(e)) from e
-        profile = body.profile if body.profile in PROFILES else detect_profile(body.request, body.materials, [f.name for f in files])
-        run = Run(request=body.request.strip(), materials=body.materials, profile=profile,
+        eris = body.eris or body.profile == "eris"
+        if eris:
+            profile = "eris"
+        elif body.profile in AUTO_FIELDS:
+            profile = body.profile
+        else:
+            profile = detect_profile(body.request, body.materials, [f.name for f in files])
+        run = Run(request=body.request.strip(), materials=body.materials, profile=profile, eris=eris,
                   require_plan_approval=body.require_plan_approval, compare_all=body.compare_all,
                   files=[FileRef(**f.ref()) for f in files])
         try:

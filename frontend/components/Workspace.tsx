@@ -30,12 +30,23 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
   const [showMaterials, setShowMaterials] = useState(false);
   const [approval, setApproval] = useState(true);
   const [compare, setCompare] = useState(true);
+  const [eris, setEris] = useState(false);
   const [files, setFiles] = useState<Attachment[]>([]);
   const [dragging, setDragging] = useState(false);
   const picker = useRef<HTMLInputElement>(null);
   const uploading = files.some((f) => !f.id && !f.error);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    try { setEris(localStorage.getItem("sasi.eris") === "1"); } catch { /* storage blocked: start with the switch off */ }
+  }, []);
+
+  function switchEris(on: boolean) {
+    setEris(on);
+    if (on) setCompare(true); // the side-by-side comparison is where every answer is checked against the Eris rules
+    try { localStorage.setItem("sasi.eris", on ? "1" : "0"); } catch { /* ignore */ }
+  }
 
   useEffect(() => {
     const load = () => api<RunSummary[]>("/api/runs").then(setRuns).catch(() => {});
@@ -77,7 +88,7 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
       const run = await api<Run>("/api/runs", {
         method: "POST",
         body: JSON.stringify({
-          request, materials, profile: "auto", require_plan_approval: approval, compare_all: compare,
+          request, materials, profile: "auto", eris, require_plan_approval: approval, compare_all: compare,
           file_ids: files.filter((f) => f.id).map((f) => f.id),
         }),
       });
@@ -123,7 +134,7 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
       )}
 
       <form
-        className={dragging ? "glass composer dragging" : "glass composer"}
+        className={`glass composer${dragging ? " dragging" : ""}${eris ? " eris-on" : ""}`}
         onSubmit={submit}
         onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
         onDragLeave={() => setDragging(false)}
@@ -132,7 +143,9 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
         <textarea
           value={request}
           onChange={(e) => setRequest(e.target.value)}
-          placeholder="Ask anything: code, research, data, planning. SASI works out what kind of job it is."
+          placeholder={eris
+            ? "Paste the Eris challenge overview and rules, and attach the data files. All three build a guidebook-compliant ML solution."
+            : "Ask anything: code, research, data, planning. SASI works out what kind of job it is."}
           rows={4}
           maxLength={20000}
         />
@@ -159,6 +172,18 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
             ))}
           </div>
         )}
+        <div className={eris ? "eris-bar on" : "eris-bar"}>
+          <label className="switch">
+            <input type="checkbox" role="switch" checked={eris} onChange={(e) => switchEris(e.target.checked)} />
+            <span className="switch-track" aria-hidden="true"><span className="switch-thumb" /></span>
+            <span className="switch-label">Project Eris mode</span>
+          </label>
+          <span className="small eris-note">
+            {eris
+              ? "On. All three follow the Eris Solver Guidebook for the ML solution, check each other against its rules, and give dry-run steps only, never a full end-to-end run."
+              : "Turn on for Eris ML challenges: guidebook rules and dry runs only."}
+          </span>
+        </div>
         <input ref={picker} type="file" multiple hidden onChange={(e) => { addFiles(e.target.files); e.target.value = ""; }} />
         <div className="composer-row">
           <button type="button" className="btn ghost" onClick={() => picker.current?.click()}>📎 Attach files</button>
@@ -202,7 +227,7 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
               </div>
               <p>{r.request}</p>
               <div className="muted small">
-                {r.profile} · {r.tasks} tasks{r.files ? ` · ${r.files} files` : ""} · {fmt(r.tokens)} tokens{r.simulated ? " · test run" : ""}
+                {r.eris ? "Project Eris" : r.profile} · {r.tasks} tasks{r.files ? ` · ${r.files} files` : ""} · {fmt(r.tokens)} tokens{r.simulated ? " · test run" : ""}
               </div>
             </button>
           ))}

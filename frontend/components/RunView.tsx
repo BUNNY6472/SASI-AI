@@ -7,7 +7,7 @@ import { AgentChip, StatusBadge, fmt } from "./ui";
 
 const LIVE = new Set(["analyzing", "cross_checking", "planning", "reviewing_plan", "awaiting_approval", "running", "integrating"]);
 const ORDER = ["claude", "chatgpt", "gemini"];
-const FIELD_NAME: Record<string, string> = { software: "Software engineering", research: "Research and analysis", general: "General" };
+const FIELD_NAME: Record<string, string> = { software: "Software engineering", research: "Research and analysis", general: "General", eris: "Project Eris ML" };
 const TERMINAL = new Set(["completed", "failed", "cancelled", "budget_stopped", "interrupted"]);
 
 export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Run | null) => void; back: () => void }) {
@@ -98,7 +98,11 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
         <div className="run-title">
           <StatusBadge status={run.status} />
           {run.simulated && <span className="badge demo">Test agents</span>}
-          <span className="badge field" title="Chosen automatically from your request">{FIELD_NAME[run.profile] || run.profile}</span>
+          {run.eris ? (
+            <span className="badge eris" title="All three follow the Eris Solver Guidebook. Dry runs only, never a full end-to-end run.">Project Eris · dry runs only</span>
+          ) : (
+            <span className="badge field" title="Chosen automatically from your request">{FIELD_NAME[run.profile] || run.profile}</span>
+          )}
           <h1>{run.request}</h1>
         </div>
         <div className="run-actions">

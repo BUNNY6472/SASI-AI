@@ -126,6 +126,7 @@ class Run(BaseModel):
     request: str
     materials: str = ""
     profile: str = "general"
+    eris: bool = False  # Project Eris mode: every model follows the Eris Solver Guidebook, dry runs only
     require_plan_approval: bool = True
     compare_all: bool = True
     files: list[FileRef] = []
@@ -149,6 +150,7 @@ class Run(BaseModel):
             "updated_at": self.updated_at,
             "request": self.request[:200],
             "profile": self.profile,
+            "eris": self.eris,
             "status": self.status,
             "simulated": self.simulated,
             "tasks": len(self.plan.tasks) if self.plan else 0,
@@ -163,6 +165,7 @@ class CreateRun(BaseModel):
     profile: str = "auto"  # "auto" lets SASI pick the field from the request
     require_plan_approval: bool = True
     compare_all: bool = True
+    eris: bool = False  # Project Eris switch
     file_ids: list[str] = Field(default=[], max_length=10)
 
 

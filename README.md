@@ -44,6 +44,18 @@ Any file type can be attached from the composer (button or drag and drop), up to
 
 On Cloud Run everything for a run is kept in BigQuery (dataset `sasi_data`): `run_checkpoints` (run state), `run_outputs` (every model's analysis, cross-check, task work, review and final result, ready to compare with SQL) and `run_files` (the files, in chunks). **Delete** on a finished run removes it from all three tables.
 
+## Project Eris mode
+
+A separate switch in the composer, for Project Eris ML challenges. When it is on:
+
+- Every model, on every step, gets the full Eris Solver Guidebook (`backend/app/workflow/eris_guidebook.md`) as rules. The text is sent as a repeated prefix, so the providers cache it.
+- The models are told never to run, or ask for, the full end-to-end training. They deliver one clean `solution.py` with no dry-run flags or switches (the determinism check rejects those), plus separate dry-run steps for a copy of the script.
+- The side-by-side comparison adds an "Eris rule check" table: every model's answer against each rule (real training in the script, no hardcoding, one end-to-end script, data, libraries, test-set use, determinism, 1.5 hours on an A10G, a complete submission.csv, domain rules).
+- Reviews send back any work that fails a rule, and the final result ends with the rule check, the dry-run steps and the expected runtime.
+- Eris runs allow up to 1,000,000 tokens and 12,000 output tokens per call, because they carry the guidebook and whole training scripts.
+
+SASI never executes code, so nothing is ever run end to end by the app itself.
+
 ## API keys
 
 Keys are pasted on the app's **Connections** page. The backend checks each key against the provider, stores it in Google Secret Manager (or memory when running locally), and starts using it immediately. Keys are never returned to the browser or logged; only the last 4 characters are shown. Runs need at least one key. With one key, that model also reviews its own work and results are labelled *self-reviewed*; with all three, every step is checked by a different model.
@@ -60,7 +72,8 @@ backend/app/
   gateway/                model access: one adapter per provider + simulated agents + model registry
   workflow/controller.py  the workflow controller (stages, gates, retries, checkpoints)
   workflow/router.py      chooses who does and who checks each task, from review history, and says why
-  workflow/profiles.py    field profiles: software, research, general
+  workflow/profiles.py    field profiles: software, research, general, and Project Eris
+  workflow/eris.py        Project Eris mode: the guidebook rules, the rule list and the dry-run instructions
   workflow/prompts.py     task-scoped prompts
   store/                  project record: in-memory, or BigQuery checkpoints (dataset sasi_data)
 frontend/                 Next.js web app with the three.js 3D scene (exported to static files)

@@ -51,7 +51,7 @@ class ChatGPTAdapter:
 
     async def generate(self, call: ModelCall) -> ModelResult:
         model = await self.resolve_model()
-        kwargs = dict(model=model, instructions=call.system, input=self._input(call),
+        kwargs = dict(model=model, instructions=call.full_system, input=self._input(call),
                       max_output_tokens=call.max_output_tokens, store=False)
         try:
             if call.on_text:

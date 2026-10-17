@@ -44,7 +44,7 @@ class SimulatedAdapter:
             provider=self.provider,
             model=f"simulated-{self.provider}",
             text=text,
-            input_tokens=len(call.prompt) // 4,
+            input_tokens=(len(call.full_system) + len(call.prompt)) // 4,
             output_tokens=len(text) // 4,
             stop_reason="end_turn",
             simulated=True,

@@ -46,12 +46,20 @@ class ClaudeAdapter:
         content.append({"type": "text", "text": extra + call.prompt})
         return content
 
+    @staticmethod
+    def _system(call: ModelCall):
+        if not call.rules:
+            return call.system
+        # Mark the shared rules for caching: every call in the run repeats them.
+        return [{"type": "text", "text": call.rules, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": call.system}]
+
     async def generate(self, call: ModelCall) -> ModelResult:
         model = await self.resolve_model()
         kwargs = dict(
             model=model,
             max_tokens=call.max_output_tokens,
-            system=call.system,
+            system=self._system(call),
             messages=[{"role": "user", "content": self._content(call)}],
             output_config={"effort": "medium"},
             # On a safety decline, let the API rerun on Anthropic's recommended fallback.
@@ -82,7 +90,9 @@ class ClaudeAdapter:
             provider=self.provider,
             model=resp.model or model,
             text=text,
-            input_tokens=resp.usage.input_tokens or 0,
+            # Count cached input too, so the per-run token limit sees everything the model read.
+            input_tokens=(resp.usage.input_tokens or 0) + (getattr(resp.usage, "cache_creation_input_tokens", 0) or 0)
+            + (getattr(resp.usage, "cache_read_input_tokens", 0) or 0),
             output_tokens=resp.usage.output_tokens or 0,
             stop_reason=resp.stop_reason or "",
         )
