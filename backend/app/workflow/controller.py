@@ -201,7 +201,10 @@ class Controller:
                 run.live.pop(live[0], None)
 
     async def _call_inner(self, run: Run, provider: str, call: ModelCall, live: tuple[str, str] | None) -> ModelResult:
-        adapter = self.registry.adapters[provider]
+        adapter = self.registry.adapters.get(provider)
+        if adapter is None:  # its key was removed while the run was going
+            self._unhealthy.setdefault(run.id, set()).add(provider)
+            raise ProviderError(provider, "its key was removed")
         call.max_output_tokens = min(call.max_output_tokens, self._out_cap(run))
         if run.eris:
             call.rules = eris.RULES  # every model, on every step, follows the Eris guidebook

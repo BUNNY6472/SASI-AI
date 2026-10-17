@@ -181,17 +181,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             how = "Try saving it again in a minute."
         return f"The key works and SASI is using it now, but it was not saved, so it will be lost when the app restarts. {how} (Details: {reason})"
 
+    async def remove_key(provider: str) -> dict:
+        """Stop using the key at once, then remove the stored copy. Removing never fails for the user."""
+        registry.remove(provider)
+        result = {"provider": provider, "configured": False, "removed": True, "saved": True}
+        try:
+            await key_store.delete(provider)
+        except Exception as e:  # noqa: BLE001
+            reason = f"{type(e).__name__}: {str(e)[:300]}"
+            log.warning("removed key for %s from the app, but not from storage: %s", provider, reason)
+            result["saved"] = False
+            result["warning"] = remove_failure_message(type(e).__name__, reason)
+        return result
+
+    def remove_failure_message(kind: str, reason: str) -> str:
+        how = ("In Cloud Shell run: cd ~/SASI-AI && git pull && bash deploy/setup-gcp.sh , wait 2 minutes, then remove it again."
+               if kind == "PermissionDenied" else "Remove it again in a minute.")
+        return ("Removed. SASI stopped using this key, but Google Cloud did not let it delete the stored copy, so the key "
+                f"would come back if the app restarts. {how} (Details: {reason})")
+
     @app.delete("/api/keys/{provider}")
     async def delete_key(provider: str):
         if provider not in PROVIDERS:
             raise HTTPException(404, "Unknown provider")
-        try:
-            await key_store.delete(provider)
-        except Exception as e:  # noqa: BLE001
-            log.warning("could not delete key for %s: %s", provider, type(e).__name__)
-            raise HTTPException(500, "Could not remove the key.") from e
-        registry.remove(provider)
-        return {"provider": provider, "configured": False}
+        return await remove_key(provider)
+
+    @app.delete("/api/keys")
+    async def delete_all_keys():
+        """Remove every key, for example before pasting a fresh set."""
+        results = [await remove_key(p) for p in PROVIDERS]
+        warnings = [r["warning"] for r in results if r.get("warning")]
+        return {"removed": [r["provider"] for r in results], "saved": not warnings, "warning": warnings[0] if warnings else None}
 
     @app.get("/api/profiles")
     async def profiles():

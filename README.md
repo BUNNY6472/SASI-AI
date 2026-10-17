@@ -59,7 +59,7 @@ SASI never executes code, so nothing is ever run end to end by the app itself.
 
 ## API keys
 
-Keys are pasted on the app's **Connections** page. The backend checks each key against the provider, stores it in Google Secret Manager (or memory when running locally), and starts using it immediately. Keys are never returned to the browser or logged; only the last 4 characters are shown. Runs need at least one key. With one key, that model also reviews its own work and results are labelled *self-reviewed*; with all three, every step is checked by a different model.
+Keys are pasted on the app's **Connections** page. The backend checks each key against the provider, stores it in Google Secret Manager (or memory when running locally), and starts using it immediately. Keys are never returned to the browser or logged; only the last 4 characters are shown. To change a key, paste the new one and press **Replace key**; the old one is destroyed. **Remove** (or **Remove all keys**) stops SASI using a key at once and writes a removal marker in Secret Manager, which needs the same permission as saving, then destroys the old versions. Runs need at least one key. With one key, that model also reviews its own work and results are labelled *self-reviewed*; with all three, every step is checked by a different model.
 
 Simulated agents exist only for the automated tests (`ALLOW_SIMULATED=true`).
 

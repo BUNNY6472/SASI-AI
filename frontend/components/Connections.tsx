@@ -48,7 +48,8 @@ function KeyForm({ p, onChange }: { p: ProviderStatus; onChange: () => Promise<v
     setBusy(true);
     setMsg(null);
     try {
-      await api(`/api/keys/${p.provider}`, { method: "DELETE" });
+      const r = await api<{ saved: boolean; warning?: string }>(`/api/keys/${p.provider}`, { method: "DELETE" });
+      setMsg(r.saved ? { ok: true, text: "Removed. Paste a new key any time." } : { ok: false, warn: true, text: r.warning || "Removed from SASI." });
       await onChange();
     } catch (err) {
       setMsg({ ok: false, text: (err as Error).message });
@@ -87,6 +88,22 @@ export default function Connections({ providers, refresh, reload }: { providers:
   const [limits, setLimits] = useState<Limits | null>(null);
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [busy, setBusy] = useState(false);
+  const [allMsg, setAllMsg] = useState<{ warn: boolean; text: string } | null>(null);
+
+  async function removeAll() {
+    if (!window.confirm("Remove all API keys from SASI? Runs can't start until you add a key again.")) return;
+    setBusy(true);
+    setAllMsg(null);
+    try {
+      const r = await api<{ saved: boolean; warning?: string | null }>("/api/keys", { method: "DELETE" });
+      setAllMsg(r.saved ? { warn: false, text: "All keys removed. Paste new ones above." } : { warn: true, text: r.warning || "Removed from SASI." });
+      await reload();
+    } catch (err) {
+      setAllMsg({ warn: true, text: (err as Error).message });
+    } finally {
+      setBusy(false);
+    }
+  }
 
   useEffect(() => {
     api<Limits>("/api/limits").then(setLimits).catch(() => {});
@@ -113,9 +130,16 @@ export default function Connections({ providers, refresh, reload }: { providers:
           </div>
         ))}
       </div>
-      <button className="btn" disabled={busy} onClick={async () => { setBusy(true); await refresh(); setBusy(false); }}>
-        {busy ? "Checking…" : "Re-check all keys"}
-      </button>
+      <p className="small muted">To change a key, paste the new one and press Replace key. You don&apos;t need to remove the old one first.</p>
+      <div className="key-actions">
+        <button className="btn" disabled={busy} onClick={async () => { setBusy(true); await refresh(); setBusy(false); }}>
+          {busy ? "Checking…" : "Re-check all keys"}
+        </button>
+        {providers.some((p) => p.connected) && (
+          <button className="btn danger" disabled={busy} onClick={removeAll}>Remove all keys</button>
+        )}
+      </div>
+      {allMsg && <p className={allMsg.warn ? "warn-text small" : "ok small"}>{allMsg.text}</p>}
 
       <div className="glass lock-note">
         Only people with your access code can open SASI. Keep the code private. Every model call is billed to your own API accounts,

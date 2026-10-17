@@ -17,6 +17,10 @@ log = logging.getLogger("sasi.keys")
 
 SECRET_NAMES = {"claude": "ANTHROPIC_API_KEY", "chatgpt": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
 
+# Stored in place of a key when it is removed. Writing it needs the same permission as saving a key,
+# so removing works whenever saving works.
+REMOVED = "__removed__"
+
 
 def hint(key: str) -> str:
     """A safe reminder of which key is stored: only the last 4 characters."""
@@ -56,7 +60,8 @@ class SecretManagerKeyStore:
 
         try:
             resp = self._client.access_secret_version(name=f"{self._secret(provider)}/versions/latest")
-            return resp.payload.data.decode("utf-8").strip()
+            value = resp.payload.data.decode("utf-8").strip()
+            return "" if value == REMOVED else value
         except (exceptions.NotFound, exceptions.FailedPrecondition):
             return ""  # secret or version missing: provider not connected
         except exceptions.PermissionDenied:
@@ -67,20 +72,31 @@ class SecretManagerKeyStore:
         versions = self._client.list_secret_versions(parent=self._secret(provider), filter="state:ENABLED")
         return [v.name for v in versions]
 
+    def _cleanup(self, provider: str, keep: str) -> None:
+        """Destroy older versions, so old keys are really gone (and the free tier's 6 active versions are not used up).
+
+        The newest version is already in place when this runs, so a cleanup problem is only logged.
+        """
+        keep_id = keep.rsplit("/", 1)[-1]
+        try:
+            for name in self._enabled_versions(provider):
+                if name.rsplit("/", 1)[-1] != keep_id:
+                    self._client.destroy_secret_version(name=name)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not destroy older versions of %s: %s", SECRET_NAMES[provider], type(e).__name__)
+
     def _write(self, provider: str, key: str) -> None:
         new = self._client.add_secret_version(parent=self._secret(provider), payload={"data": key.encode("utf-8")})
-        # Keep one version per key (Secret Manager free tier covers 6 active versions).
-        # The key is already saved at this point, so cleanup problems are only logged.
-        try:
-            old = [n for n in self._enabled_versions(provider) if n.rsplit("/", 1)[-1] != new.name.rsplit("/", 1)[-1]]
-            for name in old:
-                self._client.destroy_secret_version(name=name)
-        except Exception as e:  # noqa: BLE001
-            log.warning("saved %s, but could not remove its older versions: %s", SECRET_NAMES[provider], type(e).__name__)
+        self._cleanup(provider, new.name)
 
     def _remove(self, provider: str) -> None:
-        for name in self._enabled_versions(provider):
-            self._client.destroy_secret_version(name=name)
+        from google.api_core import exceptions
+
+        try:
+            new = self._client.add_secret_version(parent=self._secret(provider), payload={"data": REMOVED.encode("utf-8")})
+        except exceptions.NotFound:
+            return  # no secret, so no stored key
+        self._cleanup(provider, new.name)
 
     async def load(self) -> dict[str, str]:
         values = await asyncio.gather(*(asyncio.to_thread(self._read, p) for p in SECRET_NAMES))

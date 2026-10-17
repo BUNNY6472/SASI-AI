@@ -428,3 +428,71 @@ def test_models_build_one_answer_together_test_it_and_fix_it():
         assert final["score"] == 8.0, "the score is from the re-test after the fixes"
         assert not any(g.startswith("Still to fix") for g in final["gaps"])
         assert client.get("/api/runs").json()[0]["score"] == 8.0
+
+
+def test_keys_can_always_be_removed_or_replaced(monkeypatch):
+    """Removing stops using a key at once, even if the stored copy can't be deleted; replacing needs no removal first."""
+    with make_client(allow_simulated=False) as client:
+        registry = client.app.state.registry
+
+        async def fake_test(provider, key):
+            return "model-x"
+
+        monkeypatch.setattr(registry, "test_key", fake_test)
+        for p in ("claude", "chatgpt", "gemini"):
+            assert client.put(f"/api/keys/{p}", json={"key": f"sk-{p}-old-1234567890"}).status_code == 200
+        r = client.put("/api/keys/claude", json={"key": "sk-claude-new-1234567890NEW1"})
+        assert r.status_code == 200 and r.json()["hint"] == "…NEW1", "replacing works without removing first"
+
+        async def broken_delete(provider):
+            raise PermissionError("403 denied")
+
+        monkeypatch.setattr(client.app.state.key_store, "delete", broken_delete)
+        r = client.delete("/api/keys/claude")
+        assert r.status_code == 200 and r.json()["saved"] is False and "PermissionError" in r.json()["warning"]
+        keys = {k["provider"]: k["configured"] for k in client.get("/api/keys").json()}
+        assert keys == {"claude": False, "chatgpt": True, "gemini": True}, "the app stopped using it anyway"
+
+        monkeypatch.undo()
+        monkeypatch.setattr(registry, "test_key", fake_test)
+        r = client.delete("/api/keys")
+        assert r.status_code == 200 and r.json()["saved"] is True
+        assert not any(k["configured"] for k in client.get("/api/keys").json())
+        assert client.get("/api/providers").json()["needs_keys"] is True
+
+
+def test_secret_manager_remove_writes_a_marker_and_destroys_old_versions():
+    from types import SimpleNamespace
+
+    from app.keys import REMOVED, SecretManagerKeyStore
+
+    class FakeClient:
+        def __init__(self):
+            self.versions: dict[str, tuple[str, str]] = {}  # name -> (state, data)
+
+        def add_secret_version(self, parent, payload):
+            name = f"{parent}/versions/{len(self.versions) + 1}"
+            self.versions[name] = ("ENABLED", payload["data"].decode())
+            return SimpleNamespace(name=name)
+
+        def list_secret_versions(self, parent, filter):
+            return [SimpleNamespace(name=n) for n, (st, _) in self.versions.items() if n.startswith(parent) and st == "ENABLED"]
+
+        def destroy_secret_version(self, name):
+            self.versions[name] = ("DESTROYED", "")
+
+        def access_secret_version(self, name):
+            parent = name.rsplit("/versions/", 1)[0]
+            live = [d for n, (st, d) in self.versions.items() if n.startswith(parent) and st == "ENABLED"]
+            return SimpleNamespace(payload=SimpleNamespace(data=live[-1].encode()))
+
+    store = SecretManagerKeyStore.__new__(SecretManagerKeyStore)
+    store._client, store._project = FakeClient(), "p"
+    store._write("claude", "sk-old-key-123456")
+    store._write("claude", "sk-new-key-123456")
+    assert store._read("claude") == "sk-new-key-123456"
+    assert sum(st == "ENABLED" for st, _ in store._client.versions.values()) == 1, "old key destroyed"
+    store._remove("claude")
+    assert store._read("claude") == ""
+    enabled = [d for st, d in store._client.versions.values() if st == "ENABLED"]
+    assert enabled == [REMOVED], "only the removal marker is left"
