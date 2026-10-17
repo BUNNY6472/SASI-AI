@@ -303,6 +303,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "time_limit_minutes": s.run_time_limit_minutes,
             "wrap_up_minutes": s.wrap_up_minutes,
+            "timing_policy": "graceful",
+            "minimum_time_target_minutes": 20,
+            "max_total_run_minutes": settings.max_total_run_minutes,
+            "model_phase_min_minutes": s.model_phase_min_minutes,
+            "model_phase_grace_minutes": s.model_phase_grace_minutes,
             "team_size": s.team_size,
             "max_model_calls_per_run": s.max_model_calls_per_run,  # 0: no cap
             "max_tokens_per_run": s.max_tokens_per_run,  # 0: no cap

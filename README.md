@@ -24,7 +24,7 @@ request + files + selected mode/time
   -> deliver answer + sources + current checks + limitations + usage
 ```
 
-Time is a ceiling, not a target to fill. A run can finish early. Approval pauses its working clock. The controller reserves time for a final answer and reports unfinished work if it runs out of time.
+The selected time is a research planning target. At the target, no new research work is admitted, while active workflow model calls retain at least a 20-minute working allowance and five minutes of finishing grace. Actual response times can increase their allowance; completed replies proceed immediately. The total active runtime is capped at **120 minutes, including final assembly**. New work stops earlier when necessary to reserve finishing time before that cap. One bounded final synthesis may extend beyond a shorter research target, within the total cap. Approval pauses the working clock, and resume retains spent call allowances. Interrupted text is saved separately as incomplete, unreviewed work. Explicit cancellation and token/call/trial guards still apply. Source-fetch and search-tool timeouts remain separate, shorter bounds.
 
 | Mode | Starting policy | Appropriate use |
 |---|---|---|
@@ -87,11 +87,14 @@ The backend tests include fake-provider regression tests, not frontier-model ben
 
 Claude and Gemini are the frontier seats. All six supported open-model seats are configured: GLM, DeepSeek, Qwen, Kimi, MiniMax and gpt-oss. Outside trial-only mode, Claude uses its API key by default; Gemini and open models use Vertex AI. Claude on Vertex requires an explicit opt-in. Account access, lifecycle and task selection determine which models run. Qwen, Kimi and MiniMax routes are retired automatically on October 21, 2026 UTC; their cards retain an explanation.
 
-The deployment currently enforces **`TRIAL_CREDITS_ONLY=true`**: only Google Gemini through Vertex AI may run. Partner models and all API-key routes are blocked before connection probes or inference, even if keys are already saved. Google welcome credits exclude managed partner models and AI Studio API costs. The integration code remains available for a future explicitly funded configuration. This policy does not measure your credit balance or cap billing. Verify the account is still an unupgraded Free Trial, the remaining credit and its expiry before deployment; do not upgrade billing to make models available. [Google trial coverage](https://docs.cloud.google.com/free/docs/free-cloud-features)
+The deployment enforces **`TRIAL_CREDITS_ONLY=true`** for Google Cloud routes: Vertex Gemini is allowed, while partner models and the Gemini API-key fallback are blocked before probes or inference. The owner has separately enabled **`ALLOW_CLAUDE_API_KEY=true`** for a dedicated, owner-funded Anthropic key entered through Connections; those charges are outside Google Cloud credits. Legacy Claude keys are not activated by this exception. Google welcome credits exclude managed partner models and AI Studio API costs. This policy does not measure your credit balance or cap billing. Verify the account is still an unupgraded Free Trial, the remaining credit and its expiry before deployment; do not upgrade billing to make models available. [Google trial coverage](https://docs.cloud.google.com/free/docs/free-cloud-features)
 
 | Setting | Default |
 |---|---|
-| `RUN_TIME_LIMIT_MINUTES` | 60; each request can select 5–60 within the server ceiling |
+| `RUN_TIME_LIMIT_MINUTES` | 120; each new request can select a 20–120 minute research target within the server ceiling |
+| `MAX_TOTAL_RUN_MINUTES` | 120; hard total active-runtime cap including final assembly, retained across resume |
+| `MODEL_PHASE_MIN_MINUTES` | 20; minimum working allowance for an admitted workflow model call (completed replies proceed immediately) |
+| `MODEL_PHASE_GRACE_MINUTES` | 5; finishing grace after a call's allowance; active work and final synthesis stay inside the total cap |
 | `MAX_MODEL_CALLS_PER_RUN` | 300 |
 | `MAX_TOKENS_PER_RUN` | 2,400,000 |
 | `ERIS_MAX_TOKENS_PER_RUN` | 3,600,000 |

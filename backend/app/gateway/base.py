@@ -31,6 +31,8 @@ class ModelCall:
     rules: str = ""
     # Supported by Claude; other adapters keep their native reasoning settings.
     reasoning_effort: str = "medium"
+    # Transport read allowance. The controller still owns the total call deadline.
+    timeout_seconds: float | None = None
 
     @property
     def full_system(self) -> str:

@@ -9,10 +9,11 @@ control what happens next:
   integrate -> the other models test the result and it is fixed -> deliver with
   evidence, limitations and usage.
 
-Time, tokens and calls bound a run. Every call is bounded by the time
-left; measured latency reserves time for synthesis and review, and in
-the last minutes (the wrap-up) SASI stops new work and delivers the complete
-result from what is done. The clock pauses while a plan waits for approval.
+The run target stops admission of new work. Admitted model phases keep their
+adaptive allowance and bounded finishing grace; completed work proceeds early.
+Call/token caps, cancellation, trial expiry and the inclusive total runtime cap
+remain hard controls. One reserved finalization may follow the target. Approval
+pauses the run clock.
 
 Accepted work is checkpointed, so an interrupted run resumes without redoing it.
 """
@@ -37,8 +38,8 @@ from ..gateway.base import ModelCall, ModelResult, ProviderError, reply_room
 from ..gateway.catalog import name, reads, seat
 from ..gateway.registry import FRONTIER, ModelRegistry
 from ..gateway.routes import VIA, lasting_problem
-from ..models import (TERMINAL, Attempt, CheckResult, Consensus, Event, FinalResult, Judgement, LiveText, Opinion, Plan, Review, Run,
-                      Task, now)
+from ..models import (TERMINAL, Attempt, CallTiming, CheckResult, Consensus, Event, FinalResult, Judgement, LiveText, Opinion,
+                      PartialOutput, Plan, Review, Run, Task, now)
 from ..store.base import RunStore
 from . import eris, policy, prompts
 from .profiles import AUTO_FIELDS, get_profile
@@ -104,7 +105,13 @@ class NoProviders(Exception):
     pass
 
 
+class CallWindowExpired(ProviderError):
+    """One model's phase and finishing grace ended; its partial work is retained."""
+
+
 class Controller:
+    _heartbeat_seconds = 30.0
+
     def __init__(self, settings: Settings, registry: ModelRegistry, store: RunStore, history: PerformanceHistory,
                  files: FileStore | None = None):
         self.settings = settings
@@ -112,6 +119,8 @@ class Controller:
         self.store = store
         self.files = files or FileStore()
         self._last_publish: dict[str, float] = {}
+        self._last_checkpoint: dict[str, float] = {}
+        self._heartbeat_tasks: dict[str, asyncio.Task] = {}
         self.history = history
         self.router = Router(history)
         self._tasks: dict[str, asyncio.Task] = {}
@@ -135,6 +144,12 @@ class Controller:
             task.cancel()
         if active:
             await asyncio.gather(*active, return_exceptions=True)
+        if self._heartbeat_tasks:
+            results = await asyncio.gather(*self._heartbeat_tasks.values(), return_exceptions=True)
+            self._heartbeat_tasks.clear()
+            for result in results:
+                if isinstance(result, BaseException):
+                    log.error("Active-clock checkpoint failed during shutdown: %s", type(result).__name__)
 
     async def _gather_evidence(self, run: Run, files: list[StoredFile]) -> None:
         """Evidence collection extension point; model prose is never source evidence."""
@@ -144,6 +159,10 @@ class Controller:
 
         if run.research_status not in ("not_started", "collecting"):
             return  # resume uses the same timestamped evidence, not a different answer's sources
+        if run.timing_policy == "graceful" and not self._has_time(run, .1):
+            run.research_status = "partial"
+            self._event(run, "research_unavailable", "No new evidence requests were started because the work target or finalization reserve was reached.")
+            return
         run.research_status = "collecting"
         self._event(run, "research", "Collecting supplied evidence and checking whether public research is needed.")
         await self._publish(run)
@@ -324,6 +343,7 @@ class Controller:
         self._tasks.pop(run.id, None)
         self._approvals.pop(run.id, None)
         self._last_publish.pop(run.id, None)
+        self._last_checkpoint.pop(run.id, None)
         await self.files.delete(run.id)
         return await self.store.delete_run(run.id)
 
@@ -334,11 +354,17 @@ class Controller:
         self._launch(run)
 
     def _set_limit(self, run: Run) -> None:
+        run.timing_policy = "graceful"
+        run.model_phase_min_s = self.settings.model_phase_min_minutes * 60
+        run.model_phase_grace_s = self.settings.model_phase_grace_minutes * 60
+        run.total_time_limit_s = min(120 * 60, self.settings.max_total_run_minutes * 60)
         limit = max(0.0, self.settings.run_time_limit_minutes * 60)
         if run.time_limit_minutes is not None:
             requested = run.time_limit_minutes * 60
             limit = min(limit, requested) if limit else requested
-        run.time_limit_s = limit
+        if limit:
+            limit = max(20 * 60, limit)
+        run.time_limit_s = min(limit or run.total_time_limit_s, run.total_time_limit_s)
         run.wrap_up_s = min(max(0.0, self.settings.wrap_up_minutes * 60), limit / 4,
                             1.4 * policy.expected_seconds(run, "wrap_up") + 15) if limit else 0.0
 
@@ -373,6 +399,12 @@ class Controller:
         run.finished_at = None
         if not run.time_limit_s:  # a run from before time limits
             self._set_limit(run)
+        elif run.timing_policy != "graceful":
+            run.timing_policy = "graceful"
+            run.model_phase_min_s = self.settings.model_phase_min_minutes * 60
+            run.model_phase_grace_s = self.settings.model_phase_grace_minutes * 60
+        # Persisted call elapsed budgets and the finalization deadline remain intact.
+        run.active_calls = {}
         self._event(run, "resumed", "Resuming from the last checkpoint; accepted work is kept")
         for t in run.plan.tasks if run.plan else []:
             if t.status not in ("accepted",):
@@ -392,7 +424,34 @@ class Controller:
     async def _publish(self, run: Run, checkpoint: bool = False) -> None:
         run.updated_at = now()
         await self.store.save(run, checkpoint=checkpoint)
+        if checkpoint:
+            self._last_checkpoint[run.id] = time.monotonic()
         self._notify(run)
+
+    async def _checkpoint_active(self, run: Run) -> None:
+        """Bound crash recovery loss while a provider reasons without visible text."""
+        if time.monotonic() - self._last_checkpoint.get(run.id, 0) < self._heartbeat_seconds:
+            return
+        async with self._lock:
+            if time.monotonic() - self._last_checkpoint.get(run.id, 0) >= self._heartbeat_seconds:
+                await self._publish(run, checkpoint=True)
+
+    def _scheduled_checkpoint(self, run: Run) -> asyncio.Task | None:
+        """Storage must never block the provider deadline watchdog."""
+        task = self._heartbeat_tasks.get(run.id)
+        if task is not None and task.done():
+            self._heartbeat_tasks.pop(run.id, None)
+            task.result()  # surface durable failures through the workflow
+            task = None
+        if task is None and time.monotonic() - self._last_checkpoint.get(run.id, 0) >= self._heartbeat_seconds:
+            task = asyncio.create_task(self._checkpoint_active(run), name=f"clock-checkpoint-{run.id}")
+            self._heartbeat_tasks[run.id] = task
+        return task
+
+    async def _drain_checkpoint(self, run: Run) -> None:
+        task = self._heartbeat_tasks.pop(run.id, None)
+        if task is not None:
+            await asyncio.shield(task)
 
     def _notify(self, run: Run) -> None:
         """Wake clients even when durable storage is unavailable; this never claims a save."""
@@ -444,6 +503,8 @@ class Controller:
 
     def _check_budget(self, run: Run, reserve: int = 0) -> None:
         """Optional caps on calls and tokens (0 means no cap). Time is the main limit."""
+        if run.timing_policy == "graceful" and run.elapsed_s >= run.total_time_limit_s:
+            raise OutOfTime("total")
         window_error = self.registry.trial_credit_window_error()
         if window_error:
             raise BudgetExceeded(window_error)
@@ -485,7 +546,16 @@ class Controller:
         run.deadline_at = None
 
     def _time_left(self, run: Run) -> tuple[float | None, str]:
-        """Seconds a call may still use, and which limit ends it: the stage's share ("stage") or the run ("run")."""
+        """Time for admitting new work; graceful calls keep their own active windows."""
+        if run.timing_policy == "graceful":
+            total_left = run.total_time_limit_s - run.elapsed_s
+            if run.wrapping_up and run.finalization_deadline_elapsed_s is not None:
+                return min(total_left, run.finalization_deadline_elapsed_s - run.elapsed_s), "finalization"
+            # The soft target never spends the time reserved for final assembly.
+            admission_left = total_left - policy.finalization_allowance(run)
+            if run.time_limit_s:
+                admission_left = min(admission_left, run.time_limit_s - run.elapsed_s)
+            return admission_left, "run"
         if not run.deadline_at:
             return None, ""
         t = now()
@@ -498,8 +568,28 @@ class Controller:
         return end - t, "run"
 
     def _has_time(self, run: Run, seconds: float) -> bool:
+        if (run.timing_policy == "graceful" and not run.wrapping_up
+                and run.total_time_limit_s - run.elapsed_s <
+                run.model_phase_min_s + run.model_phase_grace_s + policy.finalization_allowance(run)):
+            return False
         left, _ = self._time_left(run)
         return left is None or left >= seconds
+
+    @staticmethod
+    def _phase_key(provider: str, kind: str, task_id: str = "", phase: str = "") -> str:
+        return ":".join((provider, kind, task_id, phase))
+
+    def _can_continue(self, run: Run, provider: str, kind: str, task_id: str = "", phase: str = "") -> bool:
+        key = self._phase_key(provider, kind, task_id, phase)
+        return (key in run.call_allowance_s and key not in run.call_completed_keys
+                and run.call_elapsed_s.get(key, 0) < run.call_allowance_s[key] + run.model_phase_grace_s)
+
+    def _task_can_continue(self, run: Run, task: Task) -> bool:
+        pending_review = bool(task.attempts and task.attempts[-1].output and task.attempts[-1].review is None)
+        index = len(task.attempts) - 1 if pending_review else len(task.attempts)
+        phase = str(index) if index else ""
+        return (bool(not pending_review and task.implementer and self._can_continue(run, task.implementer, "task", task.id, phase))
+                or bool(pending_review and task.reviewer and self._can_continue(run, task.reviewer, "review", task.id, phase)))
 
     def _out_cap(self, run: Run) -> int:
         """Longest answer one call may write. Eris runs need room for a whole training script."""
@@ -511,12 +601,15 @@ class Controller:
         live = run.live[key] = LiveText(provider=provider, label=label)
 
         async def on_text(piece: str) -> None:
+            if previous:
+                await previous(piece)
             live.text += piece
             t = time.monotonic()
             if t - self._last_publish.get(run.id, 0) >= 0.5:
                 self._last_publish[run.id] = t
                 await self._publish(run)
 
+        previous = call.on_text
         call.on_text = on_text
 
     def _record(self, run: Run, call: ModelCall, result: ModelResult) -> None:
@@ -554,12 +647,150 @@ class Controller:
                         f"({context:,} tokens). Models with larger windows read all of it.", provider)
 
     async def _call_inner(self, run: Run, provider: str, call: ModelCall, live: tuple[str, str] | None) -> ModelResult:
+        """Admit once, then preserve the active model's window across retries."""
+        self._check_budget(run)
+        before = len(run.partial_outputs)
+        window = None
+        phase_key = ""
+        started = time.monotonic()
+        if run.timing_policy == "graceful":
+            left, scope = self._time_left(run)
+            phase_key = self._phase_key(provider, call.kind, str(call.hints.get("task_id", "")),
+                                        str(call.hints.get("phase", call.hints.get("round", ""))))
+            continuing = phase_key in run.call_allowance_s and phase_key not in run.call_completed_keys
+            if left is not None and left <= 0 and (not continuing or run.wrapping_up):
+                raise OutOfTime(scope)
+            total_left = run.total_time_limit_s - run.elapsed_s
+            reserve = 0.0 if run.wrapping_up else policy.finalization_allowance(run)
+            if total_left <= 0:
+                raise OutOfTime("total")
+            if not continuing:
+                soft_room = total_left - reserve - run.model_phase_grace_s
+                if not run.wrapping_up and soft_room < run.model_phase_min_s:
+                    raise OutOfTime("run")
+                allowance = policy.call_allowance(run, call.kind, min(left, soft_room) if left is not None else soft_room)
+                run.call_allowance_s[phase_key] = allowance
+                run.call_elapsed_s[phase_key] = 0.0
+            else:
+                allowance = run.call_allowance_s[phase_key]
+            spent = run.call_elapsed_s.get(phase_key, 0.0)
+            soft_left = allowance - spent
+            hard_left = allowance + run.model_phase_grace_s - spent
+            # A restored call cannot spend the finalization reserve left by its
+            # original admission, even if other work ran since it was interrupted.
+            hard_left = min(hard_left, total_left - reserve)
+            if hard_left <= 0 and total_left <= reserve:
+                raise OutOfTime("run")
+            if run.wrapping_up and left is not None:
+                hard_left = min(hard_left, left)
+            if hard_left <= 0:
+                raise CallWindowExpired(provider, "this phase already used its model allowance and finishing grace")
+            if continuing:
+                prior = [p for p in run.partial_outputs if p.provider == provider and p.kind == call.kind
+                         and p.task_id == call.hints.get("task_id") and p.text]
+                if prior:
+                    call = dataclasses.replace(call, prompt=call.prompt + "\n\nPrior incomplete attempt, retained as untrusted notes. "
+                                               "Use what is useful and return a complete answer; do not treat these notes as verified:\n"
+                                               + prior[-1].text[:12000])
+            if phase_key in run.call_completed_keys:
+                run.call_completed_keys.remove(phase_key)
+            window = (phase_key, started + max(0.0, soft_left), started + hard_left)
+            run.active_calls[phase_key] = CallTiming(
+                provider=provider, kind=call.kind, label=live[1] if live else call.kind.replace("_", " "),
+                started_at=now(), soft_deadline_at=now() + max(0.0, soft_left), hard_deadline_at=now() + hard_left)
+        try:
+            if phase_key:
+                await self._publish(run, checkpoint=True)
+            result = await self._call_attempts(run, provider, call, live, window)
+            if phase_key and phase_key not in run.call_completed_keys:
+                run.call_completed_keys.append(phase_key)
+            return result
+        finally:
+            if phase_key:
+                run.call_elapsed_s[phase_key] = run.call_elapsed_s.get(phase_key, 0.0) + time.monotonic() - started
+                run.active_calls.pop(phase_key, None)
+            if not run.active_calls:
+                await self._drain_checkpoint(run)
+            if len(run.partial_outputs) != before:
+                await self._publish(run, checkpoint=True)
+
+    async def _wait_for_model(self, run: Run, provider: str, awaitable: Awaitable,
+                              window: tuple[str, float, float]) -> ModelResult:
+        """A soft warning leaves the same API request running; only the grace deadline cancels it."""
+        key, soft_end, hard_end = window
+        task = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                if task.done():
+                    return task.result()
+                if error := self.registry.trial_credit_window_error():
+                    raise BudgetExceeded(error)
+                if run.elapsed_s >= run.total_time_limit_s:
+                    raise OutOfTime("total")
+                heartbeat = self._scheduled_checkpoint(run)
+                if task.done():
+                    return task.result()
+                current = time.monotonic()
+                timing = run.active_calls[key]
+                if current >= soft_end and not timing.in_grace:
+                    timing.in_grace = True
+                    self._event(run, "finishing", f"{name(provider)} is still working on {timing.label}. "
+                                "Its model allowance has elapsed; the existing request can continue through the bounded finishing grace. "
+                                "No new instruction was sent to its active stream.", provider)
+                    await self._publish(run)
+                if task.done():
+                    return task.result()
+                if current >= hard_end:
+                    raise CallWindowExpired(provider, "model allowance and finishing grace exhausted; unfinished text was preserved")
+                until = hard_end if timing.in_grace else min(soft_end, hard_end)
+                heartbeat_due = (self._heartbeat_seconds if heartbeat is not None else
+                                 self._heartbeat_seconds - (current - self._last_checkpoint.get(run.id, 0)))
+                watched = {task, heartbeat} if heartbeat is not None else {task}
+                await asyncio.wait(watched, timeout=max(0.001, min(30.0, until - current, heartbeat_due)),
+                                   return_when=asyncio.FIRST_COMPLETED)
+                if task.done():
+                    return task.result()
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    def _keep_partial(self, run: Run, provider: str, call: ModelCall, text: str, reason: str,
+                      reserve: int, usage_recorded: bool = False, model: str = "") -> None:
+        partial = PartialOutput(provider=provider, model=model or self.registry.status.get(provider, {}).get("model") or "",
+                                kind=call.kind, label=str(call.hints.get("task_title") or call.kind.replace("_", " ")),
+                                text=text[:1_000_000], task_id=call.hints.get("task_id"), reason=reason[:500],
+                                usage_estimated=not usage_recorded)
+        run.partial_outputs.append(partial)
+        # An interrupted stream can hide reasoning/usage. Reserve its full allowed
+        # token amount conservatively instead of reporting zero or inventing exact usage.
+        if not usage_recorded:
+            input_estimate = min(reserve, fitting.measure(call, reads(provider)))
+            output_estimate = max(0, reserve - input_estimate)
+            run.usage.input_tokens += input_estimate
+            run.usage.output_tokens += output_estimate
+            bp = run.usage.by_provider.setdefault(provider, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
+            bp["calls"] += 1
+            bp["input_tokens"] += input_estimate
+            bp["output_tokens"] += output_estimate
+        self.store.record_output(run.id, {
+            "run_id": run.id, "stage": call.kind, "provider": provider, "model": partial.model,
+            "task_id": partial.task_id, "title": partial.label + " (incomplete)", "content": partial.text,
+            "verdict": "incomplete", "score": None, "input_tokens": 0, "output_tokens": 0, "created_at": now(),
+        })
+        self._event(run, "partial_saved", f"Saved {name(provider)}'s unfinished {partial.label}; it is not accepted or scored. "
+                    + ("Token usage is conservatively estimated from the reserved allowance." if partial.usage_estimated else
+                       "Provider-reported usage was retained."), provider, partial.task_id)
+
+    async def _call_attempts(self, run: Run, provider: str, call: ModelCall, live: tuple[str, str] | None,
+                             window: tuple[str, float, float] | None) -> ModelResult:
         adapter = self.registry.adapters.get(provider)
         if adapter is None:  # its key was removed while the run was going
             self._unhealthy.setdefault(run.id, set()).add(provider)
             run.skipped[provider] = "its key was removed during the run"
             raise ProviderError(provider, "its key was removed")
         call = dataclasses.replace(call)  # this model's own copy: trimming for one model never reaches another
+        original_callback = call.on_text
         info = seat(provider)
         model_max = info.max_output if info else 32_000
         # Half the model's reply limit for the answer leaves the other half for its thinking.
@@ -573,7 +804,15 @@ class Controller:
             left, scope = self._time_left(run)
             call.reasoning_effort = policy.reasoning_effort(run, call.kind, left)
             timeout: float = base_timeout
-            if left is not None:
+            if window is not None:
+                if run.elapsed_s >= run.total_time_limit_s:
+                    raise OutOfTime("total")
+                if time.monotonic() >= window[2]:
+                    raise CallWindowExpired(provider, "this phase already used its model allowance and finishing grace")
+                timeout = max(0.001, window[2] - time.monotonic())
+                # SDK read limits must not cut off a controller-admitted model phase.
+                call.timeout_seconds = timeout + 30.0
+            elif left is not None:
                 if left < self._min_call(run):
                     raise OutOfTime(scope)
                 timeout = min(timeout, left)
@@ -582,11 +821,26 @@ class Controller:
             self._check_budget(run, reserve)
             self._token_reservations[run.id] = self._token_reservations.get(run.id, 0) + reserve
             run.usage.calls += 1
+            chunks: list[str] = []
+            captured = 0
+            async def capture(piece: str) -> None:
+                nonlocal captured
+                if captured < 1_000_000:
+                    kept = piece[:1_000_000 - captured]
+                    chunks.append(kept)
+                    captured += len(kept)
+                if original_callback:
+                    await original_callback(piece)
+            call.on_text = capture
             if live:
                 self._live(run, call, provider, *live)
             started = time.monotonic()
+            complete = usage_recorded = False
+            failed_reason = "request interrupted"
+            result = None
             try:
-                result = await asyncio.wait_for(adapter.generate(call), timeout=timeout)
+                result = (await self._wait_for_model(run, provider, adapter.generate(call), window) if window else
+                          await asyncio.wait_for(adapter.generate(call), timeout=timeout))
                 if not result.text.strip():  # adapters raise for this already; an empty answer is never recorded
                     raise ProviderError(provider, "the model returned no answer text", retryable=True)
                 stop = result.stop_reason.lower()
@@ -598,9 +852,16 @@ class Controller:
                     bp["calls"] += 1
                     bp["input_tokens"] += result.input_tokens
                     bp["output_tokens"] += result.output_tokens
+                    usage_recorded = True
                     raise ProviderError(provider, "the response was truncated by its output limit", retryable=True)
+                complete = True
             except ProviderError as e:
+                failed_reason = str(e)
+                if isinstance(e, CallWindowExpired):
+                    raise
                 last = e
+                if run.timing_policy == "graceful" and run.wrapping_up:
+                    break  # one bounded finalization request, never a fresh retry
                 stated = fitting.context_error(str(e))
                 if stated is not None and shrunk < 2:
                     shrunk += 1
@@ -621,6 +882,10 @@ class Controller:
                     continue
                 break
             except asyncio.TimeoutError:
+                failed_reason = "provider request timed out"
+                if run.timing_policy == "graceful" and run.wrapping_up:
+                    last = ProviderError(provider, failed_reason)
+                    break
                 if left is not None and timeout >= left - 0.5:
                     raise OutOfTime(scope) from None  # the time limit ended this call, not a fault of the model
                 last = ProviderError(provider, f"timed out after {timeout:.0f}s", retryable=True)
@@ -628,7 +893,19 @@ class Controller:
                     again += 1
                     continue
                 break
+            except asyncio.CancelledError:
+                failed_reason = "request cancelled or application interrupted"
+                raise
+            except BudgetExceeded as e:
+                failed_reason = str(e)
+                raise
+            except OutOfTime as e:
+                failed_reason = f"run time exhausted ({e.scope})"
+                raise
             finally:
+                if not complete:
+                    self._keep_partial(run, provider, call, "".join(chunks) or (result.text if result else ""),
+                                       failed_reason, reserve, usage_recorded, result.model if result else "")
                 self._token_reservations[run.id] = max(0, self._token_reservations.get(run.id, 0) - reserve)
             u = run.usage
             policy.observe(run, call.kind, time.monotonic() - started)
@@ -663,6 +940,13 @@ class Controller:
         tried: set[str] = set()
         while True:
             eligible = [p for p in self._eligible(run) if p not in tried]
+            if run.timing_policy == "graceful" and not run.wrapping_up:
+                continuing = [p for p in eligible if self._can_continue(
+                    run, p, call.kind, str(call.hints.get("task_id", "")), str(call.hints.get("phase", call.hints.get("round", ""))))]
+                if continuing:
+                    eligible = continuing  # preserve the admitted phase before ranking a new provider
+                elif not self._has_time(run, 0.001):
+                    raise OutOfTime("run")
             if not eligible:
                 raise NoProviders(f"every model failed as {role}")
             if frontier_first:
@@ -701,8 +985,12 @@ class Controller:
         msg = "Team for this run: " + joined(names)
         if run.time_limit_s:
             left = max(0.0, run.time_limit_s - run.used_s)
-            msg += (f". Time limit {left / 60:.0f} min; the last {run.wrap_up_s / 60:.0f} min are kept for delivering the "
-                    "complete result")
+            if run.timing_policy == "graceful":
+                msg += (f". New-work target {left / 60:.0f} min; each admitted model phase has at least "
+                        f"{run.model_phase_min_s / 60:.0f} min plus {run.model_phase_grace_s / 60:.0f} min finishing grace. "
+                        "Models finish early when ready; active work may run beyond the target.")
+            else:
+                msg += (f". Time limit {left / 60:.0f} min; the last {run.wrap_up_s / 60:.0f} min are kept for delivering the complete result")
         if run.skipped:
             msg += ". Not available: " + "; ".join(f"{name(p)} ({why[:160]})" for p, why in run.skipped.items())
         self._event(run, "team", msg)
@@ -713,18 +1001,22 @@ class Controller:
         self._clock_start(run)
         try:
             try:
+                if run.timing_policy == "graceful" and run.elapsed_s >= run.total_time_limit_s:
+                    raise OutOfTime("total")
                 files = await self.files.get(run.id) if run.files else []
                 self._note_team(run, self._estimate(run, files))
                 await self._gather_evidence(run, files)
                 await self._publish(run)
                 effort = policy.allocate(run, len(self._eligible(run)), self.settings.max_tasks_per_plan)
                 self._event(run, "effort", f"{effort.reason}; {effort.analysts} initial analyst(s)")
-                if effort.analysts and not any(a.output for a in run.analyses):
-                    run.analyses = []
+                analyst_ids = self._eligible(run)[:effort.analysts]
+                if not run.plan and effort.analysts and any(not any(a.provider == p and a.output for a in run.analyses) for p in analyst_ids):
                     await self._analyze(run, files)
-                if effort.cross_check and not run.cross_checks:
+                if not run.plan and effort.cross_check:
                     await self._cross_check(run)
-                if not run.plan or not run.plan.tasks:
+                if (not run.plan or not run.plan.tasks or (not run.plan_approved and
+                        (run.plan_review is None or any(self._can_continue(run, p, "plan", phase=f"revise:{run.plan.version}")
+                                                       for p in self._eligible(run))))):
                     await self._plan(run, load, files)
                 if (run.plan_review and run.plan_review.verdict != "accept"
                         and not run.plan_approved and not run.require_plan_approval):
@@ -770,6 +1062,7 @@ class Controller:
             if run.status in TERMINAL:
                 run.finished_at = now()
             run.live = {}
+            run.active_calls = {}
             try:
                 await self._publish(run, checkpoint=True)
             except Exception as e:
@@ -812,6 +1105,12 @@ class Controller:
         providers = self._eligible(run)
         effort = policy.allocate(run, len(providers), self.settings.max_tasks_per_plan)
         providers = providers[:effort.analysts]
+        providers = [p for p in providers if not any(a.provider == p and a.output for a in run.analyses)]
+        if run.timing_policy == "graceful" and not self._has_time(run, 0.001):
+            providers = [p for p in providers if self._can_continue(run, p, "analysis")]
+        run.analyses = [a for a in run.analyses if a.output or a.provider not in providers]
+        if not providers:
+            return
         profile = get_profile(run.profile)
         run.status = "analyzing"
         what = "the request and files" if files else "the request"
@@ -832,14 +1131,14 @@ class Controller:
                 run.analyses.append(Opinion(provider=p, error=str(e).removeprefix(f"{p}: ")))
             await self._publish(run)
 
-        cap = policy.stage_allowance(run, "analysis", self._time_left(run)[0])
+        cap = None if run.timing_policy == "graceful" else policy.stage_allowance(run, "analysis", self._time_left(run)[0])
         stopped = await self._together({p: one(p) for p in providers}, cap, lambda: any(a.output for a in run.analyses))
         for p in stopped:
             run.analyses.append(Opinion(provider=p, error=f"still writing after {cap / 60:.0f} minutes, the time set for "
                                         "analysis, so the team went on with the other analyses"))
             self._event(run, "slow", f"{name(p)} was still analysing after {cap / 60:.0f} minutes; the team goes on without "
                         "its analysis to stay within the time limit", p)
-        if not any(a.output for a in run.analyses):
+        if not any(a.output for a in run.analyses) and not any(p.kind == "analysis" and p.text for p in run.partial_outputs):
             raise NoProviders("no model could analyse the request: " + "; ".join(
                 f"{name(a.provider)}: {a.error}" for a in run.analyses if a.error)[:600])
         await self._publish(run, checkpoint=True)
@@ -849,6 +1148,13 @@ class Controller:
         working = self._eligible(run)
         ok = [a for a in run.analyses if a.output and a.provider in working]
         if len(ok) < 2:
+            return
+        ok = [a for a in ok if not any(c.provider == a.provider and c.output for c in run.cross_checks)]
+        if run.timing_policy == "graceful" and not self._has_time(run, 0.001):
+            ok = [a for a in ok if self._can_continue(run, a.provider, "cross_check")]
+        run.cross_checks = [c for c in run.cross_checks if c.output or c.provider not in {a.provider for a in ok}]
+        if not ok:
+            self._decide(run)
             return
         profile = get_profile(run.profile)
         run.status = "cross_checking"
@@ -870,7 +1176,7 @@ class Controller:
                 run.cross_checks.append(Opinion(provider=a.provider, error=str(e).removeprefix(f"{a.provider}: ")))
             await self._publish(run)
 
-        cap = policy.stage_allowance(run, "cross_check", self._time_left(run)[0])
+        cap = None if run.timing_policy == "graceful" else policy.stage_allowance(run, "cross_check", self._time_left(run)[0])
         stopped = await self._together({a.provider: one(a) for a in ok}, cap,
                                        lambda: any(c.output for c in run.cross_checks))
         for p in stopped:
@@ -912,50 +1218,59 @@ class Controller:
         await self._publish(run)
 
         shared = (prompts.findings_block(run.analyses, run.cross_checks) + prompts.consensus_block(run.consensus)
-                  + prompts.evidence_block(run.evidence))
+                  + prompts.evidence_block(run.evidence) + self._partial_notes(run, {"analysis", "cross_check"}))
         task_limit = policy.allocate(run, len(self._eligible(run)), self.settings.max_tasks_per_plan).task_limit
-        system, prompt = prompts.plan_prompt(run.request, run.materials, profile, task_limit,
-                                             shared + ("\n\n" + files_mod.describe(files or []) if files else ""),
-                                             self._task_minutes(run))
-        planner, result, reason = await self._call_any(
-            run, "planner", ModelCall(system, prompt, "plan", 4000, {"request": run.request},
-                                      attachments=[] if run.analyses else (files or [])), load, frontier_first=True)
-        plan = self._parse_plan(result.text, run)
-        plan.planner = planner
-        run.plan = plan
-        field = str((prompts.parse_json(result.text) or {}).get("field") or "").lower()
-        if not run.eris and field in AUTO_FIELDS and field != run.profile:
-            run.profile = field
-            profile = get_profile(field)
-            self._event(run, "field", f"{name(planner)} judged this to be {profile.name.lower()} work, so the rest of the run uses that approach", planner)
-        self._event(run, "plan", f"{name(planner)} drafted a plan with {len(plan.tasks)} tasks ({reason})", planner)
+        plan = run.plan
+        if plan is None or not plan.tasks:
+            system, prompt = prompts.plan_prompt(run.request, run.materials, profile, task_limit,
+                                                 shared + ("\n\n" + files_mod.describe(files or []) if files else ""),
+                                                 self._task_minutes(run))
+            planner, result, reason = await self._call_any(
+                run, "planner", ModelCall(system, prompt, "plan", 4000, {"request": run.request},
+                                          attachments=[] if run.analyses else (files or [])), load, frontier_first=True)
+            plan = self._parse_plan(result.text, run)
+            plan.planner = planner
+            run.plan = plan
+            field = str((prompts.parse_json(result.text) or {}).get("field") or "").lower()
+            if not run.eris and field in AUTO_FIELDS and field != run.profile:
+                run.profile = field
+                profile = get_profile(field)
+                self._event(run, "field", f"{name(planner)} judged this to be {profile.name.lower()} work, so the rest of the run uses that approach", planner)
+            self._event(run, "plan", f"{name(planner)} drafted a plan with {len(plan.tasks)} tasks ({reason})", planner)
+        planner = plan.planner or self._eligible(run)[0]
 
         # Independent plan review by a different provider, at most one revision.
         run.status = "reviewing_plan"
-        await self._publish(run)
-        for round_ in range(2):
-            system, prompt = prompts.plan_review_prompt(run.request, plan, profile,
-                                                        prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence))
-            reviewer, rres, _ = await self._call_any(
-                run, "plan reviewer", ModelCall(system, prompt, "plan_review", 2500, {"request": run.request},
-                                                 attachments=files or []),
-                load, exclude={planner})
-            review = self._parse_review(rres.text, reviewer, rres.model, default="accept")
-            run.plan_review = review
-            self._event(run, "plan_review", f"{name(reviewer)} reviewed the plan: {review.verdict}", reviewer)
-            if review.verdict != "revise" or round_ == 1:
+        await self._publish(run, checkpoint=True)
+        for _ in range(2):
+            review = run.plan_review
+            if review is None:
+                system, prompt = prompts.plan_review_prompt(run.request, plan, profile,
+                                                            prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence))
+                reviewer, rres, _ = await self._call_any(
+                    run, "plan reviewer", ModelCall(system, prompt, "plan_review", 2500,
+                                                     {"request": run.request, "phase": str(plan.version - 1) if plan.version > 1 else ""},
+                                                     attachments=files or []),
+                    load, exclude={planner})
+                review = self._parse_review(rres.text, reviewer, rres.model, default="accept")
+                run.plan_review = review
+                self._event(run, "plan_review", f"{name(reviewer)} reviewed the plan: {review.verdict}", reviewer)
+            if review.verdict != "revise" or plan.version >= 2:
                 break
             system, prompt = prompts.plan_revise_prompt(run.request, plan, review.findings, profile, task_limit,
                                                         self._task_minutes(run))
             try:
-                result = await self._call(run, planner, ModelCall(system, prompt, "plan", 4000, {"request": run.request}))
+                result = await self._call(run, planner, ModelCall(system, prompt, "plan", 4000,
+                                           {"request": run.request, "phase": f"revise:{plan.version}"}))
             except ProviderError:
                 break  # keep the reviewed plan; the user still approves it
             revised = self._parse_plan(result.text, run)
             revised.planner = planner
             revised.version = plan.version + 1
             plan = run.plan = revised
+            run.plan_review = None
             self._event(run, "plan", f"{name(planner)} revised the plan (v{plan.version})", planner)
+            await self._publish(run, checkpoint=True)
         if run.plan_review and run.plan_review.verdict != "accept" and not run.require_plan_approval:
             raise ValueError("The plan did not pass review after revision; no task work was started.")
         await self._publish(run, checkpoint=True)
@@ -964,6 +1279,8 @@ class Controller:
         """About how many minutes the tasks will have, so the plan can be sized to finish in time."""
         if not run.time_limit_s:
             return None
+        if run.timing_policy == "graceful":
+            return max(0.0, (run.time_limit_s - run.elapsed_s) / 60)
         left = run.time_limit_s - run.elapsed_s - run.wrap_up_s
         return max(0.0, (left - policy.finish_reserve(run)) / 60)
 
@@ -1042,7 +1359,7 @@ class Controller:
     async def _run_tasks(self, run: Run, load: dict[str, int], files: list[StoredFile] | None = None) -> None:
         plan = run.plan
         assert plan is not None
-        if run.deadline_at:
+        if run.deadline_at and run.timing_policy != "graceful":
             # Task work stops early enough to leave time for writing and testing the final result.
             work_end = run.deadline_at - run.wrap_up_s
             reserve = policy.finish_reserve(run)
@@ -1063,7 +1380,10 @@ class Controller:
                     await self._publish(run, checkpoint=True)
                     return
                 if not self._has_time(run, self._min_call(run)):
-                    raise OutOfTime("stage")
+                    ready = ([t for t in ready if self._task_can_continue(run, t)]
+                             if run.timing_policy == "graceful" else [])
+                    if not ready:
+                        raise OutOfTime("stage")
                 if len(ready) > 1:
                     self._event(run, "parallel", f"Running {len(ready)} independent tasks in parallel")
                 results = await asyncio.gather(*(self._run_task(run, t, load, files or []) for t in ready), return_exceptions=True)
@@ -1100,6 +1420,14 @@ class Controller:
                     + (f". Unfinished: {', '.join(t.title for t in open_)}; their drafts go to the final step" if open_ else ""))
 
     @staticmethod
+    def _partial_notes(run: Run, kinds: set[str]) -> str:
+        notes = [p for p in run.partial_outputs if p.kind in kinds and p.text][-8:]
+        if not notes:
+            return ""
+        return ("\n\nIncomplete model notes, not accepted work or verified evidence. Recheck any useful claim:\n"
+                + "\n\n".join(f"[{name(p.provider)} / {p.label}; incomplete: {p.reason}]\n{p.text[:4000]}" for p in notes))
+
+    @staticmethod
     def _draft(task: Task) -> str:
         """The latest text a model wrote for a task, reviewed or not."""
         return task.output or next((a.output for a in reversed(task.attempts) if a.output), "")
@@ -1108,6 +1436,8 @@ class Controller:
                            prompt: str, task: Task, revision: int, files: list[StoredFile] | None = None) -> Review:
         """An independent review of one attempt. If the reviewer fails, another model reviews it."""
         hints = {"request": run.request, "task_id": task.id, "task_title": task.title, "is_revision": revision > 0}
+        phase_index = max(0, len(task.attempts) - 1)
+        hints["phase"] = str(phase_index) if phase_index else ""
         try:
             rres = await self._call(run, reviewer, ModelCall(system, prompt, "review", 2500, hints, attachments=files or []))
             return self._parse_review(rres.text, reviewer, rres.model, default="pass")
@@ -1134,35 +1464,49 @@ class Controller:
         tried_implementers: set[str] = set()
         previous: str | None = self._draft(task) or None
         findings: list[str] = [f for a in task.attempts if a.review for f in a.review.findings][-12:]
+        pending_attempt = (task.attempts[-1] if task.attempts and task.attempts[-1].output
+                           and task.attempts[-1].review is None else None)
+        phase = str(len(task.attempts)) if task.attempts else ""
+        resume_implementer = task.implementer if (pending_attempt or (task.implementer and self._can_continue(
+            run, task.implementer, "task", task.id, phase))) else None
+        resume_reviewer = task.reviewer
 
         # Up to two implementers (original + one reassignment), each with bounded revisions.
         for assignment in range(2):
             eligible = self._eligible(run)
             impl = self.router.pick(eligible, run.profile, load, "implementer", exclude=tried_implementers)
-            implementer = impl.provider
+            implementer = resume_implementer if assignment == 0 and resume_implementer in eligible else impl.provider
             tried_implementers.add(implementer)
             rev = self.router.pick(eligible, run.profile, load, "reviewer", exclude={implementer}, kind="review")
-            reviewer = rev.provider
+            reviewer = resume_reviewer if assignment == 0 and resume_reviewer in eligible else rev.provider
             task.implementer, task.reviewer = implementer, reviewer
             task.route_reason = f"{impl.reason}. {rev.reason}"
             if assignment:
                 self._event(run, "reassigned", f"'{task.title}' reassigned to {name(implementer)}", implementer, task.id)
 
             for revision in range(self.settings.max_revisions_per_task + 1):
-                task.status = "working" if revision == 0 else "revising"
-                self._event(run, "working", f"{name(implementer)} is {'revising' if revision else 'working on'} '{task.title}'", implementer, task.id)
-                await self._publish(run)
-                system, prompt = prompts.task_prompt(plan, task, deps, profile, run.materials, findings, previous, shared, run.request)
-                try:
-                    result = await self._call(run, implementer, ModelCall(
-                        system, prompt, "task", self._out_cap(run),
-                        {"request": run.request, "task_title": task.title, "task_id": task.id, "is_revision": revision > 0},
-                        attachments=task_files), live=(f"task:{task.id}", task.title))
-                except ProviderError as e:
-                    task.attempts.append(Attempt(provider=implementer, error=str(e).removeprefix(f"{implementer}: ")))
-                    break  # move on to reassignment
-                attempt = Attempt(provider=implementer, model=result.model, output=result.text, is_revision=revision > 0)
-                task.attempts.append(attempt)
+                if pending_attempt is not None:
+                    attempt, pending_attempt = pending_attempt, None
+                    implementer = attempt.provider
+                    task.implementer = implementer
+                    result = ModelResult(provider=implementer, model=attempt.model, text=attempt.output)
+                else:
+                    task.status = "working" if revision == 0 else "revising"
+                    self._event(run, "working", f"{name(implementer)} is {'revising' if revision else 'working on'} '{task.title}'", implementer, task.id)
+                    await self._publish(run)
+                    system, prompt = prompts.task_prompt(plan, task, deps, profile, run.materials, findings, previous, shared, run.request)
+                    phase = str(len(task.attempts)) if task.attempts else ""
+                    try:
+                        result = await self._call(run, implementer, ModelCall(
+                            system, prompt, "task", self._out_cap(run),
+                            {"request": run.request, "task_title": task.title, "task_id": task.id,
+                             "is_revision": revision > 0, "phase": phase},
+                            attachments=task_files), live=(f"task:{task.id}", task.title))
+                    except ProviderError as e:
+                        task.attempts.append(Attempt(provider=implementer, error=str(e).removeprefix(f"{implementer}: ")))
+                        break  # move on to reassignment
+                    attempt = Attempt(provider=implementer, model=result.model, output=result.text, is_revision=revision > 0)
+                    task.attempts.append(attempt)
 
                 task.status = "reviewing"
                 self._event(run, "reviewing", f"{name(reviewer)} is reviewing '{task.title}'", reviewer, task.id)
@@ -1225,7 +1569,8 @@ class Controller:
                     final.limitations.append(x)
             self._event(run, "judged", f"{name(p)} scored the result {j.score if j.score is not None else 'n/a'}/10"
                         + (f" and found {len(j.must_fix)} thing{'s' if len(j.must_fix) != 1 else ''} to fix" if j.must_fix else ""), p)
-            await self._publish(run)
+            final.judges.append(j)
+            await self._publish(run, checkpoint=True)
             return j
 
         results = await asyncio.gather(*(one(p) for p in judges), return_exceptions=True)
@@ -1241,7 +1586,9 @@ class Controller:
         accepted = [t for t in plan.tasks if t.status == "accepted"]
         missing = [t for t in plan.tasks if t.status != "accepted"]
         drafts = [(t.title, self._draft(t)) for t in missing if self._draft(t)]
-        if not accepted and not drafts and not any(a.output for a in run.analyses):
+        if not run.final and not accepted and not drafts and not any(a.output for a in run.analyses):
+            if any(p.text for p in run.partial_outputs):
+                raise OutOfTime("run")
             run.status = "failed"
             run.error = "No task produced any work, so there is nothing to put together."
             self._event(run, "failed", run.error)
@@ -1254,15 +1601,20 @@ class Controller:
         shared = (prompts.findings_block(run.analyses, run.cross_checks, limit=3000) + prompts.consensus_block(run.consensus)
                   + prompts.materials_block(run.materials) + prompts.evidence_block(run.evidence))
         system, prompt = prompts.integrate_prompt(run.request, plan, accepted, missing, profile, shared, drafts)
-        started = time.monotonic()
-        integrator, result, _ = await self._call_any(run, "integrator", ModelCall(
-            system, prompt, "integrate", self._out_cap(run),
-            {"request": run.request, "sections": [(t.title, t.output) for t in accepted] + drafts}), load,
-            live=("final", "Final result"), frontier_first=True)
-        took = time.monotonic() - started
-        final = FinalResult(output=result.text, integrator=integrator,
-                            best_approach=run.consensus.best if run.consensus else None)
-        run.final = final  # shown while the other models test it
+        if run.final and run.final.output:
+            final = run.final
+            integrator = final.integrator or self._eligible(run)[0]
+            took = policy.expected_seconds(run, "integrate")
+        else:
+            started = time.monotonic()
+            integrator, result, _ = await self._call_any(run, "integrator", ModelCall(
+                system, prompt, "integrate", self._out_cap(run),
+                {"request": run.request, "sections": [(t.title, t.output) for t in accepted] + drafts}), load,
+                live=("final", "Final result"), frontier_first=True)
+            took = time.monotonic() - started
+            final = FinalResult(output=result.text, integrator=integrator,
+                                best_approach=run.consensus.best if run.consensus else None)
+            run.final = final  # shown while the other models test it
         await self._verify_final(run)
         self._event(run, "integrated", f"{name(integrator)} wrote the single combined result", integrator)
         await self._publish(run, checkpoint=True)
@@ -1276,8 +1628,13 @@ class Controller:
         sections = [(t.title, t.output) for t in accepted]
         latest: list[Judgement] = []
         tested = True
-        for round_ in range(self.settings.max_final_fix_rounds + 1):
-            if not self._has_time(run, 3 * self._min_call(run)):
+        for round_ in range(final.fixes, self.settings.max_final_fix_rounds + 1):
+            judged = [j for j in final.judges if j.round == round_ and j.artifact_hash == final.artifact_hash]
+            pending_judges = [p for p in judges if p not in {j.judge for j in judged}]
+            can_start = self._has_time(run, 3 * self._min_call(run))
+            if not can_start:
+                pending_judges = [p for p in pending_judges if self._can_continue(run, p, "final_eval", phase=str(round_))]
+            if not can_start and not pending_judges and not judged:
                 tested = round_ > 0
                 final.limitations.append("The time limit was reached before the other models could "
                                          + ("re-test the fixed result." if round_ else "test the result."))
@@ -1285,10 +1642,9 @@ class Controller:
             self._event(run, "stage", f"{joined([name(p) for p in judges])} {'are' if len(judges) > 1 else 'is'} "
                         f"{'re-testing the fixed' if round_ else 'testing the'} result against the criteria and edge cases")
             await self._publish(run)
-            judged = await self._judge(run, plan, final.output, profile, judges, round_)
+            judged += await self._judge(run, plan, final.output, profile, pending_judges, round_)
             if judged:
                 latest = judged
-                final.judges.extend(judged)
             must = list(dict.fromkeys(m for j in judged for m in j.must_fix))
             current_hashes = self._current_artifact_hashes(run, final)
             must.extend(c.summary for c in final.checks if c.artifact_hash in current_hashes
@@ -1298,7 +1654,8 @@ class Controller:
                     must.append("The reviewer marked success criteria unmet. Recheck every criterion and correct the unmet requirements.")
             if not must or round_ == self.settings.max_final_fix_rounds:
                 break
-            if not self._has_time(run, took * 1.3 + 3 * self._min_call(run)):
+            fix_phase = f"fix:{round_}"
+            if not self._has_time(run, took * 1.3 + 3 * self._min_call(run)) and not self._can_continue(run, integrator, "integrate", phase=fix_phase):
                 final.limitations.append("Not fixed because the time limit was reached: " + "; ".join(must[:5]))
                 break
             self._event(run, "fixing", f"{name(integrator)} is fixing {len(must)} problem{'s' if len(must) != 1 else ''} "
@@ -1311,7 +1668,7 @@ class Controller:
             try:
                 fixed = await self._call(run, integrator, ModelCall(
                     system, prompt, "integrate", self._out_cap(run),
-                    {"request": run.request, "task_title": "Final fixes", "sections": sections}),
+                    {"request": run.request, "task_title": "Final fixes", "sections": sections, "phase": fix_phase}),
                     live=("final", "Fixing the final result"))
             except (ProviderError, OutOfTime) as e:
                 why = "the time limit was reached" if isinstance(e, OutOfTime) else "the model failed"
@@ -1350,7 +1707,9 @@ class Controller:
         self._refresh_final_assessment(run, final)
         run.status = "completed"
         if run.time_limit_s:
-            message += f", in {run.elapsed_s / 60:.0f} of {run.time_limit_s / 60:.0f} min"
+            message += (f", after {run.elapsed_s / 60:.0f} min (new-work target {run.time_limit_s / 60:.0f} min; "
+                        f"total ceiling {run.total_time_limit_s / 60:.0f} min)" if run.timing_policy == "graceful" else
+                        f", in {run.elapsed_s / 60:.0f} of {run.time_limit_s / 60:.0f} min")
         self._event(run, "completed", message, final.evaluator or final.integrator)
 
     async def _expand_for_gaps(self, run: Run, load: dict[str, int], findings: list[str]) -> str:
@@ -1383,6 +1742,8 @@ class Controller:
     async def _wrap_up(self, run: Run) -> None:
         """The run's working time is used up. Stop new work and deliver the complete result from what is done."""
         run.wrapping_up = True
+        if run.timing_policy == "graceful" and run.finalization_deadline_elapsed_s is None:
+            run.finalization_deadline_elapsed_s = min(run.total_time_limit_s, run.elapsed_s + policy.finalization_allowance(run))
         self._stage_end.pop(run.id, None)
         run.live = {}
         left, _ = self._time_left(run)
@@ -1401,6 +1762,8 @@ class Controller:
         tasks = plan.tasks if plan else []
         accepted = [t for t in tasks if t.status == "accepted"]
         drafts = [(t.title, self._draft(t)) for t in tasks if t.status != "accepted" and self._draft(t)]
+        drafts.extend((f"{name(p.provider)}: {p.label} (incomplete)", p.text)
+                      for p in run.partial_outputs if p.text and p.kind not in {"review", "plan_review", "final_eval"})
         partial = self._partial.pop(run.id, "")
         if partial:
             drafts.insert(0, ("Final result, cut off by the time limit", partial))
@@ -1409,11 +1772,17 @@ class Controller:
         except NoProviders:
             writers = []
         writers = [p for p in writers if p in FRONTIER] + [p for p in writers if p not in FRONTIER]
+        if run.timing_policy == "graceful":
+            # One finalization request only. Resume may deliver its retained text,
+            # but must not reset the window or purchase another synthesis attempt.
+            already_tried = any(":wrap_up:" in key and elapsed > 0 for key, elapsed in run.call_elapsed_s.items())
+            writers = [] if already_tried else writers[:1]
         run.status = "integrating"
-        self._event(run, "wrap_up", "Time is nearly up, so SASI stopped new work"
+        self._event(run, "wrap_up", ("The new-work target was reached; active work has finished or its grace ended. SASI stopped new work"
+                                    if run.timing_policy == "graceful" else "Time is nearly up, so SASI stopped new work")
                     + (f" and {name(writers[0])} is writing the complete final result from the work done so far"
                        f" ({left / 60:.1f} min left)" if writers and left is not None else ""))
-        await self._publish(run)
+        await self._publish(run, checkpoint=True)
         system, prompt = prompts.wrap_up_prompt(
             run.request, plan, profile, max(1.0, (left or 60) / 60), "", accepted, drafts,
             run.analyses, prompts.consensus_block(run.consensus))
@@ -1443,8 +1812,13 @@ class Controller:
             return
 
         # No model could write it in time: deliver the best work there is.
+        # A failed final request may have produced the most useful draft after the
+        # initial candidates were gathered. Preserve it in the delivered fallback too.
+        latest_wrap = next((p for p in reversed(run.partial_outputs) if p.kind == "wrap_up" and p.text), None)
         best = "\n\n".join(f"## {t.title}\n\n{t.output}" for t in accepted)
-        if not best and drafts:
+        if latest_wrap:
+            best = "## Incomplete final synthesis (not reviewed)\n\n" + latest_wrap.text + ("\n\n" + best if best else "")
+        elif not best and drafts:
             best = "\n\n".join(f"## {title} (draft, not reviewed)\n\n{text}" for title, text in drafts)
         if not best:
             best = "\n\n".join(f"## {name(a.provider)}'s analysis\n\n{a.output}" for a in run.analyses if a.output)

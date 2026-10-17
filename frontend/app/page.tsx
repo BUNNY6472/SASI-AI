@@ -6,6 +6,7 @@ import Login from "@/components/Login";
 import RunView from "@/components/RunView";
 import Workspace from "@/components/Workspace";
 import Icon from "@/components/Icon";
+import { researchTitle } from "@/lib/research-title";
 import {
   api,
   ApiError,
@@ -202,10 +203,10 @@ export default function Page() {
                   (route.view === "run" && route.id === r.id ? "on" : "")
                 }
                 onClick={() => go("/run/" + r.id)}
-                title={r.request}
+                title={researchTitle(r.request)}
               >
                 <Icon name="file" size={15} />
-                <span>{r.request}</span>
+                <span>{researchTitle(r.request)}</span>
               </button>
             ))
           )}

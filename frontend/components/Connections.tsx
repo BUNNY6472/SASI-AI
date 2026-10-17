@@ -1,22 +1,14 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
-import { api, ProviderStatus, RouteStatus, VertexInfo } from "@/lib/api";
+import {
+  api,
+  ProviderStatus,
+  RouteStatus,
+  RunLimits,
+  VertexInfo,
+} from "@/lib/api";
 import { AgentChip } from "./ui";
-
-interface Limits {
-  time_limit_minutes: number;
-  wrap_up_minutes: number;
-  team_size: number;
-  max_model_calls_per_run: number;
-  max_tokens_per_run: number;
-  eris_max_tokens_per_run: number;
-  max_output_tokens_per_call: number;
-  max_tasks_per_plan: number;
-  max_revisions_per_task: number;
-  max_concurrent_runs: number;
-  storage: string;
-}
 
 interface HistoryRow {
   provider: string;
@@ -302,7 +294,7 @@ export default function Connections({
   reload: () => Promise<void>;
 }) {
   const vertexOn = !!vertex?.on;
-  const [limits, setLimits] = useState<Limits | null>(null);
+  const [limits, setLimits] = useState<RunLimits | null>(null);
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [busy, setBusy] = useState(false);
   const [allMsg, setAllMsg] = useState<{ warn: boolean; text: string } | null>(
@@ -345,7 +337,7 @@ export default function Connections({
   const open = providers.filter((p) => p.tier === "open");
 
   useEffect(() => {
-    api<Limits>("/api/limits")
+    api<RunLimits>("/api/limits")
       .then(setLimits)
       .catch(() => {});
     api<{ routing_history: HistoryRow[] }>("/api/stats")
@@ -618,22 +610,45 @@ export default function Connections({
 
       {limits && (
         <>
-          <h2>Run limits</h2>
+          <h2>Timing & run limits</h2>
           <p className="muted small">
-            Each session respects its requested time and the server limits
-            below. SASI reserves time to assemble a result; the clock pauses
-            while a plan waits for your approval. A deadline is an upper limit,
-            not a required duration.
+            {limits.timing_policy === "graceful"
+              ? "The research time target guides new work. Research stops earlier when needed to reserve the working allowance, finishing grace and final assembly within the total maximum. Work can finish early; provider errors, cancellation and usage budgets still apply."
+              : "Historical strict timing sets an upper limit and reserves time to assemble a result. Work may finish earlier."}{" "}
+            The session clock pauses while a plan waits for approval.
           </p>
           <div className="glass limits">
             <div>
               <b>{limits.time_limit_minutes} min</b>
-              <span>maximum per run</span>
+              <span>
+                {limits.timing_policy === "graceful"
+                  ? "default research time target"
+                  : "strict time limit"}
+              </span>
             </div>
-            <div>
-              <b>Up to {limits.wrap_up_minutes} min</b>
-              <span>delivery reserve, adjusted per run</span>
-            </div>
+            {!!limits.max_total_run_minutes && (
+              <div>
+                <b>{limits.max_total_run_minutes} min total</b>
+                <span>hard active-time maximum, including finishing</span>
+              </div>
+            )}
+            {limits.timing_policy === "graceful" ? (
+              <>
+                <div>
+                  <b>{limits.model_phase_min_minutes ?? 20} min minimum</b>
+                  <span>working allowance per active model call</span>
+                </div>
+                <div>
+                  <b>+ {limits.model_phase_grace_minutes ?? 5} min</b>
+                  <span>finishing grace before an unfinished call stops</span>
+                </div>
+              </>
+            ) : (
+              <div>
+                <b>Up to {limits.wrap_up_minutes} min</b>
+                <span>delivery reserve, adjusted per run</span>
+              </div>
+            )}
             <div>
               <b>
                 {trialCreditsOnly

@@ -6,11 +6,13 @@ import {
   fileSize,
   ProviderStatus,
   Run,
+  RunLimits,
   RunSummary,
   uploadFile,
 } from "@/lib/api";
 import { AgentChip, StatusBadge, fmt, timeAgo } from "./ui";
 import Icon from "./Icon";
+import { researchTitle } from "@/lib/research-title";
 
 interface Attachment {
   key: string;
@@ -76,7 +78,8 @@ export default function Workspace({
   const [compare, setCompare] = useState(false);
   const [eris, setEris] = useState(false);
   const [mode, setMode] = useState<Mode>("adaptive");
-  const [minutes, setMinutes] = useState(30);
+  const [minutes, setMinutes] = useState(120);
+  const [limits, setLimits] = useState<RunLimits | null>(null);
   const [files, setFiles] = useState<Attachment[]>([]);
   const [dragging, setDragging] = useState(false);
   const picker = useRef<HTMLInputElement>(null);
@@ -88,6 +91,9 @@ export default function Workspace({
   const [error, setError] = useState("");
 
   useEffect(() => {
+    api<RunLimits>("/api/limits")
+      .then(setLimits)
+      .catch(() => {});
     try {
       setEris(localStorage.getItem("sasi.eris") === "1");
     } catch {}
@@ -355,17 +361,20 @@ export default function Workspace({
           </div>
           <label className="time-picker">
             <Icon name="clock" size={16} />
-            <span className="sr-only">Maximum research time</span>
-            <select
-              value={minutes}
-              onChange={(e) => setMinutes(Number(e.target.value))}
-            >
-              {[5, 15, 30, 60].map((m) => (
-                <option key={m} value={m}>
-                  Up to {m} min
-                </option>
-              ))}
-            </select>
+            <span className="time-picker-copy">
+              <span>Research time target</span>
+              <select
+                value={minutes}
+                aria-describedby="research-timing-note"
+                onChange={(e) => setMinutes(Number(e.target.value))}
+              >
+                {[20, 30, 60, 120].map((m) => (
+                  <option key={m} value={m}>
+                    {m} minutes
+                  </option>
+                ))}
+              </select>
+            </span>
           </label>
           <button
             className="btn primary start-btn"
@@ -384,6 +393,17 @@ export default function Workspace({
           </span>
           <span className="keyboard-hint">Ctrl / ⌘ ↵</span>
         </div>
+        <p id="research-timing-note" className="timing-note">
+          <strong>
+            {limits?.max_total_run_minutes ?? 120} minutes total active time
+            maximum, including finishing.
+          </strong>{" "}
+          Work can finish early. New research stops before the target when
+          needed to leave a {limits?.model_phase_min_minutes ?? 20}-minute
+          working allowance, {limits?.model_phase_grace_minutes ?? 5} minutes of
+          finishing grace, and final assembly within that maximum. Provider
+          errors and usage budgets still apply.
+        </p>
         <details className="advanced-options">
           <summary>Research preferences</summary>
           <div className="preferences-grid">
@@ -506,7 +526,7 @@ export default function Workspace({
                   <Icon name={r.profile === "software" ? "code" : "file"} />
                 </span>
                 <div className="run-item-body">
-                  <p>{r.request}</p>
+                  <p>{researchTitle(r.request)}</p>
                   <span className="muted small">
                     {r.eris ? "Project Eris" : r.profile} · {r.tasks} tasks ·{" "}
                     {fmt(r.tokens)} tokens

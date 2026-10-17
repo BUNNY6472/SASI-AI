@@ -49,11 +49,12 @@ def test_claude_on_vertex_finds_a_usable_model_and_sends_no_fallback_beta():
 
     from app.gateway.vertex import VertexClaudeAdapter
 
-    seen = []
+    seen, timeouts = [], []
 
     def handler(req: httpx2.Request) -> httpx2.Response:
         body = json.loads(req.content or b"{}")
         seen.append((req.url.path, body, dict(req.headers)))
+        timeouts.append(req.extensions.get("timeout", {}))
         if req.url.path.endswith("count-tokens:rawPredict"):
             if body["model"] == "claude-opus-5-5":
                 return httpx2.Response(404, json={"error": {"type": "not_found_error", "message": "not enabled"}})
@@ -74,8 +75,9 @@ def test_claude_on_vertex_finds_a_usable_model_and_sends_no_fallback_beta():
         http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)))
 
     assert run(adapter.resolve_model()) == "claude-opus-5", "the first model this project can call is used"
-    result = run(adapter.generate(ModelCall(system="sys", prompt="hi", kind="task", rules="RULES")))
+    result = run(adapter.generate(ModelCall(system="sys", prompt="hi", kind="task", rules="RULES", timeout_seconds=1530)))
     assert result.text == "Hello from Vertex" and result.input_tokens == 15
+    assert timeouts[-1]["read"] == 1530 and timeouts[-1]["connect"] == 5
 
     path, body, headers = seen[-1]
     assert path == "/v1/projects/sasi-511906/locations/global/publishers/anthropic/models/claude-opus-5:streamRawPredict"
@@ -134,11 +136,12 @@ def test_open_model_on_vertex_uses_the_openai_compatible_endpoint(monkeypatch):
         valid, token = True, "google-token"
 
     monkeypatch.setattr(google.auth, "default", lambda scopes=None: (Creds(), "sasi-511906"))
-    seen = []
+    seen, timeouts = [], []
 
     def handler(req: httpx2.Request) -> httpx2.Response:
         body = json.loads(req.content)
         seen.append((str(req.url), body, req.headers.get("authorization")))
+        timeouts.append(req.extensions.get("timeout", {}))
         if body["model"] == "zai-org/glm-5.2-maas":
             return httpx2.Response(404, json={"error": {"message": "Publisher model not found", "code": 404}})
         if body.get("stream"):
@@ -180,9 +183,10 @@ def test_open_model_on_vertex_uses_the_openai_compatible_endpoint(monkeypatch):
 
     image = StoredFile(id="f1", name="chart.png", mime="image/png", size=10, kind="image", data=b"0123456789")
     call = ModelCall(system="sys", prompt="Describe it", kind="task", max_output_tokens=4000, on_text=on_text,
-                     attachments=[image])
+                     attachments=[image], timeout_seconds=1530)
     result = run(adapter.generate(call))
     assert result.text == "Open-weight" and streamed == ["Open", "-weight"]
+    assert timeouts[-1]["read"] == 1530 and timeouts[-1]["connect"] == 5
     assert result.output_tokens > 0, "usage is estimated when the stream does not report it"
     url, body, _ = seen[-1]
     assert "/locations/global/" in url, "the location that worked is used"
@@ -327,10 +331,11 @@ def test_gemini_on_vertex_counts_tokens_to_check_and_sends_files_inline():
 
     from app.gateway.vertex import VertexGeminiAdapter
 
-    seen = []
+    seen, timeouts = [], []
 
     def handler(req: httpx.Request) -> httpx.Response:
         seen.append((req.url.path, json.loads(req.content or b"{}")))
+        timeouts.append(req.extensions.get("timeout", {}))
         if req.url.path.endswith(":countTokens"):
             return httpx.Response(200, json={"totalTokens": 1})
         return httpx.Response(200, json={
@@ -363,8 +368,9 @@ def test_gemini_on_vertex_counts_tokens_to_check_and_sends_files_inline():
 
     big = StoredFile(id="v", name="talk.mp4", mime="video/mp4", size=20 * 1024 * 1024, kind="video", data=b"x")
     small = StoredFile(id="i", name="a.png", mime="image/png", size=1000, kind="image", data=b"img")
-    result = run(adapter.generate(ModelCall(system="sys", prompt="Look", kind="task", attachments=[small, big])))
+    result = run(adapter.generate(ModelCall(system="sys", prompt="Look", kind="task", attachments=[small, big], timeout_seconds=1530)))
     assert result.text == "Gemini on Vertex" and result.input_tokens == 7
+    assert timeouts[-1]["read"] == 1530
     parts = seen[-1][1]["contents"][0]["parts"]
     assert any("inlineData" in p or "inline_data" in p for p in parts), "the small file goes inline"
     assert "talk.mp4 is too large" in parts[-1]["text"], "Vertex has no Files API, so a large file gets a note"
@@ -492,7 +498,7 @@ def test_with_vertex_on_runs_need_no_keys(monkeypatch):
         assert r["status"] == "completed", r.get("error")
         team = next(e["message"] for e in r["events"] if e["type"] == "team")
         assert team.startswith("Team for this run: Claude (Google Cloud), Gemini (Google Cloud), GLM (Google Cloud) and "
-                               "DeepSeek (Google Cloud). Time limit 60 min"), team
+                               "DeepSeek (Google Cloud). New-work target 120 min"), team
         assert r["team"] == ["claude", "gemini", "glm", "deepseek"]
 
         assert client.delete("/api/keys").status_code == 200

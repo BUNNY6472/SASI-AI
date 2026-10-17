@@ -4,8 +4,6 @@ import { useEffect, useMemo, useState } from "react";
 import DOMPurify from "dompurify";
 import {
   api,
-  clock,
-  elapsed,
   fileSize,
   Judgement,
   Opinion,
@@ -14,6 +12,9 @@ import {
   Task,
 } from "@/lib/api";
 import Markdown from "./Markdown";
+import { OriginalRequest, RunQuestion } from "./RunRequest";
+import { ActiveCalls, RunClock } from "./RunTiming";
+import IncompleteWork from "./IncompleteWork";
 import { AgentChip, StatusBadge, fmt } from "./ui";
 
 const LIVE = new Set([
@@ -66,7 +67,7 @@ export default function RunView({
   const [run, setRun] = useState<Run | null>(null);
   const [error, setError] = useState("");
   const [tab, setTab] = useState<
-    "compare" | "plan" | "result" | "evidence" | "activity"
+    "compare" | "plan" | "result" | "evidence" | "activity" | "partials"
   >("plan");
   const [followStage, setFollowStage] = useState(true);
   const [openTask, setOpenTask] = useState<string | null>(null);
@@ -290,6 +291,11 @@ export default function RunView({
           )}
         </div>
       </div>
+      <OriginalRequest
+        key={run.id}
+        text={run.request}
+        action={<CopyButton text={run.request} label="Copy request" />}
+      />
       {run.simulated && (
         <div className="notice warn" role="status">
           <strong>Preview mode · simulated output.</strong> These results
@@ -389,6 +395,8 @@ export default function RunView({
         </div>
       </div>
 
+      <ActiveCalls run={run} />
+
       <div className="tabs">
         <button
           className={tab === "result" ? "tab on" : "tab"}
@@ -423,8 +431,19 @@ export default function RunView({
         >
           Activity
         </button>
+        {!!run.partial_outputs?.length && (
+          <button
+            className={tab === "partials" ? "tab on" : "tab"}
+            onClick={() => chooseTab("partials")}
+          >
+            Incomplete work · {run.partial_outputs.length}
+          </button>
+        )}
       </div>
 
+      {tab === "partials" && (
+        <IncompleteWork outputs={run.partial_outputs || []} />
+      )}
       {tab === "evidence" && <EvidencePanel run={run} />}
       {tab === "result" && !run.final && !run.live.final && (
         <div className="glass evidence-panel evidence-empty">
@@ -441,6 +460,14 @@ export default function RunView({
           <button className="btn small" onClick={() => chooseTab("plan")}>
             View plan & tasks
           </button>
+          {!!run.partial_outputs?.length && (
+            <button
+              className="btn small ghost"
+              onClick={() => chooseTab("partials")}
+            >
+              View incomplete work
+            </button>
+          )}
         </div>
       )}
 
@@ -484,7 +511,7 @@ export default function RunView({
           <div className="result-meta">
             <AgentChip id={run.live.final.provider} />
             {run.wrapping_up
-              ? " is writing the complete result before the time limit"
+              ? " is assembling the available work within the finalization allowance"
               : run.final
                 ? " is fixing what the other models found"
                 : " is writing the one combined result"}{" "}
@@ -785,32 +812,6 @@ function OpinionGrid({
   );
 }
 
-/** The scores JSON at the end of a cross-check is shown as a line under the card, not as raw code. */
-/** The question as a short header, so the run's progress stays in view. The full text opens on request. */
-function RunQuestion({ text }: { text: string }) {
-  const [open, setOpen] = useState(false);
-  const long = text.length > 140 || text.trim().includes("\n");
-  return (
-    <div className="run-question">
-      <h1
-        className={open ? "open" : ""}
-        title={long && !open ? text.slice(0, 600) : undefined}
-      >
-        {text}
-      </h1>
-      {long && (
-        <button
-          className="link-btn"
-          aria-expanded={open}
-          onClick={() => setOpen(!open)}
-        >
-          {open ? "Hide full question" : "Show full question"}
-        </button>
-      )}
-    </div>
-  );
-}
-
 /** Copies text and says so for a moment. */
 function CopyButton({
   text,
@@ -879,40 +880,6 @@ function joinNames(names: string[]): string {
   return names.length < 2
     ? names.join("")
     : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
-}
-
-/** Time left on the run's clock, ticking while it runs. The clock pauses while the plan waits for approval. */
-function RunClock({ run }: { run: Run }) {
-  const [, tick] = useState(0);
-  const running = !!run.clock_started_at;
-  useEffect(() => {
-    if (!running) return;
-    const t = setInterval(() => tick((n) => n + 1), 1000);
-    return () => clearInterval(t);
-  }, [running]);
-  const limit = run.time_limit_s || 0;
-  if (!limit) return null;
-  const used = elapsed(run);
-  if (TERMINAL.has(run.status)) {
-    return (
-      <span className="run-clock" title="Time this run took">
-        ⏱ {clock(used)} of {clock(limit)}
-      </span>
-    );
-  }
-  const left = Math.max(0, limit - used);
-  const wrapAt = run.wrap_up_s || 0;
-  const cls =
-    run.wrapping_up || left <= wrapAt ? "run-clock wrap" : "run-clock";
-  return (
-    <span
-      className={cls}
-      title={`Time limit ${clock(limit)}. In the last ${clock(wrapAt)} SASI stops new work and delivers the complete result.`}
-    >
-      ⏱ {clock(left)} left{!running ? " · paused" : ""}
-      {run.wrapping_up ? " · wrapping up" : ""}
-    </span>
-  );
 }
 
 function compareState(run: Run, idx: number): "done" | "now" | "todo" {

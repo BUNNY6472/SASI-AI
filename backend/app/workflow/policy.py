@@ -1,4 +1,4 @@
-"""Bounded, observable effort allocation. Time is a ceiling, never a target to fill.
+"""Bounded, observable effort allocation. Allowances are never a duration to fill.
 
 Initial estimates are deliberately simple. Actual call durations replace them as
 the run progresses; quality gates, rather than elapsed time, decide completion.
@@ -66,11 +66,29 @@ def finish_reserve(run: Run) -> float:
 
 
 def stage_allowance(run: Run, kind: str, remaining: float | None) -> float | None:
+    if run.timing_policy == "graceful":
+        return call_allowance(run, kind, remaining)
     if remaining is None:
         return None
     desired = 2.0 * expected_seconds(run, kind)
     reserved = finish_reserve(run) + expected_seconds(run, "plan") + expected_seconds(run, "task")
     return max(0.05, min(desired, max(0.05, remaining - reserved)))
+
+
+def call_allowance(run: Run, kind: str, remaining: float | None = None) -> float:
+    """Adaptive soft window for an admitted call; the run target never shortens the minimum.
+
+    Observed latency can increase the allowance to twice the configured minimum.
+    A response that finishes sooner proceeds immediately; grace is added by the caller.
+    """
+    minimum = max(0.01, run.model_phase_min_s)
+    desired = max(minimum, min(2 * minimum, 2 * expected_seconds(run, kind)))
+    return max(minimum, min(desired, remaining)) if remaining is not None else desired
+
+
+def finalization_allowance(run: Run) -> float:
+    """One final synthesis window, snapshotted as an elapsed-time deadline by the controller."""
+    return call_allowance(run, "wrap_up") + max(0, run.model_phase_grace_s)
 
 
 def reasoning_effort(run: Run, kind: str, remaining: float | None) -> str:

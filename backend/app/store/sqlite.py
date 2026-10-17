@@ -15,6 +15,7 @@ from pathlib import Path
 from ..files import FileStore, StoredFile
 from ..models import TERMINAL, Run
 from .memory import MemoryStore
+from .recovery import restore_interrupted
 
 
 class SQLiteDatabase:
@@ -72,14 +73,7 @@ class SQLiteStore(MemoryStore):
         self._write_lock = db.write_lock
 
     def _restore(self, snapshot: str) -> Run:
-        run = Run.model_validate_json(snapshot)
-        if run.status not in TERMINAL:
-            if run.clock_started_at:
-                run.used_s += max(0, run.updated_at - run.clock_started_at)
-            run.clock_started_at = run.deadline_at = None
-            run.status = "interrupted"
-        run.live = {}
-        return run
+        return restore_interrupted(Run.model_validate_json(snapshot))
 
     def _remember(self, run: Run) -> None:
         self._runs[run.id] = run

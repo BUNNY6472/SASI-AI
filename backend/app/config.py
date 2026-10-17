@@ -1,6 +1,7 @@
 """Runtime settings. Every secret comes from the environment (Secret Manager on Cloud Run)."""
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -45,10 +46,12 @@ class Settings(BaseSettings):
     allow_simulated: bool = False
     simulated_delay: float = 0.6
 
-    # Time is the limit for a run, not tokens or calls. In the last minutes SASI stops new work and delivers
-    # the complete result from what is done.
-    run_time_limit_minutes: float = 60
+    # The run duration is a planning target. Admitted calls keep their own allowance and finishing grace.
+    run_time_limit_minutes: float = 120
+    max_total_run_minutes: float = Field(default=120, ge=50, le=120)
     wrap_up_minutes: float = 5
+    model_phase_min_minutes: float = Field(default=20, ge=20, le=60)
+    model_phase_grace_minutes: float = Field(default=5, ge=1, le=15)
     # Optional caps; 0 means no cap.
     max_model_calls_per_run: int = 300
     max_tokens_per_run: int = 2_400_000

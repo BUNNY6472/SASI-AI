@@ -20,8 +20,9 @@ import logging
 import time
 
 from ..files import FileStore, StoredFile
-from ..models import TERMINAL, Run
+from ..models import Run
 from .memory import MemoryStore
+from .recovery import restore_interrupted
 
 log = logging.getLogger("sasi.store")
 
@@ -151,13 +152,7 @@ class BigQueryStore(MemoryStore):
             log.warning("could not load history from BigQuery: %s", e)
             raise RuntimeError("Run history is unavailable; refusing to start with an empty history.") from e
         for run in runs:
-            if run.status not in TERMINAL:
-                # The process stopped mid-run. Keep accepted work; offer resume.
-                if run.clock_started_at:
-                    run.used_s += max(0, min(run.updated_at, time.time()) - run.clock_started_at)
-                run.clock_started_at = run.deadline_at = None
-                run.status = "interrupted"
-            run.live = {}
+            restore_interrupted(run)
             await super().save(run)
         if self._pending_delete:
             asyncio.create_task(self._retry_deletes())

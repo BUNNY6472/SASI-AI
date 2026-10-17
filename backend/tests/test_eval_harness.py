@@ -42,7 +42,7 @@ def test_live_run_records_external_outcome_actual_model_checks_and_hash():
         requests.append(request)
         if request.method == "POST":
             body = json.loads(request.content)
-            assert body["mode"] == "quick" and body["time_limit_minutes"] == 5
+            assert body["mode"] == "quick" and body["time_limit_minutes"] == 20
             assert body["require_plan_approval"] is False
             return httpx.Response(200, json={"id": "run-one", "status": "running"})
         return httpx.Response(200, json={"id": "run-one", "status": "completed", "simulated": False,
@@ -50,14 +50,14 @@ def test_live_run_records_external_outcome_actual_model_checks_and_hash():
                                         "analyses": [{"model": "pinned-model"}],
                                         "final": {"output": '{"total":"417.57"}', "score": 1, "checks": [{"kind": "citations", "status": "unknown"}]}})
     with httpx.Client(base_url="http://localhost", transport=httpx.MockTransport(handler)) as client:
-        result = evaluation.run_case(client, case, "quick", 5, poll_s=0)
+        result = evaluation.run_case(client, case, "quick", 20, poll_s=0)
     assert result["external_outcome"]["verdict"] == "pass", "peer score is not the objective label"
     assert result["model_ids"] == ["pinned-model"] and len(result["output_sha256"]) == 64
     assert result["usage"]["calls"] == 3 and result["checks"][0]["status"] == "unknown"
 
 
 def test_timed_out_run_is_cancelled_and_not_scored(monkeypatch):
-    now = iter([0, 1000, 1001])
+    now = iter([0, 2000, 2001])
     monkeypatch.setattr(evaluation.time, "monotonic", lambda: next(now))
     cancelled = []
     def handler(request):
@@ -66,7 +66,7 @@ def test_timed_out_run_is_cancelled_and_not_scored(monkeypatch):
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(200, json={"id": "run-one", "status": "running"})
     with httpx.Client(base_url="http://localhost", transport=httpx.MockTransport(handler)) as client:
-        result = evaluation.run_case(client, evaluation.load_cases(evaluation.DEFAULT_CASES)[0], "deep", 5)
+        result = evaluation.run_case(client, evaluation.load_cases(evaluation.DEFAULT_CASES)[0], "deep", 20)
     assert cancelled and result["external_outcome"]["verdict"] == "unscored"
     assert result["cancellation"] == "requested" and result["error_type"] == "harness_timeout"
 
@@ -78,8 +78,48 @@ def test_unknown_create_outcome_is_not_retried():
         raise httpx.ReadTimeout("timeout")
     with httpx.Client(base_url="http://localhost", transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(evaluation.EvaluationError, match="unknown"):
-            evaluation.run_case(client, evaluation.load_cases(evaluation.DEFAULT_CASES)[0], "adaptive", 5)
+            evaluation.run_case(client, evaluation.load_cases(evaluation.DEFAULT_CASES)[0], "adaptive", 20)
     assert len(calls) == 1
+
+
+def test_graceful_run_can_complete_after_its_research_target(monkeypatch):
+    now = iter([0, 1300, 1301])
+    monkeypatch.setattr(evaluation.time, "monotonic", lambda: next(now))
+    def handler(request):
+        assert not request.url.path.endswith("/cancel"), "the research target must not cancel admitted work"
+        if request.method == "POST":
+            return httpx.Response(200, json={"id": "run-one", "status": "analyzing", "timing_policy": "graceful"})
+        return httpx.Response(200, json={"id": "run-one", "status": "completed", "timing_policy": "graceful",
+                                         "final": {"output": '{"total":"417.57"}'}})
+    with httpx.Client(base_url="http://localhost", transport=httpx.MockTransport(handler)) as client:
+        result = evaluation.run_case(client, evaluation.load_cases(evaluation.DEFAULT_CASES)[0], "deep", 20, poll_s=0)
+    assert result["external_outcome"]["verdict"] == "pass"
+    assert result["harness_extra_wait_s"] == 5460
+
+
+def test_graceful_harness_still_cancels_a_stuck_run(monkeypatch):
+    now = iter([0, 7000, 7001])
+    monkeypatch.setattr(evaluation.time, "monotonic", lambda: next(now))
+    cancelled = []
+    def handler(request):
+        if request.url.path.endswith("/cancel"):
+            cancelled.append(True)
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, json={"id": "run-one", "status": "analyzing", "timing_policy": "graceful"})
+    with httpx.Client(base_url="http://localhost", transport=httpx.MockTransport(handler)) as client:
+        result = evaluation.run_case(client, evaluation.load_cases(evaluation.DEFAULT_CASES)[0], "deep", 20)
+    assert cancelled and result["error_type"] == "harness_timeout"
+
+
+def test_harness_watchdog_respects_total_cap_with_network_margin(monkeypatch):
+    now = iter([0, 7300, 7301])
+    monkeypatch.setattr(evaluation.time, "monotonic", lambda: next(now))
+    def handler(request):
+        return httpx.Response(200, json={"id": "run-one", "status": "analyzing", "timing_policy": "graceful", "total_time_limit_s": 7200})
+    with httpx.Client(base_url="http://localhost", transport=httpx.MockTransport(handler)) as client:
+        result = evaluation.run_case(client, evaluation.load_cases(evaluation.DEFAULT_CASES)[0], "deep", 120)
+    assert result["harness_watchdog_s"] == 7260
+    assert result["error_type"] == "harness_timeout" and result["cancellation"] == "requested"
 
 
 def test_invalid_fixture_cannot_introduce_executable_oracle(tmp_path):

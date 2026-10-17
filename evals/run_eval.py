@@ -114,7 +114,7 @@ def model_ids(run: dict) -> list[str]:
 
 
 def run_case(client: httpx.Client, case: dict, mode: str, minutes: float, *, poll_s: float = 2,
-             extra_wait_s: float = 60) -> dict:
+             extra_wait_s: float | None = None) -> dict:
     start = time.monotonic()
     payload = make_payload(case, mode, minutes)
     # Never retry creation automatically: after a network failure it may already exist.
@@ -125,10 +125,22 @@ def run_case(client: httpx.Client, case: dict, mode: str, minutes: float, *, pol
         run_id = run["id"]
     except (httpx.HTTPError, ValueError, KeyError) as exc:
         raise EvaluationError("Run creation failed or its outcome is unknown. Inspect the app before retrying; no automatic retry was sent.") from exc
+    if extra_wait_s is None:
+        # Let an admitted call finish and allow one final synthesis. This is a
+        # bounded watchdog, not another cutoff at the research planning target.
+        if run.get("timing_policy") == "graceful":
+            minimum = min(3600, max(1200, float(run.get("model_phase_min_s", 1200))))
+            grace = min(900, max(60, float(run.get("model_phase_grace_s", 300))))
+            extra_wait_s = 2 * (2 * minimum + grace) + 60
+        else:
+            extra_wait_s = 60
+    watchdog_s = minutes * 60 + extra_wait_s
+    if run.get("timing_policy") == "graceful":
+        watchdog_s = min(watchdog_s, min(7200, float(run.get("total_time_limit_s", 7200))) + 60)
     problem, cancel_status = None, None
     try:
         while run.get("status") not in TERMINAL:
-            if time.monotonic() - start > minutes * 60 + extra_wait_s:
+            if time.monotonic() - start > watchdog_s:
                 problem = "harness_timeout"
                 break
             time.sleep(poll_s)
@@ -153,6 +165,8 @@ def run_case(client: httpx.Client, case: dict, mode: str, minutes: float, *, pol
             "run_id": run_id, "run_status": run.get("status"), "simulated": run.get("simulated", False),
             "request": payload, "output": output, "elapsed_wall_s": round(time.monotonic() - start, 3),
             "run_used_s": run.get("used_s"), "configured_time_limit_s": run.get("time_limit_s"),
+            "timing_policy": run.get("timing_policy", "strict"), "harness_extra_wait_s": extra_wait_s,
+            "total_time_limit_s": run.get("total_time_limit_s"), "harness_watchdog_s": watchdog_s,
             "usage": run.get("usage", {}), "model_ids": model_ids(run),
             "output_sha256": hashlib.sha256(output.encode()).hexdigest(), "reported_artifact_hash": final.get("artifact_hash"),
             "checks": final.get("checks", []), "verification_status": final.get("verification_status"),
@@ -169,17 +183,17 @@ def main(argv=None) -> int:
     gate.add_argument("--dry-run", "--validate", action="store_true", help="Validate and preview locally (the default)")
     parser.add_argument("--max-cases", type=int, default=3)
     parser.add_argument("--modes", default=",".join(MODES))
-    parser.add_argument("--minutes", type=float, default=5, help="Same maximum run duration for every mode")
+    parser.add_argument("--minutes", type=float, default=20, help="Same research time target for every mode (active work may finish later)")
     parser.add_argument("--poll-seconds", type=float, default=2)
     parser.add_argument("--output", type=Path, help="New JSONL result file (existing files are never overwritten)")
     args = parser.parse_args(argv)
     modes = args.modes.split(",")
     if not modes or any(mode not in MODES for mode in modes) or len(set(modes)) != len(modes):
         parser.error("--modes must be unique choices from quick,adaptive,deep")
-    if not 1 <= args.max_cases <= 20 or not 5 <= args.minutes <= 60 or not 0.1 <= args.poll_seconds <= 30:
-        parser.error("Use 1–20 cases, 5–60 minutes, and 0.1–30 seconds between polls")
+    if not 1 <= args.max_cases <= 20 or not 20 <= args.minutes <= 120 or not 0.1 <= args.poll_seconds <= 30:
+        parser.error("Use 1–20 cases, 20–120 minutes, and 0.1–30 seconds between polls")
     cases = load_cases(args.cases)[:args.max_cases]
-    print(f"Validated {len(cases)} selected cases; {len(cases) * len(modes)} planned runs; common cap {args.minutes:g} minutes per run.")
+    print(f"Validated {len(cases)} selected cases; {len(cases) * len(modes)} planned runs; common research target {args.minutes:g} minutes per run.")
     if not args.execute:
         for case in cases:
             print(f"  {case['id']}: {case['kind']} ({', '.join(modes)})")

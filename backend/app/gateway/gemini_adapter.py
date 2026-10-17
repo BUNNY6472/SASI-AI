@@ -94,6 +94,8 @@ class GeminiAdapter:
         model = await self.resolve_model()
         # Gemini's thinking counts toward max_output_tokens, so leave room for the answer too.
         config = types.GenerateContentConfig(system_instruction=call.full_system, max_output_tokens=reply_room(call, MAX_OUTPUT))
+        if call.timeout_seconds is not None:
+            config.http_options = types.HttpOptions(timeout=max(1, int(call.timeout_seconds * 1000)))
         try:
             contents = await self._contents(call)
             if call.on_text:

@@ -114,7 +114,11 @@ def test_truncated_nonempty_response_is_retried_before_acceptance():
         result = await c._call(run, "claude", ModelCall("system", "prompt", "task", 1000))
         assert result.text == "complete" and sizes[1] > sizes[0]
         assert run.usage.output_tokens == 20
-        assert len(c.store.outputs[run.id]) == 1
+        rows = c.store.outputs[run.id]
+        assert len(rows) == 2
+        assert rows[0]["verdict"] == "incomplete" and rows[0]["score"] is None
+        assert rows[0]["content"] == "unfinished" and rows[1]["content"] == "complete"
+        assert len(run.partial_outputs) == 1 and not run.partial_outputs[0].usage_estimated
     asyncio.run(scenario())
 
 
@@ -182,10 +186,33 @@ def test_provider_receives_mode_appropriate_reasoning_effort(mode, kind, expecte
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("minutes", [0, 4, 61, -1])
+@pytest.mark.parametrize("minutes", [0, 4, 5, 15, 19, 121, -1])
 def test_requested_deadline_is_bounded(minutes):
     with pytest.raises(ValidationError):
         CreateRun(request="A request", time_limit_minutes=minutes)
+
+
+@pytest.mark.parametrize("minutes", [20, 30, 60, 120])
+def test_new_research_targets_allow_twenty_minutes_or_more(minutes):
+    assert CreateRun(request="A request", time_limit_minutes=minutes).time_limit_minutes == minutes
+
+
+def test_admitted_graceful_call_keeps_minimum_even_near_research_target():
+    run = Run(request="Research a complex problem", timing_policy="graceful")
+    assert policy.stage_allowance(run, "analysis", 1) == 1200
+    assert policy.call_allowance(run, "task", 0) == 1200
+    assert policy.finalization_allowance(run) == 1500
+    policy.observe(run, "analysis", 900)
+    assert policy.call_allowance(run, "analysis") == 1800
+    policy.observe(run, "analysis", 10_000)
+    assert policy.call_allowance(run, "analysis") == 2400
+
+
+def test_phase_configuration_cannot_shorten_the_twenty_minute_minimum():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, model_phase_min_minutes=19)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, max_total_run_minutes=121)
 
 
 def test_resume_does_not_grant_extra_time_beyond_requested_deadline():

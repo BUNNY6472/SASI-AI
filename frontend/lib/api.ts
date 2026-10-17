@@ -119,6 +119,29 @@ export interface LiveText {
   at: number;
 }
 
+export interface CallTiming {
+  provider: string;
+  kind: string;
+  label: string;
+  started_at: number;
+  soft_deadline_at: number;
+  hard_deadline_at: number;
+  in_grace: boolean;
+}
+
+export interface PartialOutput {
+  id: string;
+  provider: string;
+  model: string;
+  kind: string;
+  label: string;
+  text: string;
+  task_id: string | null;
+  reason: string;
+  created_at: number;
+  usage_estimated: boolean;
+}
+
 export interface Run {
   mode?: "adaptive" | "quick" | "deep";
   evidence?: Evidence[];
@@ -143,6 +166,9 @@ export interface Run {
   /** The models working on this run, best first. */
   team?: string[];
   live: Record<string, LiveText>;
+  active_calls?: Record<string, CallTiming>;
+  call_completed_keys?: string[];
+  partial_outputs?: PartialOutput[];
   status: string;
   simulated: boolean;
   plan: Plan | null;
@@ -176,7 +202,14 @@ export interface Run {
   error: string | null;
   /** The code file in the final result (solution.py on Project Eris runs), when there is one. */
   solution?: { name: string; code: string; lines: number } | null;
-  /** Time is the run's limit. The clock pauses while the plan waits for approval. */
+  /** Missing policy means a historical strict deadline. Approval pauses elapsed time. */
+  timing_policy?: "strict" | "graceful";
+  model_phase_min_s?: number;
+  model_phase_grace_s?: number;
+  finalization_deadline_elapsed_s?: number | null;
+  /** Hard active-runtime cap, including finishing and final assembly. */
+  total_time_limit_s?: number;
+  /** Soft admission target for graceful runs; hard limit for historical strict runs. */
   time_limit_s?: number;
   wrap_up_s?: number;
   used_s?: number;
@@ -240,6 +273,27 @@ export interface RunSummary {
   team?: string[];
   elapsed_s?: number;
   time_limit_s?: number;
+  timing_policy?: "strict" | "graceful";
+  total_time_limit_s?: number;
+}
+
+export interface RunLimits {
+  time_limit_minutes: number;
+  wrap_up_minutes: number;
+  timing_policy?: "strict" | "graceful";
+  minimum_time_target_minutes?: number;
+  max_total_run_minutes?: number;
+  model_phase_min_minutes?: number;
+  model_phase_grace_minutes?: number;
+  team_size: number;
+  max_model_calls_per_run: number;
+  max_tokens_per_run: number;
+  eris_max_tokens_per_run: number;
+  max_output_tokens_per_call: number;
+  max_tasks_per_plan: number;
+  max_revisions_per_task: number;
+  max_concurrent_runs: number;
+  storage: string;
 }
 
 export interface ProviderStatus {

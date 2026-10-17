@@ -146,9 +146,13 @@ def test_the_team_is_frontier_first_then_the_open_models_that_suit_the_task():
 # ---------------------------------------------------------------- the time limit
 
 
-def test_when_time_is_nearly_up_the_run_wraps_up_with_a_complete_result():
-    """Task work stops at its share of the time, the final step is cut at the wrap-up, and the wrap-up delivers."""
+def test_legacy_strict_clock_wraps_up_with_a_complete_result():
+    """Old stored strict-clock behavior stays readable; new runs use graceful phase windows."""
     with make_client(run_time_limit_minutes=0.1, wrap_up_minutes=0.025) as client:  # 6 s, the last 1.5 s to wrap up
+        def legacy_limit(run):
+            run.timing_policy = "strict"
+            run.time_limit_s, run.wrap_up_s = 6, 1.5
+        client.app.state.controller._set_limit = legacy_limit
         kinds = []
 
         async def change(p, call, original):
@@ -195,7 +199,9 @@ def test_time_and_resource_caps_are_bounded_by_default():
     s = Settings(_env_file=None)
     assert s.max_model_calls_per_run == 300
     assert s.max_tokens_per_run == 2_400_000 and s.eris_max_tokens_per_run == 3_600_000
-    assert s.run_time_limit_minutes == 60 and s.wrap_up_minutes == 5
+    assert s.run_time_limit_minutes == 120 and s.wrap_up_minutes == 5
+    assert s.max_total_run_minutes == 120
     with make_client() as client:
         limits = client.get("/api/limits").json()
-        assert limits["time_limit_minutes"] == 60 and limits["wrap_up_minutes"] == 5 and limits["team_size"] == 4
+        assert limits["time_limit_minutes"] == 120 and limits["wrap_up_minutes"] == 5 and limits["team_size"] == 4
+        assert limits["max_total_run_minutes"] == 120

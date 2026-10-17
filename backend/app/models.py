@@ -172,6 +172,30 @@ class LiveText(BaseModel):
     at: float = Field(default_factory=now)
 
 
+class CallTiming(BaseModel):
+    provider: str
+    kind: str
+    label: str = ""
+    started_at: float
+    soft_deadline_at: float
+    hard_deadline_at: float
+    in_grace: bool = False
+
+
+class PartialOutput(BaseModel):
+    """Preserved unfinished text; never a completed opinion, accepted task, or passing review."""
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
+    provider: str
+    model: str = ""
+    kind: str
+    label: str = ""
+    text: str
+    task_id: str | None = None
+    reason: str
+    created_at: float = Field(default_factory=now)
+    usage_estimated: bool = True
+
+
 class Run(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
     created_at: float = Field(default_factory=now)
@@ -183,7 +207,7 @@ class Run(BaseModel):
     require_plan_approval: bool = True
     compare_all: bool | None = None  # explicit legacy setting; None lets the effort policy decide
     mode: Literal["adaptive", "quick", "deep"] = "adaptive"
-    time_limit_minutes: float | None = Field(default=None, ge=5, le=60)
+    time_limit_minutes: float | None = Field(default=None, ge=5, le=120)
     evidence: list[SourceEvidence] = Field(default_factory=list)
     search_queries: list[str] = Field(default_factory=list)
     search_entry_html: str | None = None
@@ -198,6 +222,11 @@ class Run(BaseModel):
     team: list[str] = []  # the models working on this run, best first (chosen when it starts)
     skipped: dict[str, str] = {}  # models not taking part in this run, and why (no key, failing key)
     live: dict[str, LiveText] = {}
+    active_calls: dict[str, CallTiming] = Field(default_factory=dict)
+    call_elapsed_s: dict[str, float] = Field(default_factory=dict)
+    call_allowance_s: dict[str, float] = Field(default_factory=dict)
+    call_completed_keys: list[str] = Field(default_factory=list)
+    partial_outputs: list[PartialOutput] = Field(default_factory=list)
     status: RunStatus = "planning"
     simulated: bool = False
     plan: Plan | None = None
@@ -207,12 +236,18 @@ class Run(BaseModel):
     usage: Usage = Field(default_factory=Usage)
     events: list[Event] = []
     error: str | None = None
-    # Time is the run's limit. The clock pauses while the plan waits for approval.
+    # Older records used a strict deadline. New runs use a soft admission target and per-call grace.
+    # Clock and elapsed finalization allowance pause while waiting for approval.
+    timing_policy: Literal["strict", "graceful"] = "strict"
+    model_phase_min_s: float = 1200
+    model_phase_grace_s: float = 300
+    total_time_limit_s: float = 7200  # hard active-runtime ceiling including final assembly; pauses exclude approval/downtime
+    finalization_deadline_elapsed_s: float | None = None
     time_limit_s: float = 0  # 0: no limit
     wrap_up_s: float = 0  # the last part of the limit, kept for delivering the complete result
     used_s: float = 0  # working time used before the clock last started
     clock_started_at: float | None = None  # set while the clock runs
-    deadline_at: float | None = None  # when the run must be finished, while the clock runs
+    deadline_at: float | None = None  # admission target (graceful) or finish deadline (legacy strict)
     wrapping_up: bool = False
     finished_at: float | None = None
 
@@ -245,6 +280,8 @@ class Run(BaseModel):
             "team": self.team,
             "elapsed_s": round(self.elapsed_s),
             "time_limit_s": self.time_limit_s,
+            "total_time_limit_s": self.total_time_limit_s,
+            "timing_policy": self.timing_policy,
             "mode": self.mode,
             "verification_status": self.final.verification_status if self.final else "unverified",
         }
@@ -257,7 +294,7 @@ class CreateRun(BaseModel):
     require_plan_approval: bool = True
     compare_all: bool | None = None
     mode: Literal["adaptive", "quick", "deep"] = "adaptive"
-    time_limit_minutes: float | None = Field(default=None, ge=5, le=60)
+    time_limit_minutes: float | None = Field(default=None, ge=20, le=120)
     eris: bool = False  # Project Eris switch
     file_ids: list[str] = Field(default=[], max_length=10)
 

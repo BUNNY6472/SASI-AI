@@ -77,6 +77,8 @@ class ClaudeAdapter:
         kwargs = self._kwargs(call, model)
         try:
             # Always stream: long replies are only allowed as streams, and the live view needs the text anyway.
+            if call.timeout_seconds is not None:
+                kwargs["timeout"] = anthropic.Timeout(call.timeout_seconds, connect=5.0)
             async with self._messages.stream(**kwargs) as stream:
                 async for text in stream.text_stream:
                     if call.on_text:

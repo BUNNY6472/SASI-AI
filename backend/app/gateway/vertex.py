@@ -260,6 +260,8 @@ class VertexOpenModelAdapter:
         kwargs = dict(model=model, messages=messages, max_tokens=reply_room(call, self._max_output))
         text, usage, finish, served = "", None, "", model
         client = await self._signed(self._location or "global")
+        if call.timeout_seconds is not None:
+            client = client.with_options(timeout=openai.Timeout(call.timeout_seconds, connect=5.0))
         try:
             pieces: list[str] = []
             try:
