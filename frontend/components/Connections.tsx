@@ -199,7 +199,11 @@ function KeyForm({
           className="btn primary"
           disabled={busy || key.trim().length < 10}
         >
-          {busy ? "Checking…" : p.has_key ? "Replace key" : "Save key"}
+          {busy
+            ? "Checking…"
+            : p.has_key
+              ? "Replace key"
+              : `Connect ${p.display_name}`}
         </button>
         {p.has_key && (
           <button
@@ -244,11 +248,16 @@ function status(
   if (!p.connected)
     return {
       cls: "muted",
-      text: trialCreditsOnly
-        ? "Vertex Gemini unavailable"
-        : p.tier === "open"
-          ? "Not connected through Google Cloud"
-          : "No connection yet",
+      text:
+        p.provider === "claude"
+          ? p.has_key
+            ? "Claude key saved; connection unavailable"
+            : "Claude key not connected"
+          : trialCreditsOnly
+            ? "Vertex Gemini unavailable"
+            : p.tier === "open"
+              ? "Not connected through Google Cloud"
+              : "No connection yet",
     };
   if (p.tier === "open") {
     if (p.ok === false)
@@ -264,6 +273,8 @@ function status(
           ? "Key saved, but the last check failed"
           : "Not working right now",
     };
+  if (p.ok === null)
+    return { cls: "muted", text: "Connection not checked yet" };
   if (p.via === "vertex")
     return { cls: "ok", text: "Connected through Google Cloud" };
   if (p.has_key)
@@ -275,6 +286,7 @@ export default function Connections({
   providers,
   vertex,
   trialCreditsOnly = false,
+  claudeApiKeyAllowed = false,
   trialCreditExpiresAt = null,
   trialCreditWindowError = null,
   refresh,
@@ -283,6 +295,7 @@ export default function Connections({
   providers: ProviderStatus[];
   vertex: VertexInfo | null;
   trialCreditsOnly?: boolean;
+  claudeApiKeyAllowed?: boolean;
   trialCreditExpiresAt?: string | null;
   trialCreditWindowError?: string | null;
   refresh: () => Promise<void>;
@@ -350,11 +363,15 @@ export default function Connections({
               <strong>
                 {trialCreditWindowError
                   ? "Trial access paused"
-                  : "Trial credits only · Vertex Gemini"}
+                  : claudeApiKeyAllowed
+                    ? "Vertex Gemini + your Claude key"
+                    : "Trial credits only · Vertex Gemini"}
               </strong>
               <p>
                 {trialCreditWindowError ||
-                  "SASI allows Gemini through your Google Cloud project only. Claude, open-model managed APIs and all direct API-key routes are disabled by this policy."}
+                  (claudeApiKeyAllowed
+                    ? "The policy allows Vertex Gemini using your Google Cloud project and Claude using your own Anthropic API key. Claude is billed separately. Open models and the Gemini API-key route remain disabled."
+                    : "SASI allows Gemini through your Google Cloud project only. Claude, open-model managed APIs and all direct API-key routes are disabled by this policy.")}
               </p>
               {trialCreditExpiresAt && (
                 <p className="small">
@@ -368,7 +385,9 @@ export default function Connections({
           <p className="sub">
             {trialCreditWindowError
               ? "New research is paused under the trial-credit policy. Your saved research remains accessible."
-              : "Research can run with Vertex Gemini alone. Other integrations remain available in SASI for a future billing-policy change."}
+              : claudeApiKeyAllowed
+                ? "Connect Claude below to make it available alongside Vertex Gemini. The connection status on each card shows which models are ready."
+                : "Research can run with Vertex Gemini alone. Other integrations remain available in SASI for a future billing-policy change."}
             {vertex?.project && (
               <>
                 {" "}
@@ -422,30 +441,43 @@ export default function Connections({
                 </p>
               )
             )}
-            {trialCreditsOnly || p.policy_blocked ? (
-              <p className="small muted">
-                {p.provider === "claude"
-                  ? "Claude integration is ready when your billing policy allows a separate Anthropic API account. API-key entry is disabled for now."
-                  : "The Gemini API-key route is disabled. Vertex AI is the only eligible route; its current access status is shown above."}
-              </p>
-            ) : p.key_option ? (
-              <KeyForm
-                p={p}
-                vertexOn={p.routes.some(
-                  (route) => route.via === "vertex" && route.ok === true,
+            {p.key_option && !p.policy_blocked && !trialCreditWindowError ? (
+              <>
+                {p.provider === "claude" && (
+                  <p className="small muted">
+                    <b>Separate Anthropic billing.</b> Claude usage is charged
+                    to your Anthropic account. Google Cloud credits and billing
+                    limits do not cover or cap it. The key is sent to SASI’s
+                    server; only a masked hint is displayed after connection.
+                  </p>
                 )}
-                onChange={reload}
-              />
+                <KeyForm
+                  p={p}
+                  vertexOn={p.routes.some(
+                    (route) => route.via === "vertex" && route.ok === true,
+                  )}
+                  onChange={reload}
+                />
+              </>
+            ) : trialCreditsOnly || p.policy_blocked ? (
+              <p className="small muted">
+                {trialCreditWindowError
+                  ? "Model access and API-key entry are paused by the configured trial cutoff."
+                  : p.provider === "claude"
+                    ? "Claude integration is ready when your billing policy allows a separate Anthropic API account. API-key entry is disabled for now."
+                    : "The Gemini API-key route is disabled. Vertex AI is the only eligible route; its current access status is shown above."}
+              </p>
             ) : null}
           </div>
         ))}
       </div>
-      {!trialCreditsOnly && (
-        <p className="small muted">
-          To change a key, paste the new one and press Replace key. You
-          don&apos;t need to remove the old one first.
-        </p>
-      )}
+      {!trialCreditWindowError &&
+        providers.some((p) => p.key_option && !p.policy_blocked) && (
+          <p className="small muted">
+            To change a key, paste the new one and press Replace key. You
+            don&apos;t need to remove the old one first.
+          </p>
+        )}
       {open.length > 0 && (
         <>
           <h2>Open models on Google Cloud</h2>
@@ -519,6 +551,13 @@ export default function Connections({
             </a>{" "}
             before running research. Open-weight models on Vertex AI have
             serving charges and are disabled under this policy.
+            {claudeApiKeyAllowed && (
+              <>
+                {" "}
+                Claude API-key usage is billed separately by Anthropic; Google
+                Cloud credits and billing limits do not apply.
+              </>
+            )}
           </>
         ) : (
           <>
@@ -547,7 +586,9 @@ export default function Connections({
             : trialCreditsOnly
               ? trialCreditWindowError
                 ? "Refresh access status"
-                : "Check Vertex Gemini"
+                : claudeApiKeyAllowed
+                  ? "Check allowed connections"
+                  : "Check Vertex Gemini"
               : vertexOn
                 ? "Check again"
                 : "Re-check all keys"}
@@ -567,7 +608,9 @@ export default function Connections({
       <div className="glass lock-note">
         When the access-code gate is enabled, keep that code private.{" "}
         {trialCreditsOnly
-          ? "The current policy permits only Vertex Gemini before the configured cutoff. Keep an eye on your credit balance and expiry in Google Cloud Billing."
+          ? claudeApiKeyAllowed
+            ? "The current policy permits Vertex Gemini and your Claude API key before the configured cutoff. Check Google Cloud credits and Anthropic spending separately."
+            : "The current policy permits only Vertex Gemini before the configured cutoff. Keep an eye on your credit balance and expiry in Google Cloud Billing."
           : vertexOn
             ? "Calls through Google Cloud are billed to your Google Cloud project, and calls with an API key to that provider's account. Set a budget alert in Google Cloud Billing, and a monthly limit in each provider's console."
             : "Every model call is billed to your own API accounts, so set a monthly spending limit in each provider's console too."}
@@ -596,7 +639,9 @@ export default function Connections({
                 {trialCreditsOnly
                   ? trialCreditWindowError
                     ? "Paused"
-                    : "Gemini"
+                    : claudeApiKeyAllowed
+                      ? "Gemini + Claude"
+                      : "Gemini"
                   : limits.team_size}
               </b>
               <span>

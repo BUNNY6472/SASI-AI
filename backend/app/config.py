@@ -9,6 +9,7 @@ class Settings(BaseSettings):
 
     # Provider keys. Empty means the provider is not connected.
     anthropic_api_key: str = ""
+    sasi_owner_anthropic_api_key: str = ""  # isolated owner opt-in; never falls back to a legacy Claude key
     gemini_api_key: str = ""
 
     # Optional model pins. Empty means "pick from the provider's live model list".
@@ -19,7 +20,8 @@ class Settings(BaseSettings):
     # Claude uses its own API key unless its separate Vertex route is explicitly enabled.
     # A saved Gemini API key remains a fallback behind its Vertex route.
     vertex_ai: bool = False
-    trial_credits_only: bool = False  # only Vertex Gemini; block partner models and API-key routes
+    trial_credits_only: bool = False  # only Vertex Gemini, except an explicitly allowed owner Claude API key
+    allow_claude_api_key: bool = False  # direct Anthropic only; disables Vertex Claude and uses a separate key slot
     trial_credit_expires_at: str = ""  # optional ISO UTC cutoff; empty does not verify a credit balance
     vertex_claude_enabled: bool = False
     vertex_location: str = "global"  # Gemini and optional Vertex Claude

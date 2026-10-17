@@ -16,6 +16,7 @@ from .config import Settings
 log = logging.getLogger("sasi.keys")
 
 SECRET_NAMES = {"claude": "ANTHROPIC_API_KEY", "gemini": "GEMINI_API_KEY"}
+OWNER_CLAUDE_SECRET = "SASI_OWNER_ANTHROPIC_API_KEY"
 
 # Stored in place of a key when it is removed. Writing it needs the same permission as saving a key,
 # so removing works whenever saving works.
@@ -30,7 +31,8 @@ def hint(key: str) -> str:
 class EnvKeyStore:
     def __init__(self, settings: Settings):
         self._keys = {
-            "claude": settings.anthropic_api_key.strip(),
+            "claude": (settings.sasi_owner_anthropic_api_key if settings.allow_claude_api_key
+                       else settings.anthropic_api_key).strip(),
             "gemini": settings.gemini_api_key.strip(),
         }
 
@@ -45,14 +47,19 @@ class EnvKeyStore:
 
 
 class SecretManagerKeyStore:
-    def __init__(self, project: str):
+    _secret_names = SECRET_NAMES
+
+    def __init__(self, project: str, *, allow_claude_api_key: bool = False):
         from google.cloud import secretmanager
 
         self._client = secretmanager.SecretManagerServiceClient()
         self._project = project
+        self._secret_names = {**SECRET_NAMES}
+        if allow_claude_api_key:
+            self._secret_names["claude"] = OWNER_CLAUDE_SECRET
 
     def _secret(self, provider: str) -> str:
-        return f"projects/{self._project}/secrets/{SECRET_NAMES[provider]}"
+        return f"projects/{self._project}/secrets/{self._secret_names[provider]}"
 
     def _read(self, provider: str) -> str:
         from google.api_core import exceptions
@@ -64,7 +71,7 @@ class SecretManagerKeyStore:
         except (exceptions.NotFound, exceptions.FailedPrecondition):
             return ""  # secret or version missing: provider not connected
         except exceptions.PermissionDenied:
-            log.warning("no permission to read %s; run deploy/setup-gcp.sh", SECRET_NAMES[provider])
+            log.warning("no permission to read %s; run deploy/setup-gcp.sh", self._secret_names[provider])
             return ""
 
     def _enabled_versions(self, provider: str) -> list[str]:
@@ -82,7 +89,7 @@ class SecretManagerKeyStore:
                 if name.rsplit("/", 1)[-1] != keep_id:
                     self._client.destroy_secret_version(name=name)
         except Exception as e:  # noqa: BLE001
-            log.warning("could not destroy older versions of %s: %s", SECRET_NAMES[provider], type(e).__name__)
+            log.warning("could not destroy older versions of %s: %s", self._secret_names[provider], type(e).__name__)
 
     def _write(self, provider: str, key: str) -> None:
         new = self._client.add_secret_version(parent=self._secret(provider), payload={"data": key.encode("utf-8")})
@@ -98,8 +105,8 @@ class SecretManagerKeyStore:
         self._cleanup(provider, new.name)
 
     async def load(self) -> dict[str, str]:
-        values = await asyncio.gather(*(asyncio.to_thread(self._read, p) for p in SECRET_NAMES))
-        return {p: v for p, v in zip(SECRET_NAMES, values) if v}
+        values = await asyncio.gather(*(asyncio.to_thread(self._read, p) for p in self._secret_names))
+        return {p: v for p, v in zip(self._secret_names, values) if v}
 
     async def save(self, provider: str, key: str) -> None:
         await asyncio.to_thread(self._write, provider, key)
@@ -110,5 +117,5 @@ class SecretManagerKeyStore:
 
 def build_key_store(settings: Settings):
     if settings.key_store == "secretmanager":
-        return SecretManagerKeyStore(settings.gcp_project)
+        return SecretManagerKeyStore(settings.gcp_project, allow_claude_api_key=settings.allow_claude_api_key)
     return EnvKeyStore(settings)

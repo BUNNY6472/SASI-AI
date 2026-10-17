@@ -110,14 +110,12 @@ new_secret APP_ACCESS_CODE "$ACCESS_CODE"
 new_secret SESSION_SECRET "$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
 
 echo "== Places for the model API keys (you paste the keys on the app's Connections page)"
-for name in ANTHROPIC_API_KEY GEMINI_API_KEY; do
+for name in ANTHROPIC_API_KEY GEMINI_API_KEY SASI_OWNER_ANTHROPIC_API_KEY; do
   gcloud secrets describe "$name" >/dev/null 2>&1 || \
     gcloud secrets create "$name" --replication-policy automatic >/dev/null
   # The app may add a new key version and remove old ones, for these secrets only.
-  for role in roles/secretmanager.secretVersionManager roles/secretmanager.viewer; do
-    gcloud secrets add-iam-policy-binding "$name" --member "serviceAccount:$RUNTIME_SA" \
-      --role "$role" >/dev/null
-  done
+  gcloud secrets add-iam-policy-binding "$name" --member "serviceAccount:$RUNTIME_SA" \
+    --role roles/secretmanager.secretVersionManager >/dev/null
   echo "  $name ready"
 done
 

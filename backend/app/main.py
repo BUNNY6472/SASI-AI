@@ -197,9 +197,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def providers(refresh: bool = False):
         if refresh or not registry.status:
             await registry.refresh()
-        return {"providers": registry.describe(), "needs_keys": registry.live_count == 0 and not settings.allow_simulated and not settings.trial_credits_only,
+        return {"providers": registry.describe(), "needs_keys": registry.live_count == 0 and not settings.allow_simulated
+                and any(registry.key_route_allowed(p) for p in KEY_SEATS),
                 "demo_mode": registry.live_count == 0 and settings.allow_simulated and not settings.trial_credits_only, "checked_at": registry.checked_at,
                 "trial_credits_only": settings.trial_credits_only,
+                "claude_api_key_allowed": registry.key_route_allowed("claude"),
                 "trial_credit_expires_at": settings.trial_credit_expires_at.strip() or None,
                 "trial_credit_window_error": registry.trial_credit_window_error(),
                 "vertex": {"on": registry.uses_vertex, "project": settings.gcp_project, "location": settings.vertex_location},
@@ -214,8 +216,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def save_key(provider: str, body: SaveKey):
         if provider not in KEY_SEATS:
             raise HTTPException(404, "SASI takes API keys for Claude and Gemini only. The open models run through Google Cloud.")
-        if settings.trial_credits_only:
-            raise HTTPException(403, "API-key routes are disabled by trial-credit-only policy. Existing keys are preserved; only Vertex Gemini is allowed.")
+        if error := registry.key_route_error(provider):
+            raise HTTPException(403, error)
         key = body.key.strip()
         if not 10 <= len(key) <= 500 or any(c.isspace() for c in key):
             raise HTTPException(400, "That does not look like an API key. Paste the whole key.")
@@ -233,6 +235,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 msg = raw[:200]
             raise HTTPException(400, f"That key did not work: {msg}") from e
+        # The expiry may have passed during the provider check.
+        if error := registry.key_route_error(provider):
+            raise HTTPException(403, error)
         # The key works, so use it right away even if saving it fails.
         registry.set_adapter(provider, key, model)
         result = {"provider": provider, "configured": True, "hint": registry.hints.get(provider), "model": model, "saved": True,
@@ -379,6 +384,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await registry.recheck_failed()  # a key that failed before may work again
         if not registry.eligible():
             if settings.trial_credits_only:
+                if registry.key_route_allowed("claude"):
+                    raise HTTPException(400, "Connect your own Claude API key or a working Vertex Gemini connection on the Connections page. Other provider routes are disabled by trial-credit-only policy.")
                 raise HTTPException(400, "Trial-credit-only policy requires a working Vertex Gemini connection. Check the Google Cloud project and Vertex AI settings.")
             if registry.live_count:
                 why = "; ".join(f"{name(p)}: {r}" for p, r in registry.unavailable().items())

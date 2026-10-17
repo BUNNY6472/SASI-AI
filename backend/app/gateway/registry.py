@@ -47,9 +47,7 @@ class ModelRegistry:
         self.vertex: dict[str, Route] = {}
         if settings.vertex_ai:
             for p in self.seats:
-                if self._disabled_error(p):
-                    continue
-                if p == "claude" and not settings.vertex_claude_enabled:
+                if not self._vertex_route_allowed(p):
                     continue
                 try:
                     self.vertex[p] = Route("vertex", self._make_vertex(p))
@@ -89,9 +87,39 @@ class ModelRegistry:
         window_error = self.trial_credit_window_error()
         if window_error:
             return window_error
-        if self.settings.trial_credits_only and (provider != "gemini" or not self.settings.vertex_ai):
-            return "Disabled by trial-credit-only policy: only Gemini through Vertex AI is allowed."
+        if self.settings.trial_credits_only:
+            if provider == "claude" and self.settings.allow_claude_api_key:
+                return None
+            if provider != "gemini" or not self.settings.vertex_ai:
+                exception = " and the owner's explicitly enabled direct Claude API key" if self.settings.allow_claude_api_key else ""
+                return f"Disabled by trial-credit-only policy: only Gemini through Vertex AI{exception} is allowed."
         return None
+
+    def key_route_error(self, provider: str) -> str | None:
+        """Authorize the provider's own API, independently of its Vertex route."""
+        if error := self.trial_credit_window_error():
+            return error
+        if provider not in KEY_SEATS:
+            return f"{name(provider)} has no API key option."
+        if self.settings.trial_credits_only and not (provider == "claude" and self.settings.allow_claude_api_key):
+            return "This API-key route is disabled by trial-credit-only policy."
+        return None
+
+    def key_route_allowed(self, provider: str) -> bool:
+        return self.key_route_error(provider) is None
+
+    def _vertex_route_allowed(self, provider: str) -> bool:
+        if not self.settings.vertex_ai or self._disabled_error(provider):
+            return False
+        if provider == "claude":
+            return (self.settings.vertex_claude_enabled and not self.settings.trial_credits_only
+                    and not self.settings.allow_claude_api_key)
+        return True
+
+    def _route_allowed(self, provider: str, via: str) -> bool:
+        if via == "key":
+            return self.key_route_allowed(provider)
+        return via == "vertex" and self._vertex_route_allowed(provider)
 
     def _disabled_error(self, provider: str) -> str | None:
         reasons = [self._trial_policy_error(provider), self._retirement_error(provider)]
@@ -106,24 +134,26 @@ class ModelRegistry:
                 self.adapters.pop(provider, None)
                 self.vertex.pop(provider, None)
                 self.status[provider] = {"ok": False, "error": error, "model": None, "simulated": False}
-            elif self.settings.trial_credits_only:
+            else:
+                if not self._vertex_route_allowed(provider):
+                    self.vertex.pop(provider, None)
                 adapter = self.adapters.get(provider)
                 if isinstance(adapter, RoutedAdapter):
-                    allowed = [route for route in adapter.routes if route.via == "vertex"]
+                    allowed = [route for route in adapter.routes if self._route_allowed(provider, route.via)]
                     if not allowed:
                         self.adapters.pop(provider, None)
                         self.status.pop(provider, None)
                     elif len(allowed) != len(adapter.routes):
                         adapter.routes = allowed
                         self.status[provider] = adapter.status()
-                elif adapter is not None:
+                elif adapter is not None and self.settings.trial_credits_only:
                     self.adapters.pop(provider, None)
                     self.status.pop(provider, None)
 
     def _make(self, provider: str, key: str) -> ProviderAdapter:
         s = self.settings
-        if s.trial_credits_only:
-            raise ProviderError(provider, "API-key routes are disabled by trial-credit-only policy; only Vertex Gemini is allowed.")
+        if error := self.key_route_error(provider):
+            raise ProviderError(provider, error)
         if provider == "claude":
             return ClaudeAdapter(key, s.claude_model)
         if provider == "gemini":
@@ -134,6 +164,8 @@ class ModelRegistry:
         error = self._disabled_error(provider)
         if error:
             raise ProviderError(provider, error)
+        if provider == "claude" and not self._vertex_route_allowed(provider):
+            raise ProviderError(provider, "This Vertex AI route is disabled by the configured provider policy.")
         from .vertex import VertexClaudeAdapter, VertexGeminiAdapter, VertexOpenModelAdapter
 
         s = self.settings
@@ -150,12 +182,12 @@ class ModelRegistry:
     def _build(self, provider: str, key_route: Route | None = None) -> ProviderAdapter | None:
         if self._disabled_error(provider):
             return None
-        if self.settings.trial_credits_only:
+        if not self.key_route_allowed(provider):
             key_route = None
-        key = self.keys.get(provider) if not self.settings.trial_credits_only else None
+        key = self.keys.get(provider) if self.key_route_allowed(provider) else None
         if key and key_route is None:
             key_route = Route("key", self._make(provider, key))
-        routes = [r for r in (self.vertex.get(provider), key_route) if r]
+        routes = [r for r in (self.vertex.get(provider), key_route) if r and self._route_allowed(provider, r.via)]
         if routes:
             return RoutedAdapter(provider, name(provider), routes)
         if self.settings.allow_simulated and not self.settings.trial_credits_only:
@@ -189,8 +221,8 @@ class ModelRegistry:
 
     async def test_key(self, provider: str, key: str) -> str:
         """Check a key by listing the provider's models. Returns the model SASI will use."""
-        if self.settings.trial_credits_only:
-            raise ProviderError(provider, "API-key routes are disabled by trial-credit-only policy; only Vertex Gemini is allowed.")
+        if error := self.key_route_error(provider):
+            raise ProviderError(provider, error)
         adapter = self._make(provider, key.strip())
         # Listing models proves the key works, even when the model name is pinned.
         await asyncio.wait_for(adapter.list_models(), timeout=25)
@@ -201,7 +233,7 @@ class ModelRegistry:
         key = key.strip()
         self.keys[provider] = key
         self.hints[provider] = hint(key)
-        if self.settings.trial_credits_only:
+        if not self.key_route_allowed(provider):
             self._install(provider, self._build(provider))
             self._remove_disabled()
             return
@@ -256,9 +288,10 @@ class ModelRegistry:
     async def _check(self, name_: str, adapter: ProviderAdapter, timeout: float = 20) -> tuple[str, dict]:
         """Listing models (or counting tokens on Vertex) proves a route works without paying for an answer."""
         error = self._disabled_error(name_)
-        if self.settings.trial_credits_only and (not isinstance(adapter, RoutedAdapter)
-                                                or any(route.via != "vertex" for route in adapter.routes)):
-            error = "Disabled by trial-credit-only policy: only Vertex Gemini routes can be checked."
+        if not error and ((isinstance(adapter, RoutedAdapter)
+                           and any(not self._route_allowed(name_, route.via) for route in adapter.routes))
+                          or (self.settings.trial_credits_only and not isinstance(adapter, RoutedAdapter))):
+            error = "This route cannot be checked under the configured provider policy."
         if error:
             return name_, {"ok": False, "error": error, "model": None, "simulated": False}
         if isinstance(adapter, RoutedAdapter):
@@ -351,7 +384,7 @@ class ModelRegistry:
                 "error": st.get("error"),
                 "key_hint": self.hints.get(p),
                 "has_key": p in self.keys,
-                "key_option": p in KEY_SEATS and not self.settings.trial_credits_only,
+                "key_option": self.key_route_allowed(p),
                 "routes": adapter.status()["routes"] if isinstance(adapter, RoutedAdapter) else [],
             })
         return out

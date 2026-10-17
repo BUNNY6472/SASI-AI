@@ -32,6 +32,7 @@ export default function Page() {
   const [needsKeys, setNeedsKeys] = useState(false);
   const [demoMode, setDemoMode] = useState(false);
   const [trialCreditsOnly, setTrialCreditsOnly] = useState(false);
+  const [claudeApiKeyAllowed, setClaudeApiKeyAllowed] = useState(false);
   const [trialCreditExpiresAt, setTrialCreditExpiresAt] = useState<
     string | null
   >(null);
@@ -81,6 +82,7 @@ export default function Page() {
       setNeedsKeys(p.needs_keys);
       setDemoMode(!!p.demo_mode);
       setTrialCreditsOnly(!!p.trial_credits_only);
+      setClaudeApiKeyAllowed(!!p.claude_api_key_allowed);
       setTrialCreditExpiresAt(p.trial_credit_expires_at ?? null);
       setTrialCreditWindowError(p.trial_credit_window_error ?? null);
       setVertex(p.vertex ?? null);
@@ -259,7 +261,9 @@ export default function Page() {
             {trialCreditsOnly
               ? trialCreditWindowError
                 ? "Trial access paused"
-                : "Trial credits only"
+                : claudeApiKeyAllowed
+                  ? "Vertex Gemini + Claude key"
+                  : "Trial credits only"
               : "Your private workspace"}
           </div>
         </header>
@@ -307,6 +311,7 @@ export default function Page() {
               providers={providers}
               vertex={vertex}
               trialCreditsOnly={trialCreditsOnly}
+              claudeApiKeyAllowed={claudeApiKeyAllowed}
               trialCreditExpiresAt={trialCreditExpiresAt}
               trialCreditWindowError={trialCreditWindowError}
               refresh={() => loadProviders(true)}
