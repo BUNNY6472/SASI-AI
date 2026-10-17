@@ -105,13 +105,14 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
     <div className="workspace">
       <section className="hero">
         <h1>
-          Three minds.
+          Many minds.
           <br />
           <span className="grad">One answer you can check.</span>
         </h1>
         <p className="sub">
-          Give SASI a hard question and your files. Claude, ChatGPT and Gemini each analyse it on their own, check each
-          other's work, split the job, and deliver one result showing where they agreed and disagreed.
+          Give SASI a hard question and your files. A team of up to four models (Claude and Gemini first, then the best
+          open models for the task) each analyse it on their own, check each other's work, split the job, and deliver one
+          complete result within the run's time limit.
         </p>
         <div className="agents-row">
           {providers.map((p) => (
@@ -126,8 +127,8 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
       {needsKeys && (
         <div className="notice keys-cta">
           <div>
-            <strong>Add your API keys to start.</strong> Paste your Claude, ChatGPT and Gemini keys on the Connections page.
-            They are stored on the server and never shown again.
+            <strong>Add a key to start.</strong> Paste a Claude or Gemini API key on the Connections page, or turn on Google
+            Cloud Vertex AI so no keys are needed. Keys are stored on the server and never shown again.
           </div>
           <a className="btn primary" href="#/settings">Add keys</a>
         </div>
@@ -144,7 +145,7 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
           value={request}
           onChange={(e) => setRequest(e.target.value)}
           placeholder={eris
-            ? "Paste the Eris challenge overview and rules, and attach the data files. All three build a guidebook-compliant ML solution."
+            ? "Paste the Eris challenge overview and rules, and attach the data files. The whole team builds one guidebook-compliant ML solution."
             : "Ask anything: code, research, data, planning. SASI works out what kind of job it is."}
           rows={4}
           maxLength={20000}
@@ -180,7 +181,7 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
           </label>
           <span className="small eris-note">
             {eris
-              ? "On. All three follow the Eris Solver Guidebook for the ML solution, check each other against its rules, and give dry-run steps only, never a full end-to-end run."
+              ? "On. Every model follows the Eris Solver Guidebook for the ML solution; they check each other against its rules and give dry-run steps only, never a full end-to-end run."
               : "Turn on for Eris ML challenges: guidebook rules and dry runs only."}
           </span>
         </div>
@@ -192,7 +193,7 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
           </button>
           <label className="toggle" title="Each model works on it alone first, then they read and check each other's work">
             <input type="checkbox" checked={compare} onChange={(e) => setCompare(e.target.checked)} />
-            <span>All three analyse, then compare</span>
+            <span>Every model analyses, then they compare</span>
           </label>
           <label className="toggle">
             <input type="checkbox" checked={approval} onChange={(e) => setApproval(e.target.checked)} />

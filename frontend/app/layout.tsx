@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "SASI",
-  description: "Claude, ChatGPT and Gemini collaborating on one checked result.",
+  description: "Claude, Gemini and the best open models collaborating on one checked result.",
   icons: { icon: "/logo.svg" },
 };
 

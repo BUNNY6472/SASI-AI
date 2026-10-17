@@ -19,7 +19,8 @@ from . import extract
 from . import files as files_mod
 from .config import Settings, get_settings
 from .files import FileRejected, FileStore
-from .gateway.registry import DISPLAY, PROVIDERS, ModelRegistry
+from .gateway.catalog import name
+from .gateway.registry import KEY_SEATS, ModelRegistry
 from .keys import build_key_store
 from .models import TERMINAL, ApprovePlan, CreateRun, FileRef, Login, Run, SaveKey
 from .store.memory import MemoryStore
@@ -133,18 +134,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await registry.refresh()
         return {"providers": registry.describe(), "needs_keys": registry.live_count == 0 and not settings.allow_simulated,
                 "demo_mode": registry.live_count == 0 and settings.allow_simulated, "checked_at": registry.checked_at,
-                "vertex": {"on": registry.uses_vertex, "project": settings.gcp_project, "location": settings.vertex_location,
-                           "openai_location": settings.vertex_openai_location}}
+                "vertex": {"on": registry.uses_vertex, "project": settings.gcp_project, "location": settings.vertex_location},
+                "team_size": settings.team_size}
 
     @app.get("/api/keys")
     async def keys_status():
         """Which providers have a key. Never returns the keys themselves."""
-        return [{"provider": p, "configured": p in registry.hints, "hint": registry.hints.get(p)} for p in PROVIDERS]
+        return [{"provider": p, "configured": p in registry.hints, "hint": registry.hints.get(p)} for p in KEY_SEATS]
 
     @app.put("/api/keys/{provider}")
     async def save_key(provider: str, body: SaveKey):
-        if provider not in PROVIDERS:
-            raise HTTPException(404, "Unknown provider")
+        if provider not in KEY_SEATS:
+            raise HTTPException(404, "SASI takes API keys for Claude and Gemini only. The open models run through Google Cloud.")
         key = body.key.strip()
         if not 10 <= len(key) <= 500 or any(c.isspace() for c in key):
             raise HTTPException(400, "That does not look like an API key. Paste the whole key.")
@@ -206,14 +207,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.delete("/api/keys/{provider}")
     async def delete_key(provider: str):
-        if provider not in PROVIDERS:
+        if provider not in KEY_SEATS:
             raise HTTPException(404, "Unknown provider")
         return await remove_key(provider)
 
     @app.delete("/api/keys")
     async def delete_all_keys():
         """Remove every key, for example before pasting a fresh set."""
-        results = [await remove_key(p) for p in PROVIDERS]
+        results = [await remove_key(p) for p in KEY_SEATS]
         warnings = [r["warning"] for r in results if r.get("warning")]
         return {"removed": [r["provider"] for r in results], "saved": not warnings, "warning": warnings[0] if warnings else None}
 
@@ -225,10 +226,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def limits():
         s = settings
         return {
-            "max_model_calls_per_run": s.max_model_calls_per_run,
-            "max_tokens_per_run": s.max_tokens_per_run,
-            "eris_max_tokens_per_run": s.eris_max_tokens_per_run,
+            "time_limit_minutes": s.run_time_limit_minutes,
+            "wrap_up_minutes": s.wrap_up_minutes,
+            "team_size": s.team_size,
+            "max_model_calls_per_run": s.max_model_calls_per_run,  # 0: no cap
+            "max_tokens_per_run": s.max_tokens_per_run,  # 0: no cap
+            "eris_max_tokens_per_run": s.eris_max_tokens_per_run,  # 0: no cap
             "max_output_tokens_per_call": s.max_output_tokens_per_call,
+            "eris_max_output_tokens_per_call": s.eris_max_output_tokens_per_call,
             "max_tasks_per_plan": s.max_tasks_per_plan,
             "max_revisions_per_task": s.max_revisions_per_task,
             "max_concurrent_runs": s.max_concurrent_runs,
@@ -297,7 +302,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await registry.recheck_failed()  # a key that failed before may work again
         if not registry.eligible():
             if registry.live_count:
-                why = "; ".join(f"{DISPLAY.get(p, p)}: {r}" for p, r in registry.unavailable().items())
+                why = "; ".join(f"{name(p)}: {r}" for p, r in registry.unavailable().items())
                 if registry.uses_vertex:
                     raise HTTPException(400, f"None of the models is working right now ({why}). See the Connections page.")
                 raise HTTPException(400, f"None of your API keys is working right now ({why}). Replace them on the Connections page.")

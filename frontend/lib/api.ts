@@ -1,10 +1,23 @@
-export type Provider = "claude" | "chatgpt" | "gemini";
+/** A model id from the server's catalog: "claude", "gemini" (frontier) or an open model such as "glm" or "deepseek". */
+export type Provider = string;
 
-export const PROVIDER_META: Record<Provider, { name: string; color: string }> = {
+const META: Record<string, { name: string; color: string }> = {
   claude: { name: "Claude", color: "#f6a26b" },
-  chatgpt: { name: "ChatGPT", color: "#3ddc97" },
   gemini: { name: "Gemini", color: "#7aa2ff" },
+  glm: { name: "GLM", color: "#3ddc97" },
+  deepseek: { name: "DeepSeek", color: "#b48cff" },
+  qwen: { name: "Qwen", color: "#ff7eb6" },
+  kimi: { name: "Kimi", color: "#4dd4e8" },
+  minimax: { name: "MiniMax", color: "#ffd166" },
+  gptoss: { name: "gpt-oss", color: "#9ad17a" },
+  chatgpt: { name: "ChatGPT", color: "#3ddc97" }, // runs from before the change
 };
+
+/** Name and colour for any model id, including ones this screen has not heard of. */
+export function providerMeta(id: string | null | undefined): { name: string; color: string } {
+  if (!id) return { name: "Unknown", color: "#8a93a6" };
+  return META[id] || { name: id.charAt(0).toUpperCase() + id.slice(1), color: "#8a93a6" };
+}
 
 export interface Review {
   reviewer: string;
@@ -112,6 +125,8 @@ export interface Run {
   cross_checks: Opinion[];
   consensus: Consensus | null;
   skipped?: Record<string, string>;
+  /** The models working on this run, best first. */
+  team?: string[];
   live: Record<string, LiveText>;
   status: string;
   simulated: boolean;
@@ -138,6 +153,27 @@ export interface Run {
   };
   events: RunEvent[];
   error: string | null;
+  /** Time is the run's limit. The clock pauses while the plan waits for approval. */
+  time_limit_s?: number;
+  wrap_up_s?: number;
+  used_s?: number;
+  clock_started_at?: number | null;
+  deadline_at?: number | null;
+  wrapping_up?: boolean;
+  finished_at?: number | null;
+}
+
+/** Seconds of the run's time used so far. */
+export function elapsed(run: Run, nowS = Date.now() / 1000): number {
+  return (run.used_s || 0) + (run.clock_started_at ? Math.max(0, nowS - run.clock_started_at) : 0);
+}
+
+export function clock(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}` : `${m}:${String(sec).padStart(2, "0")}`;
 }
 
 export interface RunSummary {
@@ -152,11 +188,21 @@ export interface RunSummary {
   tokens: number;
   files: number;
   score?: number | null;
+  team?: string[];
+  elapsed_s?: number;
+  time_limit_s?: number;
 }
 
 export interface ProviderStatus {
   provider: Provider;
   display_name: string;
+  /** "frontier" (Claude, Gemini) or "open" (open models on Google Cloud). */
+  tier: "frontier" | "open";
+  about: string;
+  /** Tokens the model reads in one request. */
+  context: number;
+  /** Whether SASI takes an API key for this model (Claude and Gemini only). */
+  key_option: boolean;
   connected: boolean;
   simulated: boolean;
   ok: boolean | null;
@@ -181,7 +227,6 @@ export interface VertexInfo {
   on: boolean;
   project: string;
   location: string;
-  openai_location: string;
 }
 
 export interface Profile {
@@ -275,7 +320,7 @@ export const STATUS_LABEL: Record<string, string> = {
   completed: "Completed",
   failed: "Failed",
   cancelled: "Cancelled",
-  budget_stopped: "Stopped at budget limit",
+  budget_stopped: "Stopped at a cap",
   interrupted: "Interrupted",
   pending: "Waiting",
   working: "Working",

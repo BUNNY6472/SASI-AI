@@ -60,7 +60,7 @@ export default function Page() {
   return (
     <>
       <div className="backdrop" />
-      <Scene3D active={activeProviders(liveRun)} hero={route.view === "home"} />
+      <Scene3D active={activeProviders(liveRun)} hero={route.view === "home"} team={liveRun?.team} />
       {auth === "out" && <Login onDone={() => setAuth("in")} />}
       {auth === "in" && (
         <div className="shell">

@@ -158,6 +158,7 @@ class Run(BaseModel):
     analyses: list[Opinion] = []
     cross_checks: list[Opinion] = []
     consensus: Consensus | None = None
+    team: list[str] = []  # the models working on this run, best first (chosen when it starts)
     skipped: dict[str, str] = {}  # models not taking part in this run, and why (no key, failing key)
     live: dict[str, LiveText] = {}
     status: RunStatus = "planning"
@@ -169,6 +170,18 @@ class Run(BaseModel):
     usage: Usage = Field(default_factory=Usage)
     events: list[Event] = []
     error: str | None = None
+    # Time is the run's limit. The clock pauses while the plan waits for approval.
+    time_limit_s: float = 0  # 0: no limit
+    wrap_up_s: float = 0  # the last part of the limit, kept for delivering the complete result
+    used_s: float = 0  # working time used before the clock last started
+    clock_started_at: float | None = None  # set while the clock runs
+    deadline_at: float | None = None  # when the run must be finished, while the clock runs
+    wrapping_up: bool = False
+    finished_at: float | None = None
+
+    @property
+    def elapsed_s(self) -> float:
+        return self.used_s + (now() - self.clock_started_at if self.clock_started_at else 0)
 
     def summary(self) -> dict:
         return {
@@ -184,6 +197,9 @@ class Run(BaseModel):
             "tokens": self.usage.total_tokens,
             "files": len(self.files),
             "score": self.final.score if self.final else None,
+            "team": self.team,
+            "elapsed_s": round(self.elapsed_s),
+            "time_limit_s": self.time_limit_s,
         }
 
 

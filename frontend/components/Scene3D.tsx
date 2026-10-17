@@ -2,15 +2,17 @@
 
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
-import { PROVIDER_META, Provider } from "@/lib/api";
+import { providerMeta } from "@/lib/api";
 
-const ORDER: Provider[] = ["claude", "chatgpt", "gemini"];
+const DEFAULT_TEAM = ["claude", "gemini", "glm", "deepseek"];
 
 /**
- * The SASI core: three model "agents" orbit a shared core and send energy into it
+ * The SASI core: the run's models orbit a shared core and send energy into it
  * when they are working. Pure three.js, no external assets.
  */
-export default function Scene3D({ active = [], hero = false }: { active?: string[]; hero?: boolean }) {
+export default function Scene3D({ active = [], hero = false, team }: { active?: string[]; hero?: boolean; team?: string[] }) {
+  const ORDER = team?.length ? team : DEFAULT_TEAM;
+  const teamKey = ORDER.join(",");
   const mountRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef<string[]>(active);
   activeRef.current = active;
@@ -84,9 +86,9 @@ export default function Scene3D({ active = [], hero = false }: { active?: string
     core.add(halo);
 
     // Agents.
-    type Agent = { id: Provider; mesh: THREE.Mesh; glow: THREE.Sprite; light: THREE.PointLight; beam: THREE.Line; ring: THREE.Mesh; phase: number; level: number; pulses: THREE.Mesh[] };
+    type Agent = { id: string; mesh: THREE.Mesh; glow: THREE.Sprite; light: THREE.PointLight; beam: THREE.Line; ring: THREE.Mesh; phase: number; level: number; pulses: THREE.Mesh[] };
     const agents: Agent[] = ORDER.map((id, i) => {
-      const color = new THREE.Color(PROVIDER_META[id].color);
+      const color = new THREE.Color(providerMeta(id).color);
       const mesh = new THREE.Mesh(
         new THREE.SphereGeometry(0.42, 48, 48),
         new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.5, roughness: 0.3, metalness: 0.1 }),
@@ -228,7 +230,8 @@ export default function Scene3D({ active = [], hero = false }: { active?: string
       renderer.dispose();
       mount.removeChild(renderer.domElement);
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [teamKey]);
 
   return <div ref={mountRef} className={hero ? "scene" : "scene dim"} aria-hidden="true" />;
 }

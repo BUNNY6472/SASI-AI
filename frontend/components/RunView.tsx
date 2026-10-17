@@ -1,12 +1,21 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { api, fileSize, Judgement, Opinion, PROVIDER_META, Provider, Run, Task } from "@/lib/api";
+import { api, clock, elapsed, fileSize, Judgement, Opinion, providerMeta, Run, Task } from "@/lib/api";
 import Markdown from "./Markdown";
 import { AgentChip, StatusBadge, fmt } from "./ui";
 
 const LIVE = new Set(["analyzing", "cross_checking", "planning", "reviewing_plan", "awaiting_approval", "running", "integrating"]);
-const ORDER = ["claude", "chatgpt", "gemini"];
+
+/** The run's models in team order (frontier first), plus any older run's models. */
+function teamOrder(run: Run): string[] {
+  return [...new Set([
+    ...(run.team || []),
+    ...run.analyses.map((a) => a.provider),
+    ...run.cross_checks.map((c) => c.provider),
+    ...Object.values(run.live || {}).map((l) => l.provider),
+  ])];
+}
 const FIELD_NAME: Record<string, string> = { software: "Software engineering", research: "Research and analysis", general: "General", eris: "Project Eris ML" };
 const TERMINAL = new Set(["completed", "failed", "cancelled", "budget_stopped", "interrupted"]);
 
@@ -99,7 +108,7 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
           <StatusBadge status={run.status} />
           {run.simulated && <span className="badge demo">Test agents</span>}
           {run.eris ? (
-            <span className="badge eris" title="All three follow the Eris Solver Guidebook. Dry runs only, never a full end-to-end run.">Project Eris · dry runs only</span>
+            <span className="badge eris" title="Every model follows the Eris Solver Guidebook. Dry runs only, never a full end-to-end run.">Project Eris · dry runs only</span>
           ) : (
             <span className="badge field" title="Chosen automatically from your request">{FIELD_NAME[run.profile] || run.profile}</span>
           )}
@@ -133,15 +142,15 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
         </div>
       )}
 
-      {run.skipped && Object.keys(run.skipped).length > 0 && (
-        <div className="notice warn team-note small">
-          {ORDER.some((p) => !(p in run.skipped!)) ? (
-            <b>Working with {ORDER.filter((p) => !(p in run.skipped!)).map((p) => PROVIDER_META[p as Provider].name).join(" and ")}.</b>
+      {(run.team?.length || 0) > 0 && (
+        <div className={`notice team-note small ${run.skipped && Object.keys(run.skipped).length ? "warn" : ""}`}>
+          {teamOrder(run).some((p) => !(p in (run.skipped || {}))) ? (
+            <b>Team: {joinNames(teamOrder(run).filter((p) => !(p in (run.skipped || {}))).map((p) => providerMeta(p).name))}.</b>
           ) : (
             <b>No model could take part.</b>
           )}{" "}
-          {Object.entries(run.skipped).map(([p, why]) => (
-            <span key={p}>{PROVIDER_META[p as Provider]?.name || p}: {why}. </span>
+          {Object.entries(run.skipped || {}).map(([p, why]) => (
+            <span key={p}>{providerMeta(p).name}: {why.replace(/\.+$/, "")}. </span>
           ))}
         </div>
       )}
@@ -156,6 +165,7 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
         <Stage label="Build one result" state={stageState(run, 4)} />
         <Stage label="Test and score" state={stageState(run, 5)} />
         <div className="usage">
+          <RunClock run={run} />
           {fmt(run.usage.calls)} calls · {fmt(run.usage.input_tokens + run.usage.output_tokens)} tokens
         </div>
       </div>
@@ -187,7 +197,9 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
         <article className="glass result">
           <div className="result-meta">
             <AgentChip id={run.live.final.provider} />
-            {run.final ? " is fixing what the other models found" : " is writing the one combined result"} <span className="typing" />
+            {run.wrapping_up
+              ? " is writing the complete result before the time limit"
+              : run.final ? " is fixing what the other models found" : " is writing the one combined result"} <span className="typing" />
           </div>
           <Markdown text={run.live.final.text} />
         </article>
@@ -288,7 +300,7 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
           {[...run.events].reverse().map((e, i) => (
             <div key={i} className="event">
               <span className="when">{new Date(e.at * 1000).toLocaleTimeString()}</span>
-              <span className="edot" style={{ background: PROVIDER_META[e.provider as Provider]?.color || "#7b74b8" }} />
+              <span className="edot" style={{ background: e.provider ? providerMeta(e.provider).color : "#7b74b8" }} />
               <span>{e.message}</span>
             </div>
           ))}
@@ -300,7 +312,7 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
 
 function OpinionGrid({ run, opinions, prefix, waiting, empty }: { run: Run; opinions: Opinion[]; prefix: string; waiting: boolean; empty: string }) {
   const live = Object.entries(run.live).filter(([k]) => k.startsWith(`${prefix}:`)).map(([k, v]) => ({ provider: k.slice(prefix.length + 1), text: v.text }));
-  const providers = ORDER.filter((p) => opinions.some((o) => o.provider === p) || live.some((l) => l.provider === p));
+  const providers = teamOrder(run).filter((p) => opinions.some((o) => o.provider === p) || live.some((l) => l.provider === p));
   if (!providers.length) return <p className="muted pulse">{waiting ? "Starting…" : empty}</p>;
   return (
     <div className="opinions">
@@ -308,17 +320,18 @@ function OpinionGrid({ run, opinions, prefix, waiting, empty }: { run: Run; opin
         const done = opinions.find((o) => o.provider === p);
         const writing = live.find((l) => l.provider === p);
         return (
-          <div key={p} className={`glass opinion ${writing ? "live" : ""}`} style={{ ["--c" as string]: PROVIDER_META[p as Provider]?.color }}>
+          <div key={p} className={`glass opinion ${writing ? "live" : ""}`} style={{ ["--c" as string]: providerMeta(p).color }}>
             <div className="opinion-head">
               <AgentChip id={p} />
               {writing ? <small className="ok">writing <span className="typing" /></small> : done?.error ? <small className="error">failed</small> : <small className="muted">{done?.model}</small>}
             </div>
             {done?.error && <p className="error small">{done.error}</p>}
+            {done && !done.error && !done.output && !writing && <p className="error small">No answer text came back from this model.</p>}
             <div className="opinion-body"><Markdown text={prefix === "cross" ? stripScores(writing ? writing.text : done?.output || "") : writing ? writing.text : done?.output || ""} /></div>
             {!writing && done?.scores && Object.keys(done.scores).length > 0 && (
               <div className="opinion-scores small">
                 Scores given:{" "}
-                {ORDER.filter((x) => done.scores![x] != null).map((x) => `${PROVIDER_META[x as Provider].name} ${done.scores![x]}`).join(" · ")}
+                {teamOrder(run).filter((x) => done.scores![x] != null).map((x) => `${providerMeta(x).name} ${done.scores![x]}`).join(" · ")}
               </div>
             )}
           </div>
@@ -333,6 +346,35 @@ function stripScores(text: string): string {
   const at = text.lastIndexOf("```json");
   if (at < 0 || !/"scores"|```json\s*$/.test(text.slice(at))) return text;
   return text.slice(0, at).replace(/#+\s*Scores\s*$/i, "").trimEnd();
+}
+
+function joinNames(names: string[]): string {
+  return names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+/** Time left on the run's clock, ticking while it runs. The clock pauses while the plan waits for approval. */
+function RunClock({ run }: { run: Run }) {
+  const [, tick] = useState(0);
+  const running = !!run.clock_started_at;
+  useEffect(() => {
+    if (!running) return;
+    const t = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [running]);
+  const limit = run.time_limit_s || 0;
+  if (!limit) return null;
+  const used = elapsed(run);
+  if (TERMINAL.has(run.status)) {
+    return <span className="run-clock" title="Time this run took">⏱ {clock(used)} of {clock(limit)}</span>;
+  }
+  const left = Math.max(0, limit - used);
+  const wrapAt = run.wrap_up_s || 0;
+  const cls = run.wrapping_up || left <= wrapAt ? "run-clock wrap" : "run-clock";
+  return (
+    <span className={cls} title={`Time limit ${clock(limit)}. In the last ${clock(wrapAt)} SASI stops new work and delivers the complete result.`}>
+      ⏱ {clock(left)} left{!running ? " · paused" : ""}{run.wrapping_up ? " · wrapping up" : ""}
+    </span>
+  );
 }
 
 function compareState(run: Run, idx: number): "done" | "now" | "todo" {
@@ -373,7 +415,7 @@ function List({ title, items }: { title: string; items: string[] }) {
 
 function TaskCard({ task, live, open, toggle }: { task: Task; live?: string; open: boolean; toggle: () => void }) {
   const working = ["working", "reviewing", "revising"].includes(task.status);
-  const color = PROVIDER_META[(task.status === "reviewing" ? task.reviewer : task.implementer) as Provider]?.color;
+  const color = providerMeta(task.status === "reviewing" ? task.reviewer : task.implementer).color;
   return (
     <div className={`glass task ${working ? "live" : ""} t-${task.status}`} style={{ ["--c" as string]: color || "#8f7dff" }}>
       <button className="task-head" onClick={toggle}>
@@ -463,18 +505,18 @@ function Scoreboard({ run }: { run: Run }) {
   const c = run.consensus;
   if (!c) return null;
   const ranked = Object.entries(c.average).sort((a, b) => b[1] - a[1]);
-  const name = (p: string) => PROVIDER_META[p as Provider]?.name || p;
+  const name = (p: string) => providerMeta(p).name;
   return (
     <div className="glass scoreboard">
       <h2>Team decision</h2>
       <p className="muted small">
-        Each model scored every approach. The one the others rated best becomes the base, and all three build one answer on it,
-        taking the strongest points from the rest.
+        Each model scored every approach. The one the others rated best becomes the base, and the whole team builds one answer
+        on it, taking the strongest points from the rest.
       </p>
       {ranked.map(([p, avg]) => {
         const from = Object.entries(c.votes).filter(([j, v]) => j !== p && v[p] != null).map(([j, v]) => `${name(j)} ${v[p]}`);
         return (
-          <div key={p} className={p === c.best ? "score-row best" : "score-row"} style={{ ["--c" as string]: PROVIDER_META[p as Provider]?.color }}>
+          <div key={p} className={p === c.best ? "score-row best" : "score-row"} style={{ ["--c" as string]: providerMeta(p).color }}>
             <AgentChip id={p} />
             <span className="score-bar"><i style={{ width: `${Math.max(4, avg * 10)}%` }} /></span>
             <b>{avg.toFixed(1)}</b>

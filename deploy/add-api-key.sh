@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # Store one model API key in Secret Manager. Run in Google Cloud Shell:
-#   bash deploy/add-api-key.sh claude     (or chatgpt, gemini)
+#   bash deploy/add-api-key.sh claude     (or gemini)
 # Paste the key when asked; it is not shown or saved in shell history.
 # Then re-run the "Deploy to Cloud Run" workflow in GitHub Actions so the app picks it up.
 set -euo pipefail
 PROJECT_ID="${PROJECT_ID:-sasi-511906}"
 case "${1:-}" in
   claude) NAME=ANTHROPIC_API_KEY ;;
-  chatgpt) NAME=OPENAI_API_KEY ;;
   gemini) NAME=GEMINI_API_KEY ;;
-  *) echo "usage: $0 claude|chatgpt|gemini"; exit 1 ;;
+  *) echo "usage: $0 claude|gemini  (open models run through Google Cloud and need no key)"; exit 1 ;;
 esac
 read -r -s -p "Paste the $1 API key: " KEY; echo
 [ -n "$KEY" ] || { echo "No key entered"; exit 1; }

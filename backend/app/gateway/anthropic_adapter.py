@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import anthropic
 
-from .base import ModelCall, ModelResult, ProviderError, split_attachments
+from .base import ModelCall, ModelResult, ProviderError, no_text, reply_room, split_attachments
+
+MAX_OUTPUT = 128_000
 
 
 class ClaudeAdapter:
@@ -57,7 +59,7 @@ class ClaudeAdapter:
     def _kwargs(self, call: ModelCall, model: str) -> dict:
         return dict(
             model=model,
-            max_tokens=call.max_output_tokens,
+            max_tokens=reply_room(call, MAX_OUTPUT),  # thinking counts toward this, so leave room for the answer
             system=self._system(call),
             messages=[{"role": "user", "content": self._content(call)}],
             output_config={"effort": "medium"},
@@ -74,13 +76,12 @@ class ClaudeAdapter:
         model = await self.resolve_model()
         kwargs = self._kwargs(call, model)
         try:
-            if call.on_text:
-                async with self._messages.stream(**kwargs) as stream:
-                    async for text in stream.text_stream:
+            # Always stream: long replies are only allowed as streams, and the live view needs the text anyway.
+            async with self._messages.stream(**kwargs) as stream:
+                async for text in stream.text_stream:
+                    if call.on_text:
                         await call.on_text(text)
-                    resp = await stream.get_final_message()
-            else:
-                resp = await self._messages.create(**kwargs)
+                resp = await stream.get_final_message()
         except anthropic.RateLimitError as e:
             raise ProviderError(self.provider, f"rate limited: {e}", retryable=True) from e
         except anthropic.APIStatusError as e:
@@ -93,6 +94,8 @@ class ClaudeAdapter:
         if resp.stop_reason == "refusal":
             raise ProviderError(self.provider, "the model declined this request")
         text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        if not text.strip():
+            raise no_text(self.provider, resp.stop_reason or "")
         return ModelResult(
             provider=self.provider,
             model=resp.model or model,

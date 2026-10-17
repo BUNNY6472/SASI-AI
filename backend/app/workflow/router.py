@@ -59,7 +59,8 @@ class Router:
             # Spread work across providers in a run so their strengths combine.
             s = self.history.score(p, profile) - 0.2 * load.get(f"{kind}:{p}", 0)
             ranked.append((s, p))
-        ranked.sort(key=lambda t: (-t[0], t[1]))
+        order = {p: i for i, p in enumerate(eligible)}
+        ranked.sort(key=lambda t: (-t[0], order[t[1]]))  # ties go to the model ranked higher on the team
         return ranked
 
     def pick(self, eligible: list[str], profile: str, load: dict[str, int], role: str,

@@ -35,9 +35,26 @@ class ModelCall:
         return f"{self.rules}\n\n{self.system}" if self.rules else self.system
 
 
+def reply_room(call: ModelCall, model_max: int) -> int:
+    """Tokens a model may use for one reply. Thinking models spend part of it reasoning before they write,
+    so the answer allowance gets the same again on top (at least 8,000), within the model's own maximum."""
+    return max(1_000, min(model_max, call.max_output_tokens + max(8_000, call.max_output_tokens)))
+
+
+def no_text(provider: str, stop_reason: str) -> "ProviderError":
+    """A reply with no answer text, which used to show as an empty panel."""
+    why = ("it used its whole reply allowance thinking before writing the answer"
+           if "max" in (stop_reason or "").lower() or "length" in (stop_reason or "").lower()
+           else f"stop reason: {stop_reason or 'none given'}")
+    return ProviderError(provider, f"the model returned no answer text ({why})", retryable=True)
+
+
 def split_attachments(call: ModelCall, provider: str) -> tuple[list["StoredFile"], str]:
     """Files this provider can read directly, plus prompt text for data files and ones it cannot open."""
-    from ..files import CAN_READ, DIRECT_LIMIT
+    from ..files import DIRECT_LIMIT
+    from .catalog import reads
+
+    can_read = reads(provider)
 
     media, notes = [], []
     for f in call.attachments:
@@ -46,9 +63,9 @@ def split_attachments(call: ModelCall, provider: str) -> tuple[list["StoredFile"
                          + (f.text or "Mention it if it matters.") + "]")
         elif f.kind == "text":
             notes.append(f'<file name="{f.name}" untrusted="true">\n{f.text}\n</file>')
-        elif f.kind in CAN_READ.get(provider, set()) and f.size <= DIRECT_LIMIT.get(provider, {}).get(f.kind, f.size):
+        elif f.kind in can_read and f.size <= DIRECT_LIMIT.get(provider, {}).get(f.kind, f.size):
             media.append(f)
-        elif f.kind in CAN_READ.get(provider, set()):
+        elif f.kind in can_read:
             notes.append(f"[{f.name} is too large for this model to open directly. Use the other models' analyses of it.]")
         else:
             notes.append(f"[{f.name} is a {f.kind} file this model cannot open directly. "
@@ -91,7 +108,7 @@ def is_key_problem(message: str) -> bool:
 
 
 class ProviderAdapter(Protocol):
-    provider: str  # "claude" | "chatgpt" | "gemini"
+    provider: str  # a seat id from gateway/catalog.py, e.g. "claude", "gemini", "glm"
     display_name: str
     simulated: bool
 

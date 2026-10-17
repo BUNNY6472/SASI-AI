@@ -15,7 +15,7 @@ from .config import Settings
 
 log = logging.getLogger("sasi.keys")
 
-SECRET_NAMES = {"claude": "ANTHROPIC_API_KEY", "chatgpt": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
+SECRET_NAMES = {"claude": "ANTHROPIC_API_KEY", "gemini": "GEMINI_API_KEY"}
 
 # Stored in place of a key when it is removed. Writing it needs the same permission as saving a key,
 # so removing works whenever saving works.
@@ -31,7 +31,6 @@ class EnvKeyStore:
     def __init__(self, settings: Settings):
         self._keys = {
             "claude": settings.anthropic_api_key.strip(),
-            "chatgpt": settings.openai_api_key.strip(),
             "gemini": settings.gemini_api_key.strip(),
         }
 

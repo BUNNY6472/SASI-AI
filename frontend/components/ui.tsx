@@ -1,10 +1,10 @@
 "use client";
 
-import { PROVIDER_META, Provider, STATUS_LABEL } from "@/lib/api";
+import { providerMeta, STATUS_LABEL } from "@/lib/api";
 
 export function AgentChip({ id, label }: { id: string | null | undefined; label?: string }) {
   if (!id) return <span className="chip muted">unassigned</span>;
-  const meta = PROVIDER_META[id as Provider];
+  const meta = providerMeta(id);
   return (
     <span className="chip" style={{ ["--c" as string]: meta?.color || "#999" }}>
       <span className="dot" />

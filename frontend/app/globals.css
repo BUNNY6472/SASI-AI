@@ -155,7 +155,9 @@ textarea:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 4px
 .stage.done .stage-dot { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
 .stage.now { color: var(--text); background: rgba(94, 225, 255, 0.1); }
 .stage.now .stage-dot { background: var(--accent-2); box-shadow: 0 0 12px var(--accent-2); animation: pulse 1.2s infinite; }
-.usage { margin-left: auto; color: var(--muted); font-size: 13px; }
+.usage { margin-left: auto; color: var(--muted); font-size: 13px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.run-clock { color: var(--text-2); font-variant-numeric: tabular-nums; padding: 2px 10px; border-radius: 999px; border: 1px solid rgba(94, 225, 255, 0.3); }
+.run-clock.wrap { color: #ffc65c; border-color: rgba(255, 198, 92, 0.55); }
 
 .plan-grid { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 16px; align-items: start; }
 .plan-card { padding: 18px; display: grid; gap: 14px; position: sticky; top: 80px; }

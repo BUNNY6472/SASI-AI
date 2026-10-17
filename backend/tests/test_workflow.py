@@ -55,7 +55,8 @@ def test_full_run_in_demo_mode_with_plan_approval():
 
 
 def test_budget_limit_stops_run_and_keeps_state():
-    with make_client(max_model_calls_per_run=8) as client:
+    # 4 analyses + 4 cross-checks + plan + plan review = 10 calls; the cap stops the run at the first task.
+    with make_client(max_model_calls_per_run=10) as client:
         run = client.post("/api/runs", json={"request": "Write a report", "require_plan_approval": False}).json()
         run = wait_for(client, run["id"], {"budget_stopped", "completed", "failed"})
         assert run["status"] == "budget_stopped"
@@ -84,8 +85,8 @@ def test_failing_provider_is_replaced():
         registry = client.app.state.registry
 
         class Broken:
-            provider = "chatgpt"
-            display_name = "ChatGPT"
+            provider = "glm"
+            display_name = "GLM"
             simulated = True
 
             async def list_models(self):
@@ -95,13 +96,15 @@ def test_failing_provider_is_replaced():
                 return "broken"
 
             async def generate(self, call: ModelCall) -> ModelResult:
-                raise ProviderError("chatgpt", "boom")
+                raise ProviderError("glm", "boom")
 
-        registry.adapters["chatgpt"] = Broken()
+        registry.adapters["glm"] = Broken()
         run = client.post("/api/runs", json={"request": "Plan a launch", "require_plan_approval": False}).json()
         run = wait_for(client, run["id"], {"completed", "failed"})
         assert run["status"] == "completed", run.get("error")
-        assert any(e["type"] == "provider_error" for e in run["events"])
+        failed = next(e["message"] for e in run["events"] if e["type"] == "provider_error")
+        assert failed.startswith("GLM failed") and "joins the team" in failed, "a working model takes the failed one's seat"
+        assert len(run["team"]) == 5 and "glm" in run["skipped"]
 
 
 def test_real_mode_needs_keys_before_running():
@@ -132,7 +135,8 @@ def test_keys_saved_from_app_are_never_returned(monkeypatch):
         bad = client.put("/api/keys/gemini", json={"key": "sk-bad-key-0000"})
         assert bad.status_code == 400 and "sk-bad-key-0000" not in bad.text
 
-        assert client.put("/api/keys/chatgpt", json={"key": "short"}).status_code == 400
+        assert client.put("/api/keys/gemini", json={"key": "short"}).status_code == 400
+        assert client.put("/api/keys/chatgpt", json={"key": "sk-openai-1234567890"}).status_code == 404, "no OpenAI key option"
 
         for path in ("/api/keys", "/api/providers"):
             assert secret not in client.get(path).text
@@ -164,8 +168,8 @@ def test_working_key_is_used_even_if_saving_fails(monkeypatch):
         assert client.get("/api/providers").json()["needs_keys"] is False, "key is usable right away"
 
 
-def test_files_all_three_analyse_compare_and_delete():
-    """Files reach every model, each analyses on its own, they cross-check, and delete removes everything."""
+def test_files_reach_the_whole_team_who_analyse_compare_and_delete():
+    """Files reach every model on the team, each analyses on its own, they cross-check, and delete removes everything."""
     with make_client() as client:
         csv_body = b"region,sales\nnorth,120\nsouth,80\n"
         up = client.post("/api/files", content=csv_body, headers={"X-File-Name": "sales.csv", "Content-Type": "text/csv"})
@@ -181,9 +185,10 @@ def test_files_all_three_analyse_compare_and_delete():
         assert [x["name"] for x in run["files"]] == ["sales.csv", "chart.png"]
         run = wait_for(client, run["id"], {"completed", "failed"})
         assert run["status"] == "completed", run.get("error")
-        assert {a["provider"] for a in run["analyses"]} == {"claude", "chatgpt", "gemini"}
+        assert run["team"] == ["claude", "gemini", "glm", "deepseek"], "frontier models first, then the best open models"
+        assert {a["provider"] for a in run["analyses"]} == set(run["team"])
         assert all("sales.csv" in a["output"] for a in run["analyses"]), "every model saw the files"
-        assert len(run["cross_checks"]) == 3
+        assert len(run["cross_checks"]) == 4
         assert run["live"] == {}, "live text is cleared when the run ends"
 
         store = client.app.state.store
@@ -382,8 +387,8 @@ def test_project_eris_mode_gives_every_model_the_guidebook_and_dry_runs_only():
 def test_scores_are_read_from_a_cross_check():
     from app.workflow.prompts import parse_scores
 
-    text = 'Table {not json}\n## Scores\n```json\n{"scores": {"Claude (you)": 9, "chatgpt": 11, "Gemini": "x", "Other": 5}, "best": "Claude"}\n```'
-    assert parse_scores(text, ["claude", "chatgpt", "gemini"]) == {"claude": 9.0, "chatgpt": 10.0}
+    text = 'Table {not json}\n## Scores\n```json\n{"scores": {"Claude (you)": 9, "glm": 11, "Gemini": "x", "DeepSeek": 7, "Other": 5}, "best": "Claude"}\n```'
+    assert parse_scores(text, ["claude", "glm", "gemini", "deepseek"]) == {"claude": 9.0, "glm": 10.0, "deepseek": 7.0}
     assert parse_scores("no scores here", ["claude"]) == {}
 
 
@@ -412,7 +417,7 @@ def test_models_build_one_answer_together_test_it_and_fix_it():
         assert run["status"] == "completed", run.get("error")
 
         c = run["consensus"]
-        assert c["best"] == "claude" and c["average"] == {"claude": 8.0, "chatgpt": 7.0, "gemini": 6.0}
+        assert c["best"] == "claude" and c["average"] == {"claude": 8.0, "gemini": 7.0, "glm": 6.0, "deepseek": 5.0}
         assert all(cc["scores"] for cc in run["cross_checks"])
         assert all("<team_decision>" in x.prompt and "Claude's approach as the base" in x.prompt
                    for x in seen if x.kind in ("plan", "task", "integrate") and x.hints.get("task_title") != "Final fixes")
@@ -423,8 +428,9 @@ def test_models_build_one_answer_together_test_it_and_fix_it():
         fix_calls = [x for x in seen if x.hints.get("task_title") == "Final fixes"]
         assert len(fix_calls) == 1 and "Handle an empty input file" in fix_calls[0].prompt
         judges = {j["judge"] for j in final["judges"]}
-        assert final["integrator"] not in judges and len(judges) == 2, "every other model tested the result"
-        assert len(final["judges"]) == 4 and {j["round"] for j in final["judges"]} == {0, 1}
+        assert final["integrator"] in ("claude", "gemini"), "a frontier model writes the final result"
+        assert final["integrator"] not in judges and len(judges) == 3, "every other model tested the result"
+        assert len(final["judges"]) == 6 and {j["round"] for j in final["judges"]} == {0, 1}
         assert final["score"] == 8.0, "the score is from the re-test after the fixes"
         assert not any(g.startswith("Still to fix") for g in final["gaps"])
         assert client.get("/api/runs").json()[0]["score"] == 8.0
@@ -439,7 +445,7 @@ def test_keys_can_always_be_removed_or_replaced(monkeypatch):
             return "model-x"
 
         monkeypatch.setattr(registry, "test_key", fake_test)
-        for p in ("claude", "chatgpt", "gemini"):
+        for p in ("claude", "gemini"):
             assert client.put(f"/api/keys/{p}", json={"key": f"sk-{p}-old-1234567890"}).status_code == 200
         r = client.put("/api/keys/claude", json={"key": "sk-claude-new-1234567890NEW1"})
         assert r.status_code == 200 and r.json()["hint"] == "…NEW1", "replacing works without removing first"
@@ -451,7 +457,7 @@ def test_keys_can_always_be_removed_or_replaced(monkeypatch):
         r = client.delete("/api/keys/claude")
         assert r.status_code == 200 and r.json()["saved"] is False and "PermissionError" in r.json()["warning"]
         keys = {k["provider"]: k["configured"] for k in client.get("/api/keys").json()}
-        assert keys == {"claude": False, "chatgpt": True, "gemini": True}, "the app stopped using it anyway"
+        assert keys == {"claude": False, "gemini": True}, "the app stopped using it anyway"
 
         monkeypatch.undo()
         monkeypatch.setattr(registry, "test_key", fake_test)
@@ -522,28 +528,28 @@ def test_runs_go_ahead_with_whichever_keys_work():
         registry = client.app.state.registry
         good = SimulatedAdapter("claude", 0.0)
         good.simulated = False
-        registry.adapters = {"claude": good, "chatgpt": BadKey("chatgpt"), "gemini": BadKey("gemini")}
-        registry.hints = {"claude": "…AAAA", "chatgpt": "…BBBB", "gemini": "…CCCC"}
+        registry.adapters = {"claude": good, "gemini": BadKey("gemini"), "glm": BadKey("glm")}
+        registry.hints = {"claude": "…AAAA", "gemini": "…CCCC"}
         registry.status = {p: {"ok": True} for p in registry.adapters}
 
         run = client.post("/api/runs", json={"request": "Plan a product launch", "require_plan_approval": False}).json()
         run = wait_for(client, run["id"], {"completed", "failed"})
         assert run["status"] == "completed", run.get("error")
-        assert set(run["skipped"]) == {"chatgpt", "gemini"}
+        assert set(run["skipped"]) == {"gemini", "glm"}
         assert any("Only one model was available" in x for x in run["final"]["limitations"])
         provs = {p["provider"]: p for p in client.get("/api/providers").json()["providers"]}
-        assert provs["chatgpt"]["ok"] is False and "401" in provs["chatgpt"]["error"], "the failing key shows on Connections"
+        assert provs["gemini"]["ok"] is False and "401" in provs["gemini"]["error"], "the failing key shows on Connections"
 
         calls_before = run["usage"]["by_provider"].keys()
-        assert set(calls_before) <= {"claude", "chatgpt", "gemini"}
+        assert set(calls_before) <= {"claude", "gemini", "glm"}
         second = client.post("/api/runs", json={"request": "Plan a second launch", "require_plan_approval": False}).json()
         second = wait_for(client, second["id"], {"completed", "failed"})
         assert second["status"] == "completed"
         assert set(second["usage"]["by_provider"]) == {"claude"}, "failing keys are not even tried on the next run"
         assert "no key" not in " ".join(second["skipped"].values())
-        assert any(e["type"] == "team" and e["message"].startswith("Working with Claude") for e in second["events"])
+        assert any(e["type"] == "team" and e["message"].startswith("Team for this run: Claude.") for e in second["events"])
 
-        registry.adapters = {"chatgpt": BadKey("chatgpt")}
-        registry.status = {"chatgpt": {"ok": False, "error": "HTTP 401: invalid api key"}}
+        registry.adapters = {"gemini": BadKey("gemini")}
+        registry.status = {"gemini": {"ok": False, "error": "HTTP 401: invalid api key"}}
         r = client.post("/api/runs", json={"request": "Anything at all"})
         assert r.status_code == 400 and "None of your API keys is working" in r.text

@@ -1,10 +1,13 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
-import { api, Provider, ProviderStatus, RouteStatus, VertexInfo } from "@/lib/api";
+import { api, ProviderStatus, RouteStatus, VertexInfo } from "@/lib/api";
 import { AgentChip } from "./ui";
 
 interface Limits {
+  time_limit_minutes: number;
+  wrap_up_minutes: number;
+  team_size: number;
   max_model_calls_per_run: number;
   max_tokens_per_run: number;
   max_output_tokens_per_call: number;
@@ -16,11 +19,16 @@ interface Limits {
 
 interface HistoryRow { provider: string; profile: string; attempts: number; accepted: number; score: number }
 
-const WHERE: Record<Provider, { label: string; url: string }> = {
+const WHERE: Record<string, { label: string; url: string }> = {
   claude: { label: "console.anthropic.com", url: "https://console.anthropic.com/settings/keys" },
-  chatgpt: { label: "platform.openai.com", url: "https://platform.openai.com/api-keys" },
   gemini: { label: "aistudio.google.com", url: "https://aistudio.google.com/apikey" },
 };
+
+const GARDEN = "https://console.cloud.google.com/vertex-ai/model-garden";
+
+function tokens(n: number): string {
+  return n >= 1_000_000 ? `${n / 1_000_000}M` : `${Math.round(n / 1000)}K`;
+}
 
 function RouteList({ p }: { p: ProviderStatus }) {
   const active = p.ok ? p.via : null;
@@ -80,7 +88,7 @@ function KeyForm({ p, vertexOn, onChange }: { p: ProviderStatus; vertexOn: boole
     }
   }
 
-  const where = WHERE[p.provider];
+  const where = WHERE[p.provider] || { label: "the provider's console", url: "#" };
   return (
     <form className="key-form" onSubmit={save} autoComplete="off">
       <input
@@ -109,6 +117,11 @@ function KeyForm({ p, vertexOn, onChange }: { p: ProviderStatus; vertexOn: boole
 
 function status(p: ProviderStatus): { cls: string; text: string } {
   if (!p.connected) return { cls: "muted", text: "No key yet" };
+  if (p.tier === "open") {
+    if (p.ok === false) return { cls: "warn-text", text: "Not enabled or not working" };
+    if (p.ok) return { cls: "ok", text: "Working through Google Cloud" };
+    return { cls: "muted", text: "Not checked yet" };
+  }
   if (p.ok === false) return { cls: "warn-text", text: p.has_key && p.routes.length < 2 ? "Key saved, but the last check failed" : "Not working right now" };
   if (p.via === "vertex") return { cls: "ok", text: "Connected through Google Cloud" };
   if (p.has_key) return { cls: "ok", text: `Connected · key ${p.key_hint || ""}` };
@@ -141,6 +154,9 @@ export default function Connections({ providers, vertex, refresh, reload }: {
     }
   }
 
+  const frontier = providers.filter((p) => p.tier !== "open");
+  const open = providers.filter((p) => p.tier === "open");
+
   useEffect(() => {
     api<Limits>("/api/limits").then(setLimits).catch(() => {});
     api<{ routing_history: HistoryRow[] }>("/api/stats").then((s) => setHistory(s.routing_history)).catch(() => {});
@@ -151,19 +167,22 @@ export default function Connections({ providers, vertex, refresh, reload }: {
       <h1>Connections</h1>
       {vertexOn ? (
         <p className="sub">
-          Claude, ChatGPT and Gemini run through Google Cloud Vertex AI{vertex?.project ? <> in project <code>{vertex.project}</code></> : null},
-          signed in as the app&apos;s own service account, so no API keys are needed. An API key you add is the other route:
-          if one route fails, the other takes over. ChatGPT uses its key first when you add one, because Vertex AI only
-          offers OpenAI&apos;s open-weight models. Keys are stored in Google Secret Manager and never sent back to any browser.
+          Each run gets a team of up to {limits?.team_size ?? 4} models: the frontier models Claude and Gemini first, then the open
+          models that suit the task best. They all run through Google Cloud Vertex AI
+          {vertex?.project ? <> in project <code>{vertex.project}</code></> : null}, signed in as the app&apos;s own service account,
+          so no API keys are needed. A Claude or Gemini API key you add is the backup route. Keys are stored in Google Secret
+          Manager and never sent back to any browser.
         </p>
       ) : (
         <p className="sub">
-          Paste each API key once. SASI checks it, stores it on the server in Google Secret Manager, and never sends it back
-          to any browser. Only the last 4 characters are shown so you can tell which key is saved.
+          Paste a Claude or Gemini API key. SASI checks it, stores it on the server in Google Secret Manager, and never sends
+          it back to any browser. Only the last 4 characters are shown so you can tell which key is saved. Open models need
+          Google Cloud Vertex AI to be on.
         </p>
       )}
+      <h2>Frontier models</h2>
       <div className="provider-grid">
-        {providers.map((p) => (
+        {frontier.map((p) => (
           <div key={p.provider} className="glass provider-card">
             <AgentChip id={p.provider} />
             <p className={status(p).cls}>{status(p).text}</p>
@@ -174,12 +193,39 @@ export default function Connections({ providers, vertex, refresh, reload }: {
         ))}
       </div>
       <p className="small muted">To change a key, paste the new one and press Replace key. You don&apos;t need to remove the old one first.</p>
+      {open.length > 0 && (
+        <>
+          <h2>Open models on Google Cloud</h2>
+          <p className="muted small">
+            SASI adds the open models that suit each run, best first, until the team is full. A model that does not work is
+            skipped and the next one takes its seat. These run through Google Cloud only, with no API key.
+          </p>
+          <div className="provider-grid">
+            {open.map((p) => (
+              <div key={p.provider} className="glass provider-card">
+                <AgentChip id={p.provider} />
+                <p className={status(p).cls}>{status(p).text}</p>
+                <p className="small muted">{p.about} · reads {tokens(p.context)} tokens</p>
+                {p.ok && p.model && <p className="small">Model: <code>{p.model}</code></p>}
+                {p.ok === false && p.error && <p className="error small">{p.error}</p>}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
       {vertexOn && (
         <p className="small muted">
-          If Google Cloud shows &ldquo;not working&rdquo; for Claude or ChatGPT, enable the model in Vertex AI Model Garden, then press
-          Check again.
+          If a model shows &ldquo;not working&rdquo;, enable it for your project in{" "}
+          <a href={GARDEN} target="_blank" rel="noreferrer">Vertex AI Model Garden</a> (open the model and press Enable), then
+          press Check again.
         </p>
       )}
+      <div className="glass lock-note small">
+        <b>What costs money.</b> Every call through Google Cloud is billed to your Google Cloud project, and free-trial credit
+        pays for it only where Google allows (it does not cover partner models such as Claude). The one free option is a Gemini
+        API key from Google AI Studio on its free tier: it has rate limits, and Google may use free-tier prompts to improve its
+        products.
+      </div>
       <div className="key-actions">
         <button className="btn" disabled={busy} onClick={async () => { setBusy(true); await refresh(); setBusy(false); }}>
           {busy ? "Checking…" : vertexOn ? "Check again" : "Re-check all keys"}
@@ -199,10 +245,17 @@ export default function Connections({ providers, vertex, refresh, reload }: {
 
       {limits && (
         <>
-          <h2>Budget guards</h2>
+          <h2>Run limits</h2>
+          <p className="muted small">
+            Time is the limit, not tokens or calls. In the last {limits.wrap_up_minutes} minutes SASI stops new work and delivers the
+            complete result from what is done. The clock pauses while a plan waits for your approval.
+          </p>
           <div className="glass limits">
-            <div><b>{limits.max_model_calls_per_run}</b><span>model calls per run</span></div>
-            <div><b>{limits.max_tokens_per_run.toLocaleString()}</b><span>tokens per run</span></div>
+            <div><b>{limits.time_limit_minutes} min</b><span>per run</span></div>
+            <div><b>{limits.wrap_up_minutes} min</b><span>wrap-up at the end</span></div>
+            <div><b>{limits.team_size}</b><span>models per run</span></div>
+            <div><b>{limits.max_model_calls_per_run || "No cap"}</b><span>model calls per run</span></div>
+            <div><b>{limits.max_tokens_per_run ? limits.max_tokens_per_run.toLocaleString() : "No cap"}</b><span>tokens per run</span></div>
             <div><b>{limits.max_output_tokens_per_call.toLocaleString()}</b><span>output tokens per call</span></div>
             <div><b>{limits.max_tasks_per_plan}</b><span>tasks per plan</span></div>
             <div><b>{limits.max_revisions_per_task}</b><span>revisions per task</span></div>

@@ -15,7 +15,7 @@ import json
 import re
 import zipfile
 
-TEXT_LIMIT = 60_000
+TEXT_LIMIT = 150_000  # characters per data file; models with smaller context windows get a trimmed copy (gateway/fit.py)
 MAX_INNER_BYTES = 25 * 1024 * 1024
 SAMPLE_ROWS = 200
 

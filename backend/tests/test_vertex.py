@@ -23,6 +23,27 @@ def run(coro):
 # ---------------------------------------------------------------- the requests sent to Vertex AI
 
 
+def claude_stream(model: str, text: str, stop: str = "end_turn") -> str:
+    """A Messages API stream, as Claude sends it."""
+    events = [
+        ("message_start", {"type": "message_start", "message": {
+            "id": "msg_1", "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": None,
+            "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 1, "cache_read_input_tokens": 5}}}),
+    ]
+    if text:
+        events += [
+            ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ]
+    events += [
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+                           "usage": {"output_tokens": 4}}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    return "".join(f"event: {e}\ndata: {json.dumps(d)}\n\n" for e, d in events)
+
+
 def test_claude_on_vertex_finds_a_usable_model_and_sends_no_fallback_beta():
     import anthropic
 
@@ -39,6 +60,9 @@ def test_claude_on_vertex_finds_a_usable_model_and_sends_no_fallback_beta():
             return httpx2.Response(200, json={"input_tokens": 3})
         if "/claude-opus-5-5:" in req.url.path:
             return httpx2.Response(404, json={"error": {"type": "not_found_error", "message": "not enabled"}})
+        if body.get("stream"):  # answers are always streamed
+            return httpx2.Response(200, text=claude_stream("claude-opus-5", "Hello from Vertex"),
+                                   headers={"content-type": "text/event-stream"})
         return httpx2.Response(200, json={
             "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-opus-5",
             "content": [{"type": "text", "text": "Hello from Vertex"}], "stop_reason": "end_turn", "stop_sequence": None,
@@ -54,11 +78,34 @@ def test_claude_on_vertex_finds_a_usable_model_and_sends_no_fallback_beta():
     assert result.text == "Hello from Vertex" and result.input_tokens == 15
 
     path, body, headers = seen[-1]
-    assert path == "/v1/projects/sasi-511906/locations/global/publishers/anthropic/models/claude-opus-5:rawPredict"
+    assert path == "/v1/projects/sasi-511906/locations/global/publishers/anthropic/models/claude-opus-5:streamRawPredict"
     assert headers["authorization"] == "Bearer token"
     assert body["output_config"] == {"effort": "medium"}
     assert "fallbacks" not in body and "server-side-fallback" not in headers.get("anthropic-beta", "")
     assert body["system"][0]["cache_control"] == {"type": "ephemeral"}, "the shared rules are still cached"
+
+
+def test_claude_reply_with_no_text_is_an_error_not_an_empty_answer():
+    """Why the Claude panel was empty: its thinking used the whole allowance, so the reply had no text."""
+    import anthropic
+
+    from app.gateway.vertex import VertexClaudeAdapter
+
+    sent = []
+
+    def handler(req):
+        sent.append(json.loads(req.content))
+        return httpx2.Response(200, text=claude_stream("claude-opus-5-5", "", stop="max_tokens"),
+                               headers={"content-type": "text/event-stream"})
+
+    adapter = VertexClaudeAdapter("p", "global", ["claude-opus-5-5"])
+    adapter._model = "claude-opus-5-5"
+    adapter._client = anthropic.AsyncAnthropicVertex(region="global", project_id="p", access_token="t",
+                                                     http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)))
+    with pytest.raises(ProviderError) as e:
+        run(adapter.generate(ModelCall(system="s", prompt="p", kind="analysis", max_output_tokens=12_000)))
+    assert e.value.retryable and "no answer text" in str(e.value) and "thinking" in str(e.value)
+    assert sent[0]["max_tokens"] == 24_000, "the answer allowance plus the same again for thinking"
 
 
 def test_claude_on_vertex_says_how_to_enable_it():
@@ -77,7 +124,7 @@ def test_claude_on_vertex_says_how_to_enable_it():
     assert "Model Garden" in str(e.value) and "404" in str(e.value)
 
 
-def test_openai_on_vertex_uses_the_openai_compatible_endpoint(monkeypatch):
+def test_open_model_on_vertex_uses_the_openai_compatible_endpoint(monkeypatch):
     import google.auth
     import openai
 
@@ -92,6 +139,8 @@ def test_openai_on_vertex_uses_the_openai_compatible_endpoint(monkeypatch):
     def handler(req: httpx2.Request) -> httpx2.Response:
         body = json.loads(req.content)
         seen.append((str(req.url), body, req.headers.get("authorization")))
+        if body["model"] == "zai-org/glm-5.2-maas":
+            return httpx2.Response(404, json={"error": {"message": "Publisher model not found", "code": 404}})
         if body.get("stream"):
             chunks = [
                 {"id": "c", "object": "chat.completion.chunk", "created": 1, "model": body["model"],
@@ -110,12 +159,17 @@ def test_openai_on_vertex_uses_the_openai_compatible_endpoint(monkeypatch):
     monkeypatch.setattr(openai, "AsyncOpenAI", lambda **kw: real(
         **kw, http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler))))
 
-    adapter = vertex.VertexOpenAIAdapter("", "us-central1", ["openai/gpt-oss-120b-maas"])
-    assert run(adapter.resolve_model()) == "openai/gpt-oss-120b-maas"
-    url, body, auth = seen[0]
-    assert url == ("https://us-central1-aiplatform.googleapis.com/v1/projects/sasi-511906/locations/us-central1"
-                   "/endpoints/openapi/chat/completions")
-    assert auth == "Bearer google-token", "signed with the service account's token, not an API key"
+    adapter = vertex.VertexOpenModelAdapter("glm", "GLM", "", ["zai-org/glm-5.2-maas", "zai-org/glm-5-maas"],
+                                            ["global", "us-central1"])
+    assert run(adapter.resolve_model()) == "zai-org/glm-5-maas", "the newest model this project can call is used"
+    tried = [(url, body["model"]) for url, body, _ in seen]
+    central = ("https://us-central1-aiplatform.googleapis.com/v1/projects/sasi-511906/locations/us-central1/endpoints"
+               "/openapi/chat/completions")
+    assert tried[:2] == [
+        ("https://aiplatform.googleapis.com/v1/projects/sasi-511906/locations/global/endpoints/openapi/chat/completions",
+         "zai-org/glm-5.2-maas"),
+        (central, "zai-org/glm-5.2-maas")], "each model is tried in every location before the next model"
+    assert seen[-1][2] == "Bearer google-token", "signed with the service account's token, not an API key"
 
     streamed = []
 
@@ -125,13 +179,43 @@ def test_openai_on_vertex_uses_the_openai_compatible_endpoint(monkeypatch):
     from app.files import StoredFile
 
     image = StoredFile(id="f1", name="chart.png", mime="image/png", size=10, kind="image", data=b"0123456789")
-    call = ModelCall(system="sys", prompt="Describe it", kind="task", on_text=on_text, attachments=[image])
+    call = ModelCall(system="sys", prompt="Describe it", kind="task", max_output_tokens=4000, on_text=on_text,
+                     attachments=[image])
     result = run(adapter.generate(call))
     assert result.text == "Open-weight" and streamed == ["Open", "-weight"]
     assert result.output_tokens > 0, "usage is estimated when the stream does not report it"
-    _, body, _ = seen[-1]
+    url, body, _ = seen[-1]
+    assert "/locations/global/" in url, "the location that worked is used"
     assert body["messages"][0] == {"role": "system", "content": "sys"}
+    assert body["max_tokens"] == 12_000, "room to think on top of the answer allowance"
     assert "chart.png" in body["messages"][1]["content"], "a text-only model is told about files it cannot open"
+
+
+def test_open_model_with_no_answer_text_raises_a_clear_error(monkeypatch):
+    import google.auth
+    import openai
+
+    from app.gateway import vertex
+
+    class Creds:
+        valid, token = True, "t"
+
+    monkeypatch.setattr(google.auth, "default", lambda scopes=None: (Creds(), "p"))
+
+    def handler(req: httpx2.Request) -> httpx2.Response:
+        chunk = {"id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m",
+                 "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}
+        return httpx2.Response(200, text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                               headers={"content-type": "text/event-stream"})
+
+    real = openai.AsyncOpenAI
+    monkeypatch.setattr(openai, "AsyncOpenAI", lambda **kw: real(
+        **kw, http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler))))
+    adapter = vertex.VertexOpenModelAdapter("deepseek", "DeepSeek", "p", ["m"], ["global"])
+    adapter._model, adapter._location = "m", "global"
+    with pytest.raises(ProviderError) as e:
+        run(adapter.generate(ModelCall(system="s", prompt="p", kind="task")))
+    assert e.value.retryable and "no answer text" in str(e.value) and "thinking" in str(e.value)
 
 
 def test_gemini_on_vertex_counts_tokens_to_check_and_sends_files_inline():
@@ -280,8 +364,9 @@ def test_registry_orders_routes_per_model(monkeypatch):
     registry = ModelRegistry(Settings(_env_file=None, vertex_ai=True))
     registry.apply_keys({"claude": "sk-ant-1234567890", "chatgpt": "sk-openai-1234567890"})
     order = {p: [r.via for r in a.routes] for p, a in registry.adapters.items()}
-    assert order == {"claude": ["vertex", "key"], "chatgpt": ["key", "vertex"], "gemini": ["vertex"]}, \
-        "Claude and Gemini go through Google Cloud first; ChatGPT uses the OpenAI key first for the newest GPT model"
+    assert order == {"claude": ["vertex", "key"], "gemini": ["vertex"], "glm": ["vertex"], "deepseek": ["vertex"],
+                     "qwen": ["vertex"], "kimi": ["vertex"]}, \
+        "Google Cloud first, the API key as the backup; open models run on Google Cloud only; no OpenAI key"
     registry.remove("claude")
     assert [r.via for r in registry.adapters["claude"].routes] == ["vertex"], "removing a key keeps the Google Cloud route"
 
@@ -290,8 +375,10 @@ def test_with_vertex_on_runs_need_no_keys(monkeypatch):
     with vertex_app(monkeypatch, allow_simulated=False, simulated_delay=0.0) as client:
         providers = client.get("/api/providers?refresh=true").json()
         assert providers["needs_keys"] is False and providers["vertex"]["on"] is True
+        assert [p["provider"] for p in providers["providers"]] == ["claude", "gemini", "glm", "deepseek", "qwen", "kimi"]
         for p in providers["providers"]:
             assert p["connected"] and p["has_key"] is False and p["via"] == "vertex"
+            assert p["key_option"] is (p["tier"] == "frontier"), "only Claude and Gemini take an API key"
         assert not any(k["configured"] for k in client.get("/api/keys").json()), "no API key was needed"
 
         r = client.post("/api/runs", json={"request": "Plan a product launch", "require_plan_approval": False}).json()
@@ -303,7 +390,9 @@ def test_with_vertex_on_runs_need_no_keys(monkeypatch):
             time.sleep(0.05)
         assert r["status"] == "completed", r.get("error")
         team = next(e["message"] for e in r["events"] if e["type"] == "team")
-        assert "Claude (Google Cloud)" in team and "Gemini (Google Cloud)" in team
+        assert team.startswith("Team for this run: Claude (Google Cloud), Gemini (Google Cloud), GLM (Google Cloud) and "
+                               "DeepSeek (Google Cloud). Time limit 60 min"), team
+        assert r["team"] == ["claude", "gemini", "glm", "deepseek"]
 
         assert client.delete("/api/keys").status_code == 200
         assert client.get("/api/providers").json()["needs_keys"] is False, "removing keys leaves Vertex working"

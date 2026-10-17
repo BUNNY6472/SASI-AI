@@ -8,7 +8,9 @@ import time
 from google import genai
 from google.genai import errors, types
 
-from .base import ModelCall, ModelResult, ProviderError, split_attachments
+from .base import ModelCall, ModelResult, ProviderError, no_text, reply_room, split_attachments
+
+MAX_OUTPUT = 65_536
 
 _SKIP = re.compile(r"(embedding|aqa|imagen|veo|tts|audio|image|live|lite|nano|learnlm|gemma)")
 INLINE_LIMIT = 14 * 1024 * 1024  # larger requests go through the Files API
@@ -90,7 +92,8 @@ class GeminiAdapter:
 
     async def generate(self, call: ModelCall) -> ModelResult:
         model = await self.resolve_model()
-        config = types.GenerateContentConfig(system_instruction=call.full_system, max_output_tokens=call.max_output_tokens)
+        # Gemini's thinking counts toward max_output_tokens, so leave room for the answer too.
+        config = types.GenerateContentConfig(system_instruction=call.full_system, max_output_tokens=reply_room(call, MAX_OUTPUT))
         try:
             contents = await self._contents(call)
             if call.on_text:
@@ -118,6 +121,8 @@ class GeminiAdapter:
             code = getattr(e, "code", 0) or 0
             raise ProviderError(self.provider, f"HTTP {code}: {e.message}", retryable=code == 429 or code >= 500) from e
 
+        if not text.strip():
+            raise no_text(self.provider, finish)
         return ModelResult(
             provider=self.provider,
             model=version,

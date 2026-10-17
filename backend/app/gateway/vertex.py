@@ -1,10 +1,10 @@
-"""The three models through Google Cloud Vertex AI.
+"""Models through Google Cloud Vertex AI: Claude, Gemini and the open models in the catalog.
 
 The app's own service account signs every call, so no API keys are needed and usage is billed to the
-Google Cloud project. Vertex has no model list for partner models, so each adapter tries a short list of
-model IDs, newest first, and keeps the first one this project can call. Claude and Gemini are checked by
-counting tokens, which is free; if that is not offered where the model runs, a reply of a few tokens
-settles it. OpenAI's models on Vertex are asked for a few tokens.
+Google Cloud project. Vertex has no model list for partner and open models, so each adapter tries a short
+list of model IDs, newest first, and keeps the first one this project can call. Claude and Gemini are
+checked by counting tokens, which is free; if that is not offered where the model runs, a reply of a few
+tokens settles it. Open models are asked for a few tokens.
 """
 from __future__ import annotations
 
@@ -16,16 +16,20 @@ from google import genai
 from google.genai import errors, types
 
 from .anthropic_adapter import ClaudeAdapter
-from .base import ModelCall, ModelResult, ProviderError, split_attachments
+from .base import ModelCall, ModelResult, ProviderError, no_text, reply_room, split_attachments
 from .gemini_adapter import INLINE_LIMIT, GeminiAdapter
 
 CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
-ENABLE_HINT = {
-    "claude": "Enable Claude for this project in Vertex AI Model Garden (console.cloud.google.com/vertex-ai/model-garden)",
-    "gemini": "Check that the Vertex AI API is on for this project",
-    "chatgpt": "Enable OpenAI gpt-oss for this project in Vertex AI Model Garden (console.cloud.google.com/vertex-ai/model-garden)",
-}
+GARDEN = "console.cloud.google.com/vertex-ai/model-garden"
+
+
+def _hint(provider: str) -> str:
+    if provider == "gemini":
+        return "Check that the Vertex AI API is on for this project"
+    from .catalog import name
+
+    return f"Enable {name(provider)} for this project in Vertex AI Model Garden ({GARDEN})"
 
 
 def _unique(models: list[str]) -> list[str]:
@@ -34,7 +38,7 @@ def _unique(models: list[str]) -> list[str]:
 
 def _not_found(provider: str, tried: list[str], detail: str) -> ProviderError:
     return ProviderError(provider, f"HTTP 404: none of {', '.join(tried)} can be used by this project on Vertex AI. "
-                                   f"{ENABLE_HINT[provider]}. ({detail[:160]})")
+                                   f"{_hint(provider)}. ({detail[:160]})")
 
 
 class VertexClaudeAdapter(ClaudeAdapter):
@@ -141,28 +145,30 @@ class VertexGeminiAdapter(GeminiAdapter):
         return [types.Content(role="user", parts=parts)]
 
 
-class VertexOpenAIAdapter:
-    """OpenAI's models on Vertex AI, through Vertex's OpenAI-compatible Chat Completions endpoint.
-
-    Vertex offers OpenAI's open-weight gpt-oss models, which read text only, so files reach this model as
-    text or as the other models' analyses.
+class VertexOpenModelAdapter:
+    """An open model on Vertex AI (GLM, DeepSeek, Qwen, Kimi, ...), through Vertex's OpenAI-compatible
+    Chat Completions endpoint, signed with a Google access token. These models read text only, so files
+    reach them as text, or as notes pointing to the other models' analyses.
     """
 
-    provider = "chatgpt"
-    display_name = "ChatGPT"
     simulated = False
 
-    def __init__(self, project: str, location: str, models: list[str]):
+    def __init__(self, provider: str, display_name: str, project: str, models: list[str], locations: list[str],
+                 max_output: int = 32_000):
+        self.provider = provider
+        self.display_name = display_name
         self._project = project
-        self._location = location
-        self._candidates = _unique(models)
+        # Every model ID in every location, newest model first.
+        self._candidates = [(m, loc) for m in _unique(models) for loc in _unique(locations)]
+        self._max_output = max_output
         self._model: str | None = None
+        self._location: str | None = None
         self._creds = None
         self._lock = asyncio.Lock()
-        self._client: openai.AsyncOpenAI | None = None
+        self._clients: dict[str, openai.AsyncOpenAI] = {}
 
-    async def _api(self) -> openai.AsyncOpenAI:
-        """A client signed with a fresh Google access token (tokens last an hour)."""
+    async def _api(self, location: str) -> openai.AsyncOpenAI:
+        """A client for one location, signed with a fresh Google access token (tokens last an hour)."""
         import google.auth
         import google.auth.transport.requests
 
@@ -172,71 +178,67 @@ class VertexOpenAIAdapter:
                 self._project = self._project or found or ""
             if not self._creds.valid:
                 await asyncio.to_thread(self._creds.refresh, google.auth.transport.requests.Request())
-            if self._client is None:
-                if not self._project:
-                    raise ProviderError(self.provider, "no Google Cloud project is set (GCP_PROJECT)")
-                host = "aiplatform.googleapis.com" if self._location == "global" else f"{self._location}-aiplatform.googleapis.com"
-                self._client = openai.AsyncOpenAI(
-                    base_url=f"https://{host}/v1/projects/{self._project}/locations/{self._location}/endpoints/openapi",
+            if not self._project:
+                raise ProviderError(self.provider, "no Google Cloud project is set (GCP_PROJECT)")
+            if location not in self._clients:
+                host = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
+                self._clients[location] = openai.AsyncOpenAI(
+                    base_url=f"https://{host}/v1/projects/{self._project}/locations/{location}/endpoints/openapi",
                     api_key="unused", max_retries=2)
-            return self._client.with_options(api_key=self._creds.token)
+            return self._clients[location].with_options(api_key=self._creds.token)
 
-    async def _signed(self) -> openai.AsyncOpenAI:
+    async def _signed(self, location: str) -> openai.AsyncOpenAI:
         try:
-            return await self._api()
+            return await self._api(location)
         except ProviderError:
             raise
         except Exception as e:  # noqa: BLE001 - missing or unusable Google credentials
             raise ProviderError(self.provider, f"could not sign in to Google Cloud: {type(e).__name__}: {e}") from e
 
     async def list_models(self) -> list[str]:
-        client = await self._signed()
         detail = ""
-        for m in self._candidates:
+        for m, loc in self._candidates:
+            client = await self._signed(loc)
             try:
-                await client.chat.completions.create(model=m, messages=[{"role": "user", "content": "Say OK."}], max_tokens=8)
-            except openai.NotFoundError as e:
+                await client.chat.completions.create(model=m, messages=[{"role": "user", "content": "Say OK."}], max_tokens=16)
+            except (openai.NotFoundError, openai.BadRequestError) as e:
+                if isinstance(e, openai.BadRequestError) and "not found" not in str(e).lower() and "not supported" not in str(e).lower():
+                    raise ProviderError(self.provider, f"HTTP {e.status_code}: {e.message}") from e
                 detail = e.message
                 continue
             except openai.APIStatusError as e:
                 raise ProviderError(self.provider, f"HTTP {e.status_code}: {e.message}") from e
-            self._model = m
+            self._model, self._location = m, loc
             return [m]
-        raise _not_found(self.provider, self._candidates, detail)
+        raise _not_found(self.provider, _unique([m for m, _ in self._candidates]), detail)
 
     async def resolve_model(self) -> str:
         return self._model or (await self.list_models())[0]
 
     async def generate(self, call: ModelCall) -> ModelResult:
         model = await self.resolve_model()
-        _, extra = split_attachments(call, "text-only")  # every file becomes text or a note
+        _, extra = split_attachments(call, self.provider)  # text-only: every file becomes text or a note
         messages = [{"role": "system", "content": call.full_system}, {"role": "user", "content": extra + call.prompt}]
-        # gpt-oss reasons before it answers, and that counts toward max_tokens, so leave room for it.
-        kwargs = dict(model=model, messages=messages, max_tokens=call.max_output_tokens + min(4000, call.max_output_tokens))
+        # Reasoning counts toward max_tokens, so leave room for the answer.
+        kwargs = dict(model=model, messages=messages, max_tokens=reply_room(call, self._max_output))
         text, usage, finish, served = "", None, "", model
-        client = await self._signed()
+        client = await self._signed(self._location or "global")
         try:
-            if call.on_text:
-                pieces: list[str] = []
-                stream = await client.chat.completions.create(**kwargs, stream=True)
-                async for chunk in stream:
-                    served = chunk.model or served
-                    if getattr(chunk, "usage", None):
-                        usage = chunk.usage
-                    for choice in chunk.choices or []:
-                        piece = choice.delta.content if choice.delta else None
-                        if piece:
-                            pieces.append(piece)
+            pieces: list[str] = []
+            stream = await client.chat.completions.create(**kwargs, stream=True)
+            async for chunk in stream:
+                served = chunk.model or served
+                if getattr(chunk, "usage", None):
+                    usage = chunk.usage
+                for choice in chunk.choices or []:
+                    piece = choice.delta.content if choice.delta else None
+                    if piece:
+                        pieces.append(piece)
+                        if call.on_text:
                             await call.on_text(piece)
-                        if choice.finish_reason:
-                            finish = choice.finish_reason
-                text = "".join(pieces)
-            else:
-                resp = await client.chat.completions.create(**kwargs)
-                choice = resp.choices[0] if resp.choices else None
-                text = (choice.message.content or "") if choice else ""
-                finish = (choice.finish_reason or "") if choice else ""
-                usage, served = resp.usage, resp.model or model
+                    if choice.finish_reason:
+                        finish = choice.finish_reason
+            text = "".join(pieces)
         except openai.RateLimitError as e:
             raise ProviderError(self.provider, f"rate limited: {e}", retryable=True) from e
         except openai.APIStatusError as e:
@@ -246,9 +248,11 @@ class VertexOpenAIAdapter:
         except openai.APIError as e:
             raise ProviderError(self.provider, f"API error: {e}", retryable=True) from e
 
+        if not text.strip():
+            raise no_text(self.provider, finish)
         if usage:
             tokens_in, tokens_out = usage.prompt_tokens or 0, usage.completion_tokens or 0
-        else:  # the stream did not report usage: estimate it, so the run's token limit still sees this call
+        else:  # the stream did not report usage: estimate it
             tokens_in = (len(call.full_system) + len(extra) + len(call.prompt)) // 4
             tokens_out = len(text) // 4
         return ModelResult(provider=self.provider, model=served, text=text, input_tokens=tokens_in,

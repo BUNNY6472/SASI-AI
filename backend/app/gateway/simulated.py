@@ -11,12 +11,20 @@ import json
 import random
 
 from .base import ModelCall, ModelResult
+from .catalog import SEATS, name
 
-PERSONAS = {
-    "claude": ("Claude", "careful structure and edge cases"),
-    "chatgpt": ("ChatGPT", "practical implementation detail"),
-    "gemini": ("Gemini", "breadth of alternatives and data"),
+ANGLES = {
+    "claude": "careful structure and edge cases",
+    "gemini": "breadth of alternatives and data",
+    "glm": "practical implementation detail",
+    "deepseek": "step-by-step reasoning",
+    "qwen": "clean, idiomatic code",
+    "kimi": "long-horizon planning",
 }
+
+
+def persona(provider: str) -> tuple[str, str]:
+    return name(provider), ANGLES.get(provider, "a second opinion")
 
 
 class SimulatedAdapter:
@@ -24,7 +32,7 @@ class SimulatedAdapter:
 
     def __init__(self, provider: str, delay: float = 0.6):
         self.provider = provider
-        self.display_name = PERSONAS[provider][0]
+        self.display_name = name(provider)
         self._delay = delay
 
     async def list_models(self) -> list[str]:
@@ -51,7 +59,7 @@ class SimulatedAdapter:
         )
 
     def _respond(self, call: ModelCall) -> str:
-        name, angle = PERSONAS[self.provider]
+        name_, angle = persona(self.provider)
         request = call.hints.get("request", "the request")
         if call.kind == "plan":
             return json.dumps({
@@ -77,7 +85,7 @@ class SimulatedAdapter:
             return json.dumps({
                 "verdict": verdict,
                 "score": 8 if verdict in ("pass", "accept") else 5,
-                "findings": [f"[{name}, simulated] Checked for {angle}."] + (["Add one concrete example."] if verdict == "revise" else []),
+                "findings": [f"[{name_}, simulated] Checked for {angle}."] + (["Add one concrete example."] if verdict == "revise" else []),
             })
         if call.kind == "final_eval":
             return json.dumps({
@@ -89,21 +97,21 @@ class SimulatedAdapter:
             })
         if call.kind == "analysis":
             files = ", ".join(f.name for f in call.attachments) or "no files"
-            return f"## {name}'s independent analysis\n\nLooked at: {files}.\n\n- Main finding from {angle}.\n- One uncertainty to check."
+            return f"## {name_}'s independent analysis\n\nLooked at: {files}.\n\n- Main finding from {angle}.\n- One uncertainty to check."
         if call.kind == "cross_check":
             # Every simulated model ranks the approaches the same way, so the team decision is predictable in tests.
-            scores = {"Claude": 8, "ChatGPT": 7, "Gemini": 6}
-            return (f"## {name}'s cross-check\n\n- Agrees with the others on the main finding.\n- Disagrees on one detail and explains why.\n\n"
-                    f"## Scores\n```json\n{json.dumps({'scores': scores, 'best': 'Claude'})}\n```")
+            scores = {s.name: max(1, 8 - i) for i, s in enumerate(SEATS.values())}
+            return (f"## {name_}'s cross-check\n\n- Agrees with the others on the main finding.\n- Disagrees on one detail and explains why.\n\n"
+                    f"## Scores\n```json\n{json.dumps({'scores': scores, 'best': name('claude')})}\n```")
         title = call.hints.get("task_title", "the task")
-        if call.kind == "integrate":
+        if call.kind in ("integrate", "wrap_up"):
             return (
-                f"# Result\n\n_Simulated output assembled by {name}. Connect real API keys to get real answers._\n\n"
+                f"# Result\n\n_Simulated output assembled by {name_}. Connect real API keys to get real answers._\n\n"
                 f"**Request:** {request}\n\n"
                 + "\n\n".join(f"## {t}\n{c}" for t, c in call.hints.get("sections", []))
             )
         return (
-            f"_Simulated work by {name}, focused on {angle}._\n\n"
+            f"_Simulated work by {name_}, focused on {angle}._\n\n"
             f"- Key point about **{title}** for the request.\n"
             f"- A second consideration a real model would expand on.\n"
             + ("- Added a concrete example after review.\n" if call.hints.get("is_revision") else "")

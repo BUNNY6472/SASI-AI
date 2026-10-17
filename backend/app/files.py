@@ -24,7 +24,7 @@ log = logging.getLogger("sasi.files")
 MAX_FILE_BYTES = 25 * 1024 * 1024  # Cloud Run caps a request at 32 MiB
 MAX_RUN_BYTES = 60 * 1024 * 1024
 MAX_FILES_PER_RUN = 10
-TEXT_LIMIT = 60_000  # characters of a data file that go into a prompt
+TEXT_LIMIT = 150_000  # characters of a data file that go into a prompt
 STAGE_TTL = 3 * 3600
 
 IMAGE = {"image/png", "image/jpeg", "image/webp", "image/gif"}
@@ -34,17 +34,11 @@ PDF = {"application/pdf"}
 EXTRA_TYPES = {".csv": "text/csv", ".tsv": "text/tab-separated-values", ".md": "text/markdown", ".jsonl": "application/jsonl",
                ".m4a": "audio/mp4", ".webm": "video/webm", ".mov": "video/quicktime", ".yaml": "text/yaml", ".yml": "text/yaml"}
 
-# Which kinds each model can read directly. Others get the analyses of the models that can.
-CAN_READ = {
-    "claude": {"image", "pdf", "text"},
-    "chatgpt": {"image", "pdf", "text"},
-    "gemini": {"image", "pdf", "text", "video", "audio"},
-}
+# Which kinds each model can read directly is in gateway/catalog.py. Others get the analyses of the models that can.
 
 # Per-file size limits for sending a file inline to each provider's API.
 DIRECT_LIMIT = {
     "claude": {"image": 5 * 1024 * 1024, "pdf": 30 * 1024 * 1024},
-    "chatgpt": {"image": 20 * 1024 * 1024, "pdf": 30 * 1024 * 1024},
 }
 
 

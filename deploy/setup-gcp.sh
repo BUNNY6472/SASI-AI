@@ -9,7 +9,8 @@
 #   - service account sasi-deployer  (what GitHub Actions uses to deploy)
 #   - keyless GitHub login (Workload Identity Federation) limited to the BUNNY6472/SASI-AI repo
 #   - secrets APP_ACCESS_CODE and SESSION_SECRET (random values)
-# The app calls Claude, Gemini and OpenAI's models through Vertex AI as sasi-runtime, so it needs no API keys.
+# The app calls Claude, Gemini and open models (GLM, DeepSeek, Qwen, Kimi) through Vertex AI as sasi-runtime, so it
+# needs no API keys.
 # Vertex AI usage is billed to this project. API keys entered on the Connections page are the other route.
 set -euo pipefail
 
@@ -109,10 +110,10 @@ new_secret APP_ACCESS_CODE "$ACCESS_CODE"
 new_secret SESSION_SECRET "$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
 
 echo "== Places for the model API keys (you paste the keys on the app's Connections page)"
-for name in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY; do
+for name in ANTHROPIC_API_KEY GEMINI_API_KEY; do
   gcloud secrets describe "$name" >/dev/null 2>&1 || \
     gcloud secrets create "$name" --replication-policy automatic >/dev/null
-  # The app may add a new key version and remove old ones, for these three secrets only.
+  # The app may add a new key version and remove old ones, for these secrets only.
   for role in roles/secretmanager.secretVersionManager roles/secretmanager.viewer; do
     gcloud secrets add-iam-policy-binding "$name" --member "serviceAccount:$RUNTIME_SA" \
       --role "$role" >/dev/null

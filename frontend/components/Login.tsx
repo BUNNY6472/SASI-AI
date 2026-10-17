@@ -27,7 +27,7 @@ export default function Login({ onDone }: { onDone: () => void }) {
       <form className="glass login-card" onSubmit={submit}>
         <img src="/logo.svg" alt="" width={72} height={72} className="login-logo" />
         <h1>SASI</h1>
-        <p className="sub">Claude, ChatGPT and Gemini, working as one team.</p>
+        <p className="sub">Claude, Gemini and the best open models, working as one team.</p>
         <label className="field">
           <span>Access code</span>
           <input type="password" value={code} onChange={(e) => setCode(e.target.value)} autoFocus autoComplete="current-password" />
