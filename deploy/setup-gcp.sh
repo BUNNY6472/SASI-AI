@@ -63,6 +63,23 @@ bind "$DEPLOY_SA" roles/secretmanager.viewer
 gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
   --member "serviceAccount:$DEPLOY_SA" --role roles/iam.serviceAccountUser >/dev/null
 
+# Let the person running this script start builds as sasi-builder (owners can already; this makes it explicit).
+ME=$(gcloud config get-value account 2>/dev/null || true)
+if [ -n "$ME" ]; then
+  gcloud iam service-accounts add-iam-policy-binding "$BUILD_SA" --member "user:$ME" --role roles/iam.serviceAccountUser >/dev/null && \
+    echo "  roles/iam.serviceAccountUser on sasi-builder -> $ME" || true
+fi
+
+echo "== Build source bucket"
+BUILD_BUCKET="gs://${PROJECT_ID}-sasi-build"
+if ! gcloud storage buckets describe "$BUILD_BUCKET" >/dev/null 2>&1; then
+  gcloud storage buckets create "$BUILD_BUCKET" --location "$REGION" --uniform-bucket-level-access
+fi
+# Delete uploaded sources after a day so storage stays inside the free tier.
+echo '{"rule":[{"action":{"type":"Delete"},"condition":{"age":1}}]}' > /tmp/sasi-lifecycle.json
+gcloud storage buckets update "$BUILD_BUCKET" --lifecycle-file /tmp/sasi-lifecycle.json >/dev/null
+gcloud storage buckets add-iam-policy-binding "$BUILD_BUCKET" --member "serviceAccount:$BUILD_SA" --role roles/storage.objectViewer >/dev/null
+
 echo "== Keyless GitHub login (Workload Identity Federation)"
 gcloud iam workload-identity-pools describe "$POOL" --location global >/dev/null 2>&1 || \
   gcloud iam workload-identity-pools create "$POOL" --location global --display-name "GitHub Actions"

@@ -12,11 +12,11 @@ REGION="${REGION:-us-central1}"
 SERVICE=sasi
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/sasi/${SERVICE}:build-$(date +%Y%m%d%H%M%S)"
 
-retry() {  # retry a command up to 3 times; Cloud Shell's network can drop connections
+retry() {  # retry with growing waits; covers flaky networks and new permissions still spreading
   local n=1
   until "$@"; do
-    if [ "$n" -ge 3 ]; then echo "Failed after 3 tries: $*"; return 1; fi
-    echo "Retrying in $((n * 10))s..."; sleep $((n * 10)); n=$((n + 1))
+    if [ "$n" -ge 4 ]; then echo "Failed after 4 tries: $*"; return 1; fi
+    echo "Retrying in $((n * 30))s..."; sleep $((n * 30)); n=$((n + 1))
   done
 }
 
@@ -24,14 +24,26 @@ if [ "${SKIP_SETUP:-0}" != "1" ]; then
   bash deploy/setup-gcp.sh
 fi
 
+build_on_cloud_build() {
+  gcloud builds submit . \
+    --project "$PROJECT_ID" \
+    --region "$REGION" \
+    --config deploy/cloudbuild.yaml \
+    --substitutions "_IMAGE=${IMAGE}" \
+    --service-account "projects/${PROJECT_ID}/serviceAccounts/sasi-builder@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --gcs-source-staging-dir "gs://${PROJECT_ID}-sasi-build/source"
+}
+
+build_in_cloud_shell() {
+  gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+  docker build -t "$IMAGE" . && retry docker push "$IMAGE"
+}
+
 echo "== Building the app on Cloud Build (about 5 minutes)"
-retry gcloud builds submit . \
-  --project "$PROJECT_ID" \
-  --region "$REGION" \
-  --config deploy/cloudbuild.yaml \
-  --substitutions "_IMAGE=${IMAGE}" \
-  --service-account "projects/${PROJECT_ID}/serviceAccounts/sasi-builder@${PROJECT_ID}.iam.gserviceaccount.com" \
-  --default-buckets-behavior regional-user-owned-bucket
+if ! retry build_on_cloud_build; then
+  echo "== Cloud Build did not work; building inside Cloud Shell instead"
+  build_in_cloud_shell
+fi
 
 echo "== Deploying to Cloud Run"
 SECRETS="APP_ACCESS_CODE=APP_ACCESS_CODE:latest,SESSION_SECRET=SESSION_SECRET:latest"
