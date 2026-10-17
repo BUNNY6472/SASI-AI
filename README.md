@@ -9,14 +9,15 @@ This release builds the design in the *Multi-Model Collaboration App* architectu
 | Stage | What happens | Gate before moving on |
 |---|---|---|
 | 0a. Independent analysis | Every connected model studies the request and attached files on its own, in parallel. Text appears live as each model writes | At least one analysis succeeded |
-| 0b. Cross-check | Each model reads the others' analyses and lists agreements, disagreements and mistakes | Runs when two or more analyses exist |
-| 1. Understand + plan | One model turns the request into a goal, assumptions, success criteria and a task graph | Plan is readable; falls back to a single task if not |
+| 0b. Cross-check and team decision | Each model reads the others' analyses, lists agreements, disagreements, mistakes and edge cases, and scores every approach 0-10. The approach with the best average score from the *other* models becomes the base for one answer | Runs when two or more analyses exist |
+| 1. Understand + plan | One model turns the request into a goal, assumptions, success criteria and a task graph, building on the chosen approach | Plan is readable; falls back to a single task if not |
 | 2. Plan review | A *different* model reviews the plan; the planner revises once if asked | Reviewer accepts, or one revision is done |
 | 3. Your approval | You see the plan and approve it (optional switch) | You click Approve |
 | 4. Parallel work | Tasks with no unmet dependency run at the same time on different models, each with only its own context | Required inputs were accepted |
 | 5. Cross-review | Each output is reviewed by another model: pass, revise or block. One revision, then one reassignment to another model | Pass, else the task is marked "needs your review" and dependants are blocked |
-| 6. Integrate + evaluate | One model merges the accepted work; a different model scores it against the success criteria | Done |
-| 7. Deliver | Result, who did and checked what, gaps, limitations and token usage | |
+| 6. One result | One model merges the accepted work into a single answer, never a set of alternatives | Done |
+| 7. Test, fix and score | Every other model tests that one result against the criteria and edge cases and scores it. If any finds something that must be fixed, the integrator fixes it once and they test again. The final score is their average | The other models' re-test |
+| 8. Deliver | One result with its score, who built and tested it, what was fixed, gaps, limitations and token usage | |
 
 Rules that are enforced by code, not by model opinion:
 

@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     eris_max_output_tokens_per_call: int = 12_000
     max_tasks_per_plan: int = 5
     max_revisions_per_task: int = 1
+    max_final_fix_rounds: int = 1  # the other models test the final result; the integrator fixes what they find
     max_concurrent_runs: int = 3
 
     # Storage.

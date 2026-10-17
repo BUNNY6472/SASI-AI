@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { api, fileSize, Opinion, PROVIDER_META, Provider, Run, Task } from "@/lib/api";
+import { api, fileSize, Judgement, Opinion, PROVIDER_META, Provider, Run, Task } from "@/lib/api";
 import Markdown from "./Markdown";
 import { AgentChip, StatusBadge, fmt } from "./ui";
 
@@ -140,8 +140,8 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
         <Stage label="Review plan" state={stageState(run, 1)} />
         <Stage label="Approve" state={stageState(run, 2)} />
         <Stage label={`Work ${done}/${total}`} state={stageState(run, 3)} />
-        <Stage label="Integrate" state={stageState(run, 4)} />
-        <Stage label="Deliver" state={stageState(run, 5)} />
+        <Stage label="Build one result" state={stageState(run, 4)} />
+        <Stage label="Test and score" state={stageState(run, 5)} />
         <div className="usage">
           {fmt(run.usage.calls)} calls · {fmt(run.usage.input_tokens + run.usage.output_tokens)} tokens
         </div>
@@ -166,12 +166,16 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
               <OpinionGrid run={run} opinions={run.cross_checks} prefix="cross" waiting={run.status === "cross_checking"} empty="Waiting for the analyses…" />
             </>
           )}
+          <Scoreboard run={run} />
         </div>
       )}
 
-      {tab === "result" && !run.final && run.live.final && (
+      {tab === "result" && run.live.final && (
         <article className="glass result">
-          <div className="result-meta"><AgentChip id={run.live.final.provider} /> is writing the final result <span className="typing" /></div>
+          <div className="result-meta">
+            <AgentChip id={run.live.final.provider} />
+            {run.final ? " is fixing what the other models found" : " is writing the one combined result"} <span className="typing" />
+          </div>
           <Markdown text={run.live.final.text} />
         </article>
       )}
@@ -211,21 +215,39 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
         </div>
       )}
 
-      {tab === "result" && run.final && (
+      {tab === "result" && run.final && !run.live.final && (
         <div className="result-grid">
           <article className="glass result">
+            <div className="one-banner">
+              <div>
+                <span className="eyebrow">One solution, built together</span>
+                <p className="small muted">
+                  {run.final.best_approach && <>Built on the approach of <AgentChip id={run.final.best_approach} /> · </>}
+                  written by <AgentChip id={run.final.integrator} />
+                  {lastRound(run.final.judges).length > 0 && <> · tested by {lastRound(run.final.judges).map((j) => <AgentChip key={j.judge} id={j.judge} />)}</>}
+                  {run.final.fixes > 0 && <> · fixed {run.final.fixes === 1 ? "once" : `${run.final.fixes} times`} after their tests</>}
+                </p>
+              </div>
+              {run.final.score != null ? (
+                <div className="big-score" title="Average score from the models that tested it"><b>{run.final.score}</b><small>/10</small></div>
+              ) : run.status === "integrating" ? (
+                <small className="muted">Being tested <span className="typing" /></small>
+              ) : null}
+            </div>
             <div className="result-meta">
-              Integrated by <AgentChip id={run.final.integrator} /> · evaluated by <AgentChip id={run.final.evaluator} />
-              {run.final.score != null && <span className="score">{run.final.score}/10</span>}
               <button className="btn ghost small" onClick={() => navigator.clipboard.writeText(run.final!.output)}>Copy</button>
             </div>
             <Markdown text={run.final.output} />
           </article>
           <aside className="glass evidence">
-            <h3>Evaluation</h3>
-            <p className={run.final.meets_criteria ? "ok" : "warn-text"}>
-              {run.final.meets_criteria ? "Meets the agreed criteria" : "Does not fully meet the criteria"}
-            </p>
+            <h3>Tested and scored</h3>
+            {run.status === "integrating" && <p className="muted pulse small">The other models are testing it…</p>}
+            {run.final.meets_criteria != null && (
+              <p className={run.final.meets_criteria ? "ok" : "warn-text"}>
+                {run.final.meets_criteria ? "Meets the agreed criteria" : "Does not fully meet the criteria"}
+              </p>
+            )}
+            <JudgeList judges={run.final.judges} />
             <List title="Gaps" items={run.final.gaps} />
             <List title="Limitations" items={run.final.limitations} />
             <h3>Who did what</h3>
@@ -279,12 +301,25 @@ function OpinionGrid({ run, opinions, prefix, waiting, empty }: { run: Run; opin
               {writing ? <small className="ok">writing <span className="typing" /></small> : done?.error ? <small className="error">failed</small> : <small className="muted">{done?.model}</small>}
             </div>
             {done?.error && <p className="error small">{done.error}</p>}
-            <div className="opinion-body"><Markdown text={writing ? writing.text : done?.output || ""} /></div>
+            <div className="opinion-body"><Markdown text={prefix === "cross" ? stripScores(writing ? writing.text : done?.output || "") : writing ? writing.text : done?.output || ""} /></div>
+            {!writing && done?.scores && Object.keys(done.scores).length > 0 && (
+              <div className="opinion-scores small">
+                Scores given:{" "}
+                {ORDER.filter((x) => done.scores![x] != null).map((x) => `${PROVIDER_META[x as Provider].name} ${done.scores![x]}`).join(" · ")}
+              </div>
+            )}
           </div>
         );
       })}
     </div>
   );
+}
+
+/** The scores JSON at the end of a cross-check is shown as a line under the card, not as raw code. */
+function stripScores(text: string): string {
+  const at = text.lastIndexOf("```json");
+  if (at < 0 || !/"scores"|```json\s*$/.test(text.slice(at))) return text;
+  return text.slice(0, at).replace(/#+\s*Scores\s*$/i, "").trimEnd();
 }
 
 function compareState(run: Run, idx: number): "done" | "now" | "todo" {
@@ -308,6 +343,7 @@ function stageState(run: Run, idx: number): "done" | "now" | "todo" {
     return idx < cur ? "done" : "todo";
   }
   if (run.status === "running" && !run.require_plan_approval && idx === 2) return "done";
+  if (run.status === "integrating" && run.final && !run.live.final) return idx <= 4 ? "done" : "now";
   if (idx < cur || run.status === "completed") return "done";
   return idx === cur ? "now" : "todo";
 }
@@ -380,4 +416,60 @@ function layerTasks(tasks: Task[]): Task[][] {
     (layers[d] ||= []).push(t);
   });
   return layers.filter(Boolean);
+}
+
+function lastRound(judges: Judgement[]): Judgement[] {
+  if (!judges?.length) return [];
+  const last = Math.max(...judges.map((j) => j.round));
+  return judges.filter((j) => j.round === last);
+}
+
+function JudgeList({ judges }: { judges: Judgement[] }) {
+  if (!judges?.length) return null;
+  const rounds = [...new Set(judges.map((j) => j.round))].sort((a, b) => b - a);
+  return (
+    <div className="judges">
+      {rounds.map((r) => (
+        <div key={r} className="judge-round">
+          <span className="eyebrow">{r === 0 ? "First test" : "After the fixes"}</span>
+          {judges.filter((j) => j.round === r).map((j) => (
+            <div key={j.judge} className="judge">
+              <div className="judge-head"><AgentChip id={j.judge} /><b>{j.score != null ? `${j.score}/10` : "no score"}</b></div>
+              {j.must_fix.length > 0 && (
+                <ul className="must-fix">{j.must_fix.map((m, i) => <li key={i}>{m}</li>)}</ul>
+              )}
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Scoreboard({ run }: { run: Run }) {
+  const c = run.consensus;
+  if (!c) return null;
+  const ranked = Object.entries(c.average).sort((a, b) => b[1] - a[1]);
+  const name = (p: string) => PROVIDER_META[p as Provider]?.name || p;
+  return (
+    <div className="glass scoreboard">
+      <h2>Team decision</h2>
+      <p className="muted small">
+        Each model scored every approach. The one the others rated best becomes the base, and all three build one answer on it,
+        taking the strongest points from the rest.
+      </p>
+      {ranked.map(([p, avg]) => {
+        const from = Object.entries(c.votes).filter(([j, v]) => j !== p && v[p] != null).map(([j, v]) => `${name(j)} ${v[p]}`);
+        return (
+          <div key={p} className={p === c.best ? "score-row best" : "score-row"} style={{ ["--c" as string]: PROVIDER_META[p as Provider]?.color }}>
+            <AgentChip id={p} />
+            <span className="score-bar"><i style={{ width: `${Math.max(4, avg * 10)}%` }} /></span>
+            <b>{avg.toFixed(1)}</b>
+            <small className="muted">{from.length ? `from ${from.join(" · ")}` : "own score"}</small>
+            {p === c.best && <span className="badge best">Chosen as the base</span>}
+          </div>
+        );
+      })}
+    </div>
+  );
 }

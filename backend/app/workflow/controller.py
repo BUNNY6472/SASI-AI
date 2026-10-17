@@ -22,7 +22,8 @@ from ..config import Settings
 from ..files import FileStore, StoredFile
 from ..gateway.base import ModelCall, ModelResult, ProviderError
 from ..gateway.registry import ModelRegistry
-from ..models import TERMINAL, Attempt, Event, FinalResult, LiveText, Opinion, Plan, Review, Run, Task, now
+from ..models import (TERMINAL, Attempt, Consensus, Event, FinalResult, Judgement, LiveText, Opinion, Plan, Review, Run,
+                      Task, now)
 from ..store.base import RunStore
 from . import eris, prompts
 from .profiles import AUTO_FIELDS, get_profile
@@ -348,18 +349,40 @@ class Controller:
         async def one(a: Opinion) -> None:
             others = [o for o in run.analyses if o.output and o.provider != a.provider]
             system, prompt = prompts.cross_check_prompt(run.request, a, others, profile)
-            call = ModelCall(system, prompt, "cross_check", min(5000 if run.eris else 3000, self._out_cap(run)),
+            call = ModelCall(system, prompt, "cross_check", min(5000 if run.eris else 4000, self._out_cap(run)),
                              {"request": run.request, "task_title": "Cross-check"})
             try:
                 res = await self._call(run, a.provider, call, live=(f"cross:{a.provider}", "Cross-check"))
-                run.cross_checks.append(Opinion(provider=a.provider, model=res.model, output=res.text))
-                self._event(run, "cross_check", f"{NAMES[a.provider]} compared the analyses", a.provider)
+                scores = prompts.parse_scores(res.text, [o.provider for o in ok])
+                run.cross_checks.append(Opinion(provider=a.provider, model=res.model, output=res.text, scores=scores))
+                self._event(run, "cross_check", f"{NAMES[a.provider]} compared the analyses"
+                            + (" and scored each approach" if scores else ""), a.provider)
             except ProviderError as e:
                 run.cross_checks.append(Opinion(provider=a.provider, error=str(e)))
             await self._publish(run)
 
         await self._gather(one(a) for a in ok)
+        self._decide(run)
         await self._publish(run, checkpoint=True)
+
+    def _decide(self, run: Run) -> None:
+        """Average the scores each approach got from the other models and pick the one to build the single answer on."""
+        votes = {c.provider: c.scores for c in run.cross_checks if c.scores}
+        candidates = [a.provider for a in run.analyses if a.output]
+        average: dict[str, float] = {}
+        for cand in candidates:
+            others = [v[cand] for judge, v in votes.items() if judge != cand and cand in v]
+            own = [v[cand] for judge, v in votes.items() if judge == cand and cand in v]
+            pool = others or own  # a model's score for itself counts only when nobody else scored it
+            if pool:
+                average[cand] = round(sum(pool) / len(pool), 1)
+        if not average:
+            return
+        best = max(average, key=lambda p: (average[p], -candidates.index(p)))
+        run.consensus = Consensus(best=best, average=average, votes=votes)
+        ranked = ", ".join(f"{NAMES[p]} {s:.1f}" for p, s in sorted(average.items(), key=lambda kv: -kv[1]))
+        self._event(run, "consensus", f"The models scored each other's approaches ({ranked}). "
+                    f"They build one answer together on {NAMES[best]}'s approach.", best)
 
     @staticmethod
     def _task_files(run: Run, files: list[StoredFile]) -> list[StoredFile]:
@@ -374,7 +397,7 @@ class Controller:
         self._event(run, "stage", "Understanding the request and drafting a plan")
         await self._publish(run)
 
-        shared = prompts.findings_block(run.analyses, run.cross_checks)
+        shared = prompts.findings_block(run.analyses, run.cross_checks) + prompts.consensus_block(run.consensus)
         system, prompt = prompts.plan_prompt(run.request, run.materials, profile, self.settings.max_tasks_per_plan,
                                              shared + ("\n\n" + files_mod.describe(files or []) if files else ""))
         planner, result, reason = await self._call_any(
@@ -508,7 +531,7 @@ class Controller:
         plan = run.plan
         assert plan is not None
         profile = get_profile(run.profile)
-        shared = prompts.findings_block(run.analyses, run.cross_checks, limit=4000)
+        shared = prompts.findings_block(run.analyses, run.cross_checks, limit=4000) + prompts.consensus_block(run.consensus)
         task_files = self._task_files(run, files)
         deps = [t for t in plan.tasks if t.id in task.depends_on]
         tried_implementers: set[str] = set()
@@ -583,6 +606,42 @@ class Controller:
         self._event(run, "needs_human_review", f"'{task.title}' did not pass review within the retry limit; kept as a draft for a person to check", task_id=task.id)
         await self._publish(run, checkpoint=True)
 
+    async def _judge(self, run: Run, plan: Plan, output: str, profile, judges: list[str], round_: int) -> list[Judgement]:
+        """Each judge tests the final result on its own, at the same time."""
+        system, prompt = prompts.final_eval_prompt(run.request, plan, output, profile)
+        final = run.final
+        assert final is not None
+
+        async def one(p: str) -> Judgement | None:
+            try:
+                res = await self._call(run, p, ModelCall(system, prompt, "final_eval", 2000,
+                                                         {"request": run.request, "round": round_}))
+            except ProviderError:
+                return None
+            data = prompts.parse_json(res.text) or {}
+            score = data.get("score")
+
+            def strs(key: str) -> list[str]:
+                return [str(x) for x in (data.get(key) or []) if isinstance(x, (str, int, float))][:10]
+
+            j = Judgement(judge=p, model=res.model, round=round_,
+                          score=max(0.0, min(10.0, float(score))) if isinstance(score, (int, float)) and not isinstance(score, bool) else None,
+                          meets_criteria=bool(data["meets_criteria"]) if "meets_criteria" in data else None,
+                          must_fix=strs("must_fix"), gaps=strs("gaps") or ([] if data else ["Its test reply could not be read."]))
+            for x in strs("limitations"):
+                if x not in final.limitations:
+                    final.limitations.append(x)
+            self._event(run, "judged", f"{NAMES[p]} scored the result {j.score if j.score is not None else 'n/a'}/10"
+                        + (f" and found {len(j.must_fix)} thing{'s' if len(j.must_fix) != 1 else ''} to fix" if j.must_fix else ""), p)
+            await self._publish(run)
+            return j
+
+        results = await asyncio.gather(*(one(p) for p in judges), return_exceptions=True)
+        for r in results:
+            if isinstance(r, BaseException):
+                raise r
+        return [r for r in results if r is not None]
+
     async def _integrate(self, run: Run, load: dict[str, int]) -> None:
         plan = run.plan
         assert plan is not None
@@ -599,26 +658,59 @@ class Controller:
         run.status = "integrating"
         self._event(run, "stage", f"Integrating {len(accepted)} accepted outputs")
         await self._publish(run)
-        shared = prompts.findings_block(run.analyses, run.cross_checks, limit=3000)
+        shared = prompts.findings_block(run.analyses, run.cross_checks, limit=3000) + prompts.consensus_block(run.consensus)
         system, prompt = prompts.integrate_prompt(run.request, plan, accepted, missing, profile, shared)
         integrator, result, reason = await self._call_any(run, "integrator", ModelCall(
             system, prompt, "integrate", self._out_cap(run),
             {"request": run.request, "sections": [(t.title, t.output) for t in accepted]}), load,
             live=("final", "Final result"))
-        final = FinalResult(output=result.text, integrator=integrator)
-        self._event(run, "integrated", f"{NAMES[integrator]} integrated the result", integrator)
+        final = FinalResult(output=result.text, integrator=integrator,
+                            best_approach=run.consensus.best if run.consensus else None)
+        run.final = final  # shown while the other models test it
+        self._event(run, "integrated", f"{NAMES[integrator]} wrote the single combined result", integrator)
         await self._publish(run)
 
-        system, prompt = prompts.final_eval_prompt(run.request, plan, result.text, profile)
-        evaluator, eres, _ = await self._call_any(run, "final evaluator", ModelCall(
-            system, prompt, "final_eval", 1500, {"request": run.request}), load, exclude={integrator})
-        data = prompts.parse_json(eres.text) or {}
-        final.evaluator = evaluator
-        final.meets_criteria = bool(data.get("meets_criteria")) if "meets_criteria" in data else None
-        score = data.get("score")
-        final.score = float(score) if isinstance(score, (int, float)) else None
-        final.gaps = [str(g) for g in (data.get("gaps") or [])][:12]
-        final.limitations = [str(x) for x in (data.get("limitations") or [])][:12]
+        # Every other model tests the one result; the integrator fixes what they find, then they score it again.
+        judges = [p for p in self._eligible(run) if p != integrator] or [integrator]
+        sections = [(t.title, t.output) for t in accepted]
+        latest: list[Judgement] = []
+        for round_ in range(self.settings.max_final_fix_rounds + 1):
+            self._event(run, "stage", f"{' and '.join(NAMES[p] for p in judges)} {'are' if len(judges) > 1 else 'is'} "
+                        f"{'re-testing the fixed' if round_ else 'testing the'} result against the criteria and edge cases")
+            await self._publish(run)
+            latest = await self._judge(run, plan, final.output, profile, judges, round_)
+            final.judges.extend(latest)
+            must = list(dict.fromkeys(m for j in latest for m in j.must_fix))
+            if not must or round_ == self.settings.max_final_fix_rounds:
+                break
+            self._event(run, "fixing", f"{NAMES[integrator]} is fixing {len(must)} problem{'s' if len(must) != 1 else ''} "
+                        "the other models found", integrator)
+            await self._publish(run)
+            system, prompt = prompts.fix_prompt(run.request, plan, final.output, must, profile)
+            try:
+                fixed = await self._call(run, integrator, ModelCall(
+                    system, prompt, "integrate", self._out_cap(run),
+                    {"request": run.request, "task_title": "Final fixes", "sections": sections}),
+                    live=("final", "Fixing the final result"))
+            except ProviderError:
+                final.limitations.append("These problems found by the other models could not be fixed: " + "; ".join(must[:5]))
+                break
+            final.output = fixed.text
+            final.fixes += 1
+            await self._publish(run)
+
+        scores = [j.score for j in latest if j.score is not None]
+        final.score = round(sum(scores) / len(scores), 1) if scores else None
+        verdicts = [j.meets_criteria for j in latest if j.meets_criteria is not None]
+        final.meets_criteria = all(verdicts) if verdicts else None
+        final.evaluator = latest[0].judge if latest else None
+        still = list(dict.fromkeys(m for j in latest for m in j.must_fix))
+        final.gaps = (["Still to fix: " + m for m in still] + list(dict.fromkeys(g for j in latest for g in j.gaps)))[:12]
+        final.limitations = final.limitations[:12]
+        if not latest:
+            final.limitations.append("No other model was available to test and score the final result.")
+        elif judges == [integrator]:
+            final.limitations.append("Only one model was available, so it scored its own result.")
         if missing:
             final.limitations.insert(0, "Unfinished (did not pass review): " + ", ".join(t.title for t in missing))
         if any(t.assurance == "self-reviewed" for t in accepted):
@@ -626,5 +718,7 @@ class Controller:
         final.limitations.append("Assurance level: evidence-reviewed by independent models, not objectively tested. Check important results yourself.")
         run.final = final
         run.status = "completed"
-        self._event(run, "completed", f"Delivered. {NAMES[evaluator]} evaluated it: {'meets' if final.meets_criteria else 'does not fully meet'} the criteria", evaluator)
+        who = " and ".join(dict.fromkeys(NAMES.get(j.judge, j.judge) for j in latest)) or "no other model"
+        self._event(run, "completed", f"Delivered one result, scored {final.score if final.score is not None else 'n/a'}/10 by {who}"
+                    + (f" after {final.fixes} round of fixes" if final.fixes else ""), final.evaluator)
         await self._publish(run, checkpoint=True)

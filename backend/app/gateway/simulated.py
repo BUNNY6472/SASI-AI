@@ -83,6 +83,7 @@ class SimulatedAdapter:
             return json.dumps({
                 "meets_criteria": True,
                 "score": 8,
+                "must_fix": [],
                 "gaps": [],
                 "limitations": ["Produced by simulated agents. Add API keys for real answers."],
             })
@@ -90,7 +91,10 @@ class SimulatedAdapter:
             files = ", ".join(f.name for f in call.attachments) or "no files"
             return f"## {name}'s independent analysis\n\nLooked at: {files}.\n\n- Main finding from {angle}.\n- One uncertainty to check."
         if call.kind == "cross_check":
-            return f"## {name}'s cross-check\n\n- Agrees with the others on the main finding.\n- Disagrees on one detail and explains why."
+            # Every simulated model ranks the approaches the same way, so the team decision is predictable in tests.
+            scores = {"Claude": 8, "ChatGPT": 7, "Gemini": 6}
+            return (f"## {name}'s cross-check\n\n- Agrees with the others on the main finding.\n- Disagrees on one detail and explains why.\n\n"
+                    f"## Scores\n```json\n{json.dumps({'scores': scores, 'best': 'Claude'})}\n```")
         title = call.hints.get("task_title", "the task")
         if call.kind == "integrate":
             return (

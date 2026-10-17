@@ -70,7 +70,24 @@ export interface Opinion {
   model: string;
   output: string;
   error: string | null;
+  scores?: Record<string, number>;
   at: number;
+}
+
+export interface Consensus {
+  best: string;
+  average: Record<string, number>;
+  votes: Record<string, Record<string, number>>;
+}
+
+export interface Judgement {
+  judge: string;
+  model: string;
+  score: number | null;
+  meets_criteria: boolean | null;
+  must_fix: string[];
+  gaps: string[];
+  round: number;
 }
 
 export interface LiveText {
@@ -93,6 +110,7 @@ export interface Run {
   files: FileRef[];
   analyses: Opinion[];
   cross_checks: Opinion[];
+  consensus: Consensus | null;
   live: Record<string, LiveText>;
   status: string;
   simulated: boolean;
@@ -107,6 +125,9 @@ export interface Run {
     score: number | null;
     gaps: string[];
     limitations: string[];
+    judges: Judgement[];
+    fixes: number;
+    best_approach: string | null;
   } | null;
   usage: {
     calls: number;
@@ -129,6 +150,7 @@ export interface RunSummary {
   tasks: number;
   tokens: number;
   files: number;
+  score?: number | null;
 }
 
 export interface ProviderStatus {

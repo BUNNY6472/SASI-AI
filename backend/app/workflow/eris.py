@@ -24,6 +24,18 @@ CHECKS: list[str] = [
     "Domain rules: the guidebook's rules for this kind of challenge (CV, NLP, RAG, fine-tuning, from-scratch, bio/chem) are followed, grey areas are named, and the challenge's own real restrictions win",
 ]
 
+# Edge cases the models test every Eris solution against.
+EDGE_CASES: list[str] = [
+    "submission.csv: every test id exactly once, in the expected order and count, with the exact column names and dtypes",
+    "missing values, unseen categories or new labels in the test data",
+    "columns whose type differs between train and test (numbers read as text, dates, ids)",
+    "class imbalance and rare classes in the validation split (stratified or grouped folds where needed)",
+    "leakage between train and validation (duplicate rows, groups, time order)",
+    "GPU memory on the 24 GB A10G: batch size, sequence length or image size, mixed precision",
+    "very long, empty or oddly encoded texts; corrupt or odd-sized images",
+    "the prediction format the metric needs: probabilities or labels, clipping, rounding",
+]
+
 DRY_RUN = (
     "DRY RUNS ONLY. Never run, and never tell the user to run, the full end-to-end training: a full run on the test "
     "environment costs a submission credit and up to 1.5 hours. Never claim you ran or measured anything. Verify with dry "

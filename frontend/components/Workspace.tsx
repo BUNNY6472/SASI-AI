@@ -227,7 +227,7 @@ export default function Workspace({ open, needsKeys, providers }: { open: (id: s
               </div>
               <p>{r.request}</p>
               <div className="muted small">
-                {r.eris ? "Project Eris" : r.profile} · {r.tasks} tasks{r.files ? ` · ${r.files} files` : ""} · {fmt(r.tokens)} tokens{r.simulated ? " · test run" : ""}
+                {r.eris ? "Project Eris" : r.profile} · {r.tasks} tasks{r.files ? ` · ${r.files} files` : ""} · {fmt(r.tokens)} tokens{r.score != null ? ` · scored ${r.score}/10` : ""}{r.simulated ? " · test run" : ""}
               </div>
             </button>
           ))}

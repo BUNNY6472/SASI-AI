@@ -377,3 +377,54 @@ def test_project_eris_mode_gives_every_model_the_guidebook_and_dry_runs_only():
         assert normal["eris"] is False and normal["profile"] != "eris"
         wait_for(client, normal["id"], {"completed", "failed"})
         assert seen and not any(c.rules for c in seen), "normal runs are unchanged"
+
+
+def test_scores_are_read_from_a_cross_check():
+    from app.workflow.prompts import parse_scores
+
+    text = 'Table {not json}\n## Scores\n```json\n{"scores": {"Claude (you)": 9, "chatgpt": 11, "Gemini": "x", "Other": 5}, "best": "Claude"}\n```'
+    assert parse_scores(text, ["claude", "chatgpt", "gemini"]) == {"claude": 9.0, "chatgpt": 10.0}
+    assert parse_scores("no scores here", ["claude"]) == {}
+
+
+def test_models_build_one_answer_together_test_it_and_fix_it():
+    """They score each other's approaches, build one answer on the best, every other model tests it, and it is fixed once."""
+    with make_client() as client:
+        registry = client.app.state.registry
+        seen: list[ModelCall] = []
+        for adapter in registry.adapters.values():
+            original = adapter.generate
+
+            async def spy(call: ModelCall, original=original) -> ModelResult:
+                seen.append(call)
+                result = await original(call)
+                if call.kind == "final_eval" and call.hints.get("round") == 0:
+                    import json as _json
+                    data = _json.loads(result.text)
+                    data["must_fix"], data["score"] = ["Handle an empty input file"], 5
+                    result.text = _json.dumps(data)
+                return result
+
+            adapter.generate = spy
+
+        run = client.post("/api/runs", json={"request": "Analyse churn and recommend one plan", "require_plan_approval": False}).json()
+        run = wait_for(client, run["id"], {"completed", "failed"})
+        assert run["status"] == "completed", run.get("error")
+
+        c = run["consensus"]
+        assert c["best"] == "claude" and c["average"] == {"claude": 8.0, "chatgpt": 7.0, "gemini": 6.0}
+        assert all(cc["scores"] for cc in run["cross_checks"])
+        assert all("<team_decision>" in x.prompt and "Claude's approach as the base" in x.prompt
+                   for x in seen if x.kind in ("plan", "task", "integrate") and x.hints.get("task_title") != "Final fixes")
+
+        final = run["final"]
+        assert final["best_approach"] == "claude"
+        assert final["fixes"] == 1, "the integrator fixed what the other models found"
+        fix_calls = [x for x in seen if x.hints.get("task_title") == "Final fixes"]
+        assert len(fix_calls) == 1 and "Handle an empty input file" in fix_calls[0].prompt
+        judges = {j["judge"] for j in final["judges"]}
+        assert final["integrator"] not in judges and len(judges) == 2, "every other model tested the result"
+        assert len(final["judges"]) == 4 and {j["round"] for j in final["judges"]} == {0, 1}
+        assert final["score"] == 8.0, "the score is from the re-test after the fixes"
+        assert not any(g.startswith("Still to fix") for g in final["gaps"])
+        assert client.get("/api/runs").json()[0]["score"] == 8.0

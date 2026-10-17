@@ -82,14 +82,30 @@ class Event(BaseModel):
     task_id: str | None = None
 
 
+class Judgement(BaseModel):
+    """One model's test of the final result: its score and what must be fixed."""
+
+    judge: str
+    model: str = ""
+    score: float | None = None
+    meets_criteria: bool | None = None
+    must_fix: list[str] = []
+    gaps: list[str] = []
+    round: int = 0  # 0 = first check, 1 = after the fixes
+    at: float = Field(default_factory=now)
+
+
 class FinalResult(BaseModel):
     output: str = ""
     integrator: str | None = None
     evaluator: str | None = None
     meets_criteria: bool | None = None
-    score: float | None = None
+    score: float | None = None  # average of the other models' scores on the last check
     gaps: list[str] = []
     limitations: list[str] = []
+    judges: list[Judgement] = []
+    fixes: int = 0  # rounds of fixes after the other models tested it
+    best_approach: str | None = None  # whose approach the single solution was built on
 
 
 class FileRef(BaseModel):
@@ -107,7 +123,16 @@ class Opinion(BaseModel):
     model: str = ""
     output: str = ""
     error: str | None = None
+    scores: dict[str, float] = {}  # cross-checks only: this model's 0-10 score for each approach, by provider
     at: float = Field(default_factory=now)
+
+
+class Consensus(BaseModel):
+    """The models' scores for each other's approaches, and the one they build the single answer on."""
+
+    best: str
+    average: dict[str, float] = {}  # approach (provider) -> average score from the other models
+    votes: dict[str, dict[str, float]] = {}  # judge -> approach -> score
 
 
 class LiveText(BaseModel):
@@ -132,6 +157,7 @@ class Run(BaseModel):
     files: list[FileRef] = []
     analyses: list[Opinion] = []
     cross_checks: list[Opinion] = []
+    consensus: Consensus | None = None
     live: dict[str, LiveText] = {}
     status: RunStatus = "planning"
     simulated: bool = False
@@ -156,6 +182,7 @@ class Run(BaseModel):
             "tasks": len(self.plan.tasks) if self.plan else 0,
             "tokens": self.usage.total_tokens,
             "files": len(self.files),
+            "score": self.final.score if self.final else None,
         }
 
 
