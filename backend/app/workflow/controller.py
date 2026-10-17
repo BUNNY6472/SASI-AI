@@ -27,6 +27,7 @@ from ..models import (TERMINAL, Attempt, Consensus, Event, FinalResult, Judgemen
 from ..store.base import RunStore
 from . import eris, prompts
 from .profiles import AUTO_FIELDS, get_profile
+from ..gateway.registry import is_key_problem
 from .router import PerformanceHistory, Router
 
 log = logging.getLogger("sasi.controller")
@@ -204,6 +205,7 @@ class Controller:
         adapter = self.registry.adapters.get(provider)
         if adapter is None:  # its key was removed while the run was going
             self._unhealthy.setdefault(run.id, set()).add(provider)
+            run.skipped[provider] = "its key was removed during the run"
             raise ProviderError(provider, "its key was removed")
         call.max_output_tokens = min(call.max_output_tokens, self._out_cap(run))
         if run.eris:
@@ -239,7 +241,13 @@ class Controller:
             self._record(run, call, result)
             return result
         self._unhealthy.setdefault(run.id, set()).add(provider)
-        self._event(run, "provider_error", f"{NAMES[provider]} failed and is skipped for the rest of this run: {last}", provider)
+        reason = str(last or "unknown error")
+        if is_key_problem(reason):
+            self.registry.mark_failed(provider, reason)  # later runs skip it until the key passes a check again
+        run.skipped[provider] = f"failed during the run: {reason[:200]}"
+        others = [NAMES[p] for p in self.registry.eligible() if p not in self._unhealthy.get(run.id, set())]
+        self._event(run, "provider_error", f"{NAMES[provider]} failed and is skipped for the rest of this run: {reason[:200]}. "
+                    + (f"{' and '.join(others)} carr{'y' if len(others) > 1 else 'ies'} on." if others else ""), provider)
         raise last or ProviderError(provider, "unknown error")
 
     async def _call_any(self, run: Run, role: str, call: ModelCall, load: dict[str, int],
@@ -260,9 +268,22 @@ class Controller:
 
     # ------------------------------------------------------------------ main flow
 
+    def _note_team(self, run: Run) -> None:
+        """Say which models take part, so a run with one or two working keys still goes ahead, and the user knows why."""
+        run.skipped = self.registry.unavailable()
+        working = [p for p in self.registry.eligible()]
+        if not working:
+            return
+        names = [NAMES[p] for p in working]
+        msg = "Working with " + (", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else names[0])
+        if run.skipped:
+            msg += ". Skipped: " + "; ".join(f"{NAMES[p]} ({why})" for p, why in run.skipped.items())
+        self._event(run, "team", msg)
+
     async def _execute(self, run: Run) -> None:
         load: dict[str, int] = {}
         try:
+            self._note_team(run)
             files = await self.files.get(run.id) if run.files else []
             if run.compare_all and not run.analyses:
                 await self._analyze(run, files)

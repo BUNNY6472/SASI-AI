@@ -496,3 +496,54 @@ def test_secret_manager_remove_writes_a_marker_and_destroys_old_versions():
     assert store._read("claude") == ""
     enabled = [d for st, d in store._client.versions.values() if st == "ENABLED"]
     assert enabled == [REMOVED], "only the removal marker is left"
+
+
+def test_runs_go_ahead_with_whichever_keys_work():
+    """With two failing keys, the run finishes on the one that works; failing keys are skipped next time and named."""
+    from app.gateway.simulated import SimulatedAdapter
+
+    class BadKey:
+        simulated = False
+
+        def __init__(self, provider):
+            self.provider = provider
+            self.display_name = provider
+
+        async def list_models(self):
+            raise ProviderError(self.provider, "HTTP 401: invalid api key")
+
+        async def resolve_model(self):
+            return "x"
+
+        async def generate(self, call):
+            raise ProviderError(self.provider, "HTTP 401: invalid api key")
+
+    with make_client(allow_simulated=False) as client:
+        registry = client.app.state.registry
+        good = SimulatedAdapter("claude", 0.0)
+        good.simulated = False
+        registry.adapters = {"claude": good, "chatgpt": BadKey("chatgpt"), "gemini": BadKey("gemini")}
+        registry.hints = {"claude": "…AAAA", "chatgpt": "…BBBB", "gemini": "…CCCC"}
+        registry.status = {p: {"ok": True} for p in registry.adapters}
+
+        run = client.post("/api/runs", json={"request": "Plan a product launch", "require_plan_approval": False}).json()
+        run = wait_for(client, run["id"], {"completed", "failed"})
+        assert run["status"] == "completed", run.get("error")
+        assert set(run["skipped"]) == {"chatgpt", "gemini"}
+        assert any("Only one model was available" in x for x in run["final"]["limitations"])
+        provs = {p["provider"]: p for p in client.get("/api/providers").json()["providers"]}
+        assert provs["chatgpt"]["ok"] is False and "401" in provs["chatgpt"]["error"], "the failing key shows on Connections"
+
+        calls_before = run["usage"]["by_provider"].keys()
+        assert set(calls_before) <= {"claude", "chatgpt", "gemini"}
+        second = client.post("/api/runs", json={"request": "Plan a second launch", "require_plan_approval": False}).json()
+        second = wait_for(client, second["id"], {"completed", "failed"})
+        assert second["status"] == "completed"
+        assert set(second["usage"]["by_provider"]) == {"claude"}, "failing keys are not even tried on the next run"
+        assert "no key" not in " ".join(second["skipped"].values())
+        assert any(e["type"] == "team" and e["message"].startswith("Working with Claude") for e in second["events"])
+
+        registry.adapters = {"chatgpt": BadKey("chatgpt")}
+        registry.status = {"chatgpt": {"ok": False, "error": "HTTP 401: invalid api key"}}
+        r = client.post("/api/runs", json={"request": "Anything at all"})
+        assert r.status_code == 400 and "None of your API keys is working" in r.text

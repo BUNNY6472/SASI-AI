@@ -25,7 +25,7 @@ Rules that are enforced by code, not by model opinion:
 - A model never reviews its own work while another provider is available. If it has to, the result is labelled *self-reviewed*.
 - Every accepted step records its assurance level. This release only does model review, so results are *evidence-reviewed*, never "tested" or "verified".
 - Budget guards per run: model calls, total tokens, output tokens per call, tasks per plan, revisions per task, and runs at once. Hitting a limit stops the run and keeps accepted work.
-- A provider that fails is retried once for temporary errors, then skipped for the rest of that run, and its work goes to another model.
+- Runs go ahead with whichever models work: one, two or three. A model with no key or a failing key is skipped and the run says so. A provider that fails mid-run is retried once for temporary errors, then skipped for the rest of that run, and its work goes to another model. A key that is rejected or out of credit is skipped in later runs until it passes a check again, which happens before each run.
 - Pasted reference material is passed to models as untrusted data, never as instructions.
 - Model output is sanitized before it is shown in the browser.
 

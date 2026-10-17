@@ -133,6 +133,19 @@ export default function RunView({ id, onRun, back }: { id: string; onRun: (r: Ru
         </div>
       )}
 
+      {run.skipped && Object.keys(run.skipped).length > 0 && (
+        <div className="notice warn team-note small">
+          {ORDER.some((p) => !(p in run.skipped!)) ? (
+            <b>Working with {ORDER.filter((p) => !(p in run.skipped!)).map((p) => PROVIDER_META[p as Provider].name).join(" and ")}.</b>
+          ) : (
+            <b>No model could take part.</b>
+          )}{" "}
+          {Object.entries(run.skipped).map(([p, why]) => (
+            <span key={p}>{PROVIDER_META[p as Provider]?.name || p}: {why}. </span>
+          ))}
+        </div>
+      )}
+
       <div className="progress-strip glass">
         {run.compare_all && <Stage label="Analyse" state={compareState(run, 0)} />}
         {run.compare_all && <Stage label="Compare" state={compareState(run, 1)} />}

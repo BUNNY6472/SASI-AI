@@ -111,6 +111,7 @@ export interface Run {
   analyses: Opinion[];
   cross_checks: Opinion[];
   consensus: Consensus | null;
+  skipped?: Record<string, string>;
   live: Record<string, LiveText>;
   status: string;
   simulated: boolean;

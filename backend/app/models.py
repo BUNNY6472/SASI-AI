@@ -158,6 +158,7 @@ class Run(BaseModel):
     analyses: list[Opinion] = []
     cross_checks: list[Opinion] = []
     consensus: Consensus | None = None
+    skipped: dict[str, str] = {}  # models not taking part in this run, and why (no key, failing key)
     live: dict[str, LiveText] = {}
     status: RunStatus = "planning"
     simulated: bool = False

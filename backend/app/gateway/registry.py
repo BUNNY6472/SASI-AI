@@ -77,18 +77,47 @@ class ModelRegistry:
             return live
         return [p for p, a in self.adapters.items() if a.simulated]
 
-    async def refresh(self) -> dict[str, dict]:
-        async def check(name: str, adapter: ProviderAdapter) -> tuple[str, dict]:
-            try:
-                model = await asyncio.wait_for(adapter.resolve_model(), timeout=20)
-                return name, {"ok": True, "model": model, "simulated": adapter.simulated}
-            except Exception as e:  # noqa: BLE001 - surfaced to the UI
-                return name, {"ok": False, "model": None, "simulated": adapter.simulated, "error": str(e)[:300]}
+    @staticmethod
+    async def _check(name: str, adapter: ProviderAdapter, timeout: float = 20) -> tuple[str, dict]:
+        """Listing models proves the key still works (it costs no tokens)."""
+        try:
+            await asyncio.wait_for(adapter.list_models(), timeout=timeout)
+            model = await asyncio.wait_for(adapter.resolve_model(), timeout=timeout)
+            return name, {"ok": True, "model": model, "simulated": adapter.simulated}
+        except Exception as e:  # noqa: BLE001 - surfaced to the UI
+            return name, {"ok": False, "model": None, "simulated": adapter.simulated, "error": str(e)[:300]}
 
-        results = await asyncio.gather(*(check(n, a) for n, a in self.adapters.items()))
+    async def refresh(self) -> dict[str, dict]:
+        results = await asyncio.gather(*(self._check(n, a) for n, a in self.adapters.items()))
         self.status = dict(results)
         self.checked_at = time.time()
         return self.status
+
+    def mark_failed(self, provider: str, error: str) -> None:
+        """A key failed during a run (rejected, or out of credit): skip it until it passes a check again."""
+        if provider in self.adapters:
+            self.status[provider] = {**self.status.get(provider, {}), "ok": False, "error": error[:300]}
+
+    async def recheck_failed(self, timeout: float = 12) -> None:
+        """Before a run, check again the keys that failed, so a fixed key (or a topped-up account) is used again."""
+        failed = [(p, a) for p, a in self.adapters.items() if self.status.get(p, {}).get("ok") is False]
+        if failed:
+            for name, st in await asyncio.gather(*(self._check(p, a, timeout) for p, a in failed)):
+                self.status[name] = st
+
+    def unavailable(self) -> dict[str, str]:
+        """Why each model can't take part right now: no key, or a key that is failing."""
+        out = {}
+        working = set(self.eligible())
+        for p in PROVIDERS:
+            if p in working:
+                continue
+            adapter = self.adapters.get(p)
+            if not adapter or adapter.simulated:
+                out[p] = "no key added"
+            else:
+                out[p] = "its key is not working: " + (self.status.get(p, {}).get("error") or "the last check failed")[:200]
+        return out
 
     def describe(self) -> list[dict]:
         out = []
@@ -106,3 +135,13 @@ class ModelRegistry:
                 "key_hint": self.hints.get(name),
             })
         return out
+
+
+_KEY_PROBLEMS = ("401", "403", "authentication", "unauthorized", "permission", "api key", "api_key", "invalid x-api-key",
+                 "quota", "billing", "credit", "insufficient", "payment")
+
+
+def is_key_problem(message: str) -> bool:
+    """Errors that mean the key itself is bad or the account is out of credit, not a passing hiccup."""
+    low = message.lower()
+    return any(t in low for t in _KEY_PROBLEMS)

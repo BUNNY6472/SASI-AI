@@ -19,7 +19,7 @@ from . import extract
 from . import files as files_mod
 from .config import Settings, get_settings
 from .files import FileRejected, FileStore
-from .gateway.registry import PROVIDERS, ModelRegistry
+from .gateway.registry import DISPLAY, PROVIDERS, ModelRegistry
 from .keys import build_key_store
 from .models import TERMINAL, ApprovePlan, CreateRun, FileRef, Login, Run, SaveKey
 from .store.memory import MemoryStore
@@ -290,7 +290,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/runs")
     async def create_run(body: CreateRun):
+        await registry.recheck_failed()  # a key that failed before may work again
         if not registry.eligible():
+            if registry.live_count:
+                why = "; ".join(f"{DISPLAY.get(p, p)}: {r}" for p, r in registry.unavailable().items())
+                raise HTTPException(400, f"None of your API keys is working right now ({why}). Replace them on the Connections page.")
             raise HTTPException(400, "Add at least one API key on the Connections page first.")
         if controller.active_count() >= settings.max_concurrent_runs:
             raise HTTPException(429, f"Up to {settings.max_concurrent_runs} runs can be active at once. Wait for one to finish.")
