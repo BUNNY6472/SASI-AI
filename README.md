@@ -142,3 +142,5 @@ Copy `backend/.env.example` to `backend/.env` to add keys locally.
 ## Deploy
 
 See [docs/SETUP.md](docs/SETUP.md).
+
+For every link, where SASI is deployed, how it works inside, and what is done so far, see [docs/PROJECT.md](docs/PROJECT.md).
