@@ -20,6 +20,15 @@ retry() {  # retry with growing waits; covers flaky networks and new permissions
   done
 }
 
+ensure_login() {  # Cloud Shell logins can expire during long sessions; sign in again if needed
+  if ! gcloud auth print-access-token >/dev/null 2>&1; then
+    echo "== Your Google Cloud login has expired. Follow the link below to sign in again."
+    gcloud auth login --update-adc
+    gcloud config set project "$PROJECT_ID" >/dev/null
+  fi
+}
+ensure_login
+
 if [ "${SKIP_SETUP:-0}" != "1" ]; then
   bash deploy/setup-gcp.sh
 fi
@@ -40,6 +49,7 @@ build_in_cloud_shell() {
 }
 
 echo "== Building the app on Cloud Build (about 5 minutes)"
+ensure_login
 if ! retry build_on_cloud_build; then
   echo "== Cloud Build did not work; building inside Cloud Shell instead"
   build_in_cloud_shell
@@ -47,7 +57,9 @@ fi
 
 echo "== Deploying to Cloud Run"
 SECRETS="APP_ACCESS_CODE=APP_ACCESS_CODE:latest,SESSION_SECRET=SESSION_SECRET:latest"
-retry gcloud run deploy "$SERVICE" \
+deploy_service() {
+  ensure_login
+  gcloud run deploy "$SERVICE" \
   --project "$PROJECT_ID" \
   --region "$REGION" \
   --image "$IMAGE" \
@@ -62,6 +74,8 @@ retry gcloud run deploy "$SERVICE" \
   --set-env-vars "STORAGE_BACKEND=bigquery,KEY_STORE=secretmanager,GCP_PROJECT=${PROJECT_ID},BIGQUERY_DATASET=sasi_data" \
   --set-secrets "$SECRETS" \
   --quiet
+}
+retry deploy_service
 
 URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" --region "$REGION" --format 'value(status.url)')
 CODE=$(gcloud secrets versions access latest --secret APP_ACCESS_CODE --project "$PROJECT_ID")
