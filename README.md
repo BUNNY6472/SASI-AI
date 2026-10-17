@@ -1,0 +1,83 @@
+# SASI
+
+Claude, ChatGPT and Gemini working as one team. You ask once; SASI plans the work, splits it across the three models, has each piece checked by a different model, and delivers one combined result with the evidence behind it.
+
+This is the first release of the design in the *Multi-Model Collaboration App* architecture document: the common engine with the **software engineering** and **research/report** field profiles (plus a general profile).
+
+## How a request moves through SASI
+
+| Stage | What happens | Gate before moving on |
+|---|---|---|
+| 1. Understand + plan | One model turns the request into a goal, assumptions, success criteria and a task graph | Plan is readable; falls back to a single task if not |
+| 2. Plan review | A *different* model reviews the plan; the planner revises once if asked | Reviewer accepts, or one revision is done |
+| 3. Your approval | You see the plan and approve it (optional switch) | You click Approve |
+| 4. Parallel work | Tasks with no unmet dependency run at the same time on different models, each with only its own context | Required inputs were accepted |
+| 5. Cross-review | Each output is reviewed by another model: pass, revise or block. One revision, then one reassignment to another model | Pass, else the task is marked "needs your review" and dependants are blocked |
+| 6. Integrate + evaluate | One model merges the accepted work; a different model scores it against the success criteria | Done |
+| 7. Deliver | Result, who did and checked what, gaps, limitations and token usage | |
+
+Rules that are enforced by code, not by model opinion:
+
+- Provider keys stay on the server (Secret Manager on Cloud Run). The browser never sees them.
+- A model never reviews its own work while another provider is available. If it has to, the result is labelled *self-reviewed*.
+- Every accepted step records its assurance level. This release only does model review, so results are *evidence-reviewed*, never "tested" or "verified".
+- Budget guards per run: model calls, total tokens, output tokens per call, tasks per plan, revisions per task, and runs at once. Hitting a limit stops the run and keeps accepted work.
+- A provider that fails is retried once for temporary errors, then skipped for the rest of that run, and its work goes to another model.
+- Pasted reference material is passed to models as untrusted data, never as instructions.
+- Model output is sanitized before it is shown in the browser.
+
+## Demo mode
+
+With no API keys, each provider is replaced by a simulated agent so the whole workflow runs end to end. Outputs are clearly labelled. As soon as a key is added for a provider, the real model takes over for that provider. With at least one real key, simulated agents are not used.
+
+## Code map
+
+```
+backend/app/
+  main.py                 API, access-code sign-in, live updates (server-sent events), serves the web app
+  config.py               settings and budget limits (all from environment)
+  models.py               run, plan, task, review, usage records
+  gateway/                model access: one adapter per provider + simulated agents + model registry
+  workflow/controller.py  the workflow controller (stages, gates, retries, checkpoints)
+  workflow/router.py      chooses who does and who checks each task, from review history, and says why
+  workflow/profiles.py    field profiles: software, research, general
+  workflow/prompts.py     task-scoped prompts
+  store/                  project record: in-memory, or BigQuery checkpoints (dataset sasi_data)
+frontend/                 Next.js web app with the three.js 3D scene (exported to static files)
+Dockerfile                one container: the web app + API
+.github/workflows/        CI on every PR; deploy to Cloud Run on main
+deploy/                   one-time Google Cloud setup and the API-key helper
+```
+
+### Choices made against the architecture's suggested stack
+
+The document calls its stack "replaceable choices". To start inside the free tier with one small service:
+
+- **Project record:** BigQuery (`sasi_data.run_checkpoints`, created automatically) instead of PostgreSQL. Cloud SQL has no free tier. Each meaningful step appends a checkpoint row; an interrupted run can resume from it without redoing accepted work.
+- **Workflow:** a small asyncio controller instead of LangGraph plus a job queue. Same stages and checkpoints, fewer moving parts. It runs inside the web service, which is limited to one instance.
+- **Models:** the official Anthropic, OpenAI and Google Gen AI SDKs. Claude defaults to `claude-opus-5-5`; ChatGPT and Gemini pick the newest general model from the account's live model list. Pin any of them with `CLAUDE_MODEL`, `OPENAI_MODEL`, `GEMINI_MODEL`.
+- **Sign-in:** one shared access code for now. Google sign-in and per-user projects come later.
+
+Not in this release: file uploads, sandboxed code execution, web search, benchmark feeds, multiple users. These are later phases in the document.
+
+## Run locally
+
+```bash
+# backend
+cd backend
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+python -m pytest -q
+uvicorn app.main:app --reload --port 8080
+
+# web app (in another terminal)
+cd frontend
+npm ci
+npm run dev        # http://localhost:3000, forwards /api to :8080
+```
+
+Copy `backend/.env.example` to `backend/.env` to add keys locally.
+
+## Deploy
+
+See [docs/SETUP.md](docs/SETUP.md).

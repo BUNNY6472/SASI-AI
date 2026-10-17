@@ -1,0 +1,76 @@
+name: Deploy to Cloud Run
+
+# Deploys main to Google Cloud Run. Uses keyless Workload Identity Federation:
+# no Google key file is stored in GitHub. Run deploy/setup-gcp.sh once first.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID || 'sasi-511906' }}
+  REGION: ${{ vars.GCP_REGION || 'us-central1' }}
+  SERVICE: sasi
+  REPOSITORY: sasi
+
+jobs:
+  deploy:
+    if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push image
+        run: |
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${SERVICE}:${GITHUB_SHA::12}"
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy
+        run: |
+          # Mount only the secrets that exist, so the app deploys before the API keys are added.
+          SECRETS="APP_ACCESS_CODE=APP_ACCESS_CODE:latest,SESSION_SECRET=SESSION_SECRET:latest"
+          for name in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY; do
+            if gcloud secrets describe "$name" --project "$PROJECT_ID" >/dev/null 2>&1; then
+              SECRETS="${SECRETS},${name}=${name}:latest"
+              echo "Using secret $name"
+            else
+              echo "Secret $name not found yet; that model runs as a demo agent"
+            fi
+          done
+          gcloud run deploy "$SERVICE" \
+            --project "$PROJECT_ID" \
+            --region "$REGION" \
+            --image "$IMAGE" \
+            --service-account "sasi-runtime@${PROJECT_ID}.iam.gserviceaccount.com" \
+            --allow-unauthenticated \
+            --min-instances 0 \
+            --max-instances 1 \
+            --cpu 1 \
+            --memory 512Mi \
+            --concurrency 80 \
+            --timeout 3600 \
+            --set-env-vars "STORAGE_BACKEND=bigquery,GCP_PROJECT=${PROJECT_ID},BIGQUERY_DATASET=sasi_data" \
+            --set-secrets "$SECRETS"
+
+      - name: Show URL
+        run: |
+          URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" --region "$REGION" --format 'value(status.url)')
+          echo "Deployed: $URL" | tee -a "$GITHUB_STEP_SUMMARY"
