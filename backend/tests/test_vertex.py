@@ -191,6 +191,64 @@ def test_open_model_on_vertex_uses_the_openai_compatible_endpoint(monkeypatch):
     assert "chart.png" in body["messages"][1]["content"], "a text-only model is told about files it cannot open"
 
 
+def test_deepseek_gets_images_inline_and_falls_back_to_text_if_they_are_refused(monkeypatch):
+    import google.auth
+    import openai
+
+    from app.files import StoredFile
+    from app.gateway import vertex
+    from app.gateway.catalog import SEATS
+
+    class Creds:
+        valid, token = True, "t"
+
+    monkeypatch.setattr(google.auth, "default", lambda scopes=None: (Creds(), "p"))
+    seen, refuse = [], {"images": False}
+
+    def handler(req: httpx2.Request) -> httpx2.Response:
+        body = json.loads(req.content)
+        seen.append(body)
+        if refuse["images"] and isinstance(body["messages"][1]["content"], list):
+            return httpx2.Response(400, json={"error": {"message": "image input is not supported", "code": 400}})
+        chunk = {"id": "c", "object": "chat.completion.chunk", "created": 1, "model": body["model"],
+                 "choices": [{"index": 0, "delta": {"content": "A bar chart"}, "finish_reason": "stop"}]}
+        return httpx2.Response(200, text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                               headers={"content-type": "text/event-stream"})
+
+    real = openai.AsyncOpenAI
+    monkeypatch.setattr(openai, "AsyncOpenAI", lambda **kw: real(
+        **kw, http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler))))
+    seat = SEATS["deepseek"]
+    adapter = vertex.VertexOpenModelAdapter("deepseek", "DeepSeek", "p", list(seat.vertex_models), ["global"],
+                                            seat.max_output, list(seat.vision_models))
+    adapter._model, adapter._location = "deepseek-ai/deepseek-v4.1-flash-maas", "global"
+    image = StoredFile(id="f1", name="chart.png", mime="image/png", size=4, kind="image", data=b"\x89PNG")
+    data = StoredFile(id="f2", name="rows.csv", mime="text/csv", size=8, kind="text", data=b"", text="a,b\n1,2")
+
+    def call():
+        return ModelCall(system="sys", prompt="Describe it", kind="task", max_output_tokens=4000, attachments=[image, data])
+
+    assert run(adapter.generate(call())).text == "A bar chart"
+    content = seen[-1]["messages"][1]["content"]
+    assert content[0]["type"] == "text" and "rows.csv" in content[0]["text"] and "Describe it" in content[0]["text"]
+    assert content[1] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw=="}}
+
+    refuse["images"] = True
+    assert run(adapter.generate(call())).text == "A bar chart", "the call still succeeds"
+    retry = seen[-1]["messages"][1]["content"]
+    assert isinstance(retry, str) and "chart.png" in retry, "the retry is text only, with a note about the image"
+    sent = len(seen)
+    run(adapter.generate(call()))
+    assert len(seen) == sent + 1 and isinstance(seen[-1]["messages"][1]["content"], str), "no more image attempts"
+
+    older = vertex.VertexOpenModelAdapter("deepseek", "DeepSeek", "p", list(seat.vertex_models), ["global"],
+                                          seat.max_output, list(seat.vision_models))
+    older._model, older._location = "deepseek-ai/deepseek-v3.2-maas", "global"
+    refuse["images"] = False
+    run(older.generate(call()))
+    assert isinstance(seen[-1]["messages"][1]["content"], str), "an older text-only fallback model gets text"
+
+
 def test_open_model_with_no_answer_text_raises_a_clear_error(monkeypatch):
     import google.auth
     import openai

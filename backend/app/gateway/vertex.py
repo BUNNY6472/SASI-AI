@@ -17,6 +17,7 @@ from google.genai import errors, types
 
 from .anthropic_adapter import ClaudeAdapter
 from .base import ModelCall, ModelResult, ProviderError, no_text, reply_room, split_attachments
+from .fit import context_error
 from .gemini_adapter import INLINE_LIMIT, GeminiAdapter
 
 CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -147,15 +148,17 @@ class VertexGeminiAdapter(GeminiAdapter):
 
 class VertexOpenModelAdapter:
     """An open model on Vertex AI (GLM, DeepSeek, Qwen, Kimi, ...), through Vertex's OpenAI-compatible
-    Chat Completions endpoint, signed with a Google access token. These models read text only, so files
-    reach them as text, or as notes pointing to the other models' analyses.
+    Chat Completions endpoint, signed with a Google access token. Models listed in `vision_models` get images
+    inline; every other file reaches them as text, or as notes pointing to the other models' analyses.
     """
 
     simulated = False
 
     def __init__(self, provider: str, display_name: str, project: str, models: list[str], locations: list[str],
-                 max_output: int = 32_000):
+                 max_output: int = 32_000, vision_models: list[str] | None = None):
         self.provider = provider
+        self._vision = set(vision_models or [])
+        self._images_ok = True  # turned off if the endpoint refuses images
         self.display_name = display_name
         self._project = project
         # Every model ID in every location, newest model first.
@@ -215,17 +218,33 @@ class VertexOpenModelAdapter:
     async def resolve_model(self) -> str:
         return self._model or (await self.list_models())[0]
 
+    def _messages(self, call: ModelCall, images: bool) -> tuple[list[dict], str, bool]:
+        """The request messages, the file notes added to the prompt, and whether any image went inline."""
+        media, extra = split_attachments(call, self.provider, None if images else set())
+        user: str | list[dict] = extra + call.prompt
+        if media:
+            user = [{"type": "text", "text": user}] + [
+                {"type": "image_url", "image_url": {"url": f"data:{f.mime};base64,{f.b64}"}} for f in media]
+        return [{"role": "system", "content": call.full_system}, {"role": "user", "content": user}], extra, bool(media)
+
     async def generate(self, call: ModelCall) -> ModelResult:
         model = await self.resolve_model()
-        _, extra = split_attachments(call, self.provider)  # text-only: every file becomes text or a note
-        messages = [{"role": "system", "content": call.full_system}, {"role": "user", "content": extra + call.prompt}]
+        messages, extra, sent_images = self._messages(call, model in self._vision and self._images_ok)
         # Reasoning counts toward max_tokens, so leave room for the answer.
         kwargs = dict(model=model, messages=messages, max_tokens=reply_room(call, self._max_output))
         text, usage, finish, served = "", None, "", model
         client = await self._signed(self._location or "global")
         try:
             pieces: list[str] = []
-            stream = await client.chat.completions.create(**kwargs, stream=True)
+            try:
+                stream = await client.chat.completions.create(**kwargs, stream=True)
+            except openai.BadRequestError as e:
+                if not sent_images or context_error(str(e.message)) is not None:
+                    raise
+                # The endpoint would not take the images: if text alone works, send text only from now on.
+                kwargs["messages"], extra, _ = self._messages(call, False)
+                stream = await client.chat.completions.create(**kwargs, stream=True)
+                self._images_ok = False
             async for chunk in stream:
                 served = chunk.model or served
                 if getattr(chunk, "usage", None):

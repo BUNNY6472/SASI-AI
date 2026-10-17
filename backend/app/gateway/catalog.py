@@ -23,6 +23,7 @@ class Seat:
     reads: frozenset[str]  # file kinds it can open directly; everything else reaches it as text or notes
     vertex_models: tuple[str, ...] = ()  # model IDs on Vertex AI, newest first; the first one the project can call is used
     locations: tuple[str, ...] = ("global",)
+    vision_models: tuple[str, ...] = ()  # which of vertex_models read images; the older ones get text only
     key: str = ""  # "anthropic" or "gemini" when the provider's own API key is another route
     about: str = ""
 
@@ -33,12 +34,16 @@ SEATS: dict[str, Seat] = {s.id: s for s in [
     Seat("gemini", "Gemini", "frontier", 1_000_000, 65_536, ("code", "reasoning", "long", "vision", "video"),
          frozenset({"image", "pdf", "text", "video", "audio"}), key="gemini", about="Google's frontier model"),
     # Open models on Vertex AI, best first.
-    Seat("glm", "GLM", "open", 200_000, 32_000, ("code", "reasoning", "agentic"), frozenset({"text"}),
+    # GLM 5.2 and DeepSeek V4.1 Flash read 1M tokens (their Model Garden cards). If an older fallback model is
+    # used, its smaller window is learned from its first "too long" error.
+    Seat("glm", "GLM", "open", 1_000_000, 32_000, ("code", "reasoning", "agentic", "long"), frozenset({"text"}),
          ("zai-org/glm-5.2-maas", "zai-org/glm-5-maas", "zai-org/glm-4.7-maas"), ("global", "us-central1"),
-         about="Z.ai GLM 5.2, a leading open model for coding and long agentic work"),
-    Seat("deepseek", "DeepSeek", "open", 1_000_000, 32_000, ("code", "reasoning", "long"), frozenset({"text"}),
+         about="Z.ai GLM 5.2, a leading open model for coding and long agentic work, with a 1M-token context"),
+    Seat("deepseek", "DeepSeek", "open", 1_000_000, 32_000, ("code", "reasoning", "long", "vision"),
+         frozenset({"image", "text"}),
          ("deepseek-ai/deepseek-v4.1-flash-maas", "deepseek-ai/deepseek-v3.2-maas", "deepseek-ai/deepseek-v3.1-maas"),
-         ("global", "us-central1"), about="DeepSeek V4.1 Flash, the newest DeepSeek model, with a 1M-token context"),
+         ("global", "us-central1"), vision_models=("deepseek-ai/deepseek-v4.1-flash-maas",),
+         about="DeepSeek V4.1 Flash, the newest DeepSeek model, with a 1M-token context; it also reads images"),
     Seat("qwen", "Qwen", "open", 262_144, 32_000, ("code",), frozenset({"text"}),
          ("qwen/qwen3-coder-480b-a35b-instruct-maas", "qwen/qwen3-235b-a22b-instruct-2507-maas"), ("global", "us-south1"),
          about="Qwen3 Coder, a strong open coding model"),

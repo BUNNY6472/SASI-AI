@@ -37,7 +37,7 @@ Rules that are enforced by code, not by model opinion:
 
 Any file type can be attached from the composer (button or drag and drop), up to 10 per run and 25 MB each.
 
-- Images and PDFs go to Claude and Gemini directly. Video and audio go to Gemini. The open models read text, so for media they work from the frontier models' analyses.
+- Images and PDFs go to Claude and Gemini directly. Video and audio go to Gemini. DeepSeek V4.1 Flash also reads images. The other open models read text, so for media they work from the frontier models' analyses.
 - Data and documents are converted to text in `backend/app/extract.py`:
   - CSV, TSV, JSON, JSON Lines and Parquet.
   - Excel (`.xlsx`) and Word (`.docx`).
@@ -69,12 +69,12 @@ On Cloud Run, SASI reaches every model through Vertex AI, signed in as the app's
 |---|---|---|---|---|
 | Claude | frontier | `claude-opus-5-5`, `claude-opus-5` | 1M | Enable Claude once in Vertex AI Model Garden. A Claude API key is the backup route |
 | Gemini | frontier | `gemini-4-argon` | 1M | Files go inline up to 14 MB per request (Vertex has no Files API). A Gemini API key is the backup route |
-| GLM | open | `zai-org/glm-5.2-maas`, `glm-5-maas`, `glm-4.7-maas` | 200K | Strong at code and long agentic work |
-| DeepSeek | open | `deepseek-ai/deepseek-v4.1-flash-maas`, `v3.2-maas`, `v3.1-maas` | 1M | Takes very large inputs whole |
+| GLM | open | `zai-org/glm-5.2-maas`, `glm-5-maas`, `glm-4.7-maas` | 1M | Strong at code and long agentic work |
+| DeepSeek | open | `deepseek-ai/deepseek-v4.1-flash-maas`, `v3.2-maas`, `v3.1-maas` | 1M | Takes very large inputs whole, and reads images |
 | Qwen | open | `qwen/qwen3-coder-480b-a35b-instruct-maas`, `qwen3-235b-a22b-instruct-2507-maas` | 256K | Coding |
 | Kimi | open | `moonshotai/kimi-k2-thinking-maas` | 256K | Reasoning |
 
-The open models are reached through Vertex AI's OpenAI-compatible Chat Completions endpoint and read text only; images, PDFs, video and audio reach them through the frontier models' analyses. Each is tried in a few locations, and the first model ID this project can call is used. Enable each one once in [Model Garden](https://console.cloud.google.com/vertex-ai/model-garden) (open the model, press **Enable**); a model that is not enabled shows "not working" on Connections and is skipped.
+The open models are reached through Vertex AI's OpenAI-compatible Chat Completions endpoint. DeepSeek V4.1 Flash gets images inline (if the endpoint refuses them, it gets text from then on); otherwise images, PDFs, video and audio reach the open models through the frontier models' analyses. Each is tried in a few locations, and the first model ID this project can call is used. Use each model's **API Service** card in [Model Garden](https://console.cloud.google.com/vertex-ai/model-garden), not the card with **Deploy** (that one runs the model on your own paid GPU server). Press **Enable** if the API Service card shows it; GLM 5.2 and DeepSeek V4.1 Flash need no enable step. A model this project can't call shows "not working" on Connections and is skipped.
 
 The team for a run is the working frontier models, then open models ranked by whether the input fits their context window and whether their strengths suit the work (code for software and Eris runs, reasoning for research and general runs), up to `TEAM_SIZE` (4). Change the open models with `OPEN_MODELS` (default `glm,deepseek,qwen,kimi`; `minimax` and `gptoss` are also known; in `EXTRA_ENV` separate them with `+`, such as `OPEN_MODELS=glm+kimi`), and the frontier models with `VERTEX_CLAUDE_MODEL`, `VERTEX_GEMINI_MODEL` and `VERTEX_LOCATION`, for example `EXTRA_ENV="TEAM_SIZE=3" bash deploy/deploy-now.sh`.
 

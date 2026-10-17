@@ -39,6 +39,7 @@ EXTRA_TYPES = {".csv": "text/csv", ".tsv": "text/tab-separated-values", ".md": "
 # Per-file size limits for sending a file inline to each provider's API.
 DIRECT_LIMIT = {
     "claude": {"image": 5 * 1024 * 1024, "pdf": 30 * 1024 * 1024},
+    "deepseek": {"image": 5 * 1024 * 1024},
 }
 
 

@@ -64,7 +64,7 @@ The app reaches Claude, Gemini and the open models (GLM, DeepSeek, Qwen, Kimi) t
 
 ## 5. Enable the models in Vertex AI Model Garden (one time)
 
-Gemini works straight away. For the others, open [Vertex AI Model Garden](https://console.cloud.google.com/vertex-ai/model-garden) in project `sasi-511906`, then open each model below and press **Enable** (accept the terms if asked):
+Gemini works straight away. For the others, open [Vertex AI Model Garden](https://console.cloud.google.com/vertex-ai/model-garden) in project `sasi-511906` and search for each model below. Open the card whose name ends in **API Service**, not the one with a **Deploy** button: Deploy runs the model on your own GPU server, billed by the hour. If the API Service card shows **Enable**, press it and accept the terms. GLM 5.2 and DeepSeek V4.1 Flash show no Enable button and are ready to use. To check from PowerShell that a model answers, run `deploy/check-open-models.ps1`.
 
 - **Claude Opus 5.5**
 - **GLM 5.2** (Z.ai)

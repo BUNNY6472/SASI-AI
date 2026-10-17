@@ -49,12 +49,13 @@ def no_text(provider: str, stop_reason: str) -> "ProviderError":
     return ProviderError(provider, f"the model returned no answer text ({why})", retryable=True)
 
 
-def split_attachments(call: ModelCall, provider: str) -> tuple[list["StoredFile"], str]:
-    """Files this provider can read directly, plus prompt text for data files and ones it cannot open."""
+def split_attachments(call: ModelCall, provider: str, can_read: set[str] | None = None) -> tuple[list["StoredFile"], str]:
+    """Files this provider can read directly, plus prompt text for data files and ones it cannot open.
+    `can_read` overrides the file kinds the provider's catalog entry says it reads."""
     from ..files import DIRECT_LIMIT
     from .catalog import reads
 
-    can_read = reads(provider)
+    can_read = reads(provider) if can_read is None else can_read
 
     media, notes = [], []
     for f in call.attachments:

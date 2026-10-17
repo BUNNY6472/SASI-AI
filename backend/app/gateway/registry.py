@@ -69,7 +69,7 @@ class ModelRegistry:
             return VertexGeminiAdapter(s.gcp_project, s.vertex_location, [s.vertex_gemini_model or s.gemini_model, "gemini-4-argon"])
         seat = SEATS[provider]
         return VertexOpenModelAdapter(provider, seat.name, s.gcp_project, list(seat.vertex_models), list(seat.locations),
-                                      seat.max_output)
+                                      seat.max_output, list(seat.vision_models))
 
     def _build(self, provider: str, key_route: Route | None = None) -> ProviderAdapter | None:
         key = self.keys.get(provider)

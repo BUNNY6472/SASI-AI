@@ -128,13 +128,19 @@ def test_the_team_is_frontier_first_then_the_open_models_that_suit_the_task():
     opens = ["glm", "deepseek", "qwen", "kimi"]
     assert rank_open(opens, "software", 10_000)[:2] == ["glm", "deepseek"]
     assert rank_open(opens, "research", 10_000)[:3] == ["glm", "deepseek", "kimi"]
-    assert rank_open(opens, "research", 400_000)[0] == "deepseek", "a huge input goes to the model whose window holds it"
+    assert rank_open(["qwen", "kimi", "deepseek"], "software", 400_000)[0] == "deepseek", \
+        "a huge input goes to the model whose window holds it"
+    assert rank_open(opens, "research", 400_000)[:2] == ["glm", "deepseek"], "GLM 5.2 and DeepSeek both read 1M tokens"
 
     with make_client(team_size=3) as client:
         registry = client.app.state.registry
         assert registry.team("software") == ["claude", "gemini", "glm"]
-        assert registry.team("general", 400_000) == ["claude", "gemini", "deepseek"]
+        assert registry.team("general", 400_000) == ["claude", "gemini", "glm"]
         assert "chatgpt" not in registry.adapters
+
+    with make_client(team_size=3, open_models="qwen,kimi,deepseek") as client:
+        registry = client.app.state.registry
+        assert registry.team("general", 400_000) == ["claude", "gemini", "deepseek"], "the one whose window holds it"
 
 
 # ---------------------------------------------------------------- the time limit
