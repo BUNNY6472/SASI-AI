@@ -75,6 +75,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.registry = registry
     app.state.controller = controller
     app.state.store = store
+    app.state.key_store = key_store
 
     def authed(request: Request) -> bool:
         if not settings.app_access_code:
@@ -158,13 +159,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 msg = raw[:200]
             raise HTTPException(400, f"That key did not work: {msg}") from e
+        # The key works, so use it right away even if saving it fails.
+        registry.set_adapter(provider, key, model)
+        result = {"provider": provider, "configured": True, "hint": registry.hints.get(provider), "model": model, "saved": True}
         try:
             await key_store.save(provider, key)
         except Exception as e:  # noqa: BLE001
-            log.warning("could not store key for %s: %s", provider, type(e).__name__)
-            raise HTTPException(500, "The key works, but it could not be saved. Re-run deploy/setup-gcp.sh, then try again.") from e
-        registry.set_adapter(provider, key, model)
-        return {"provider": provider, "configured": True, "hint": registry.hints.get(provider), "model": model}
+            reason = f"{type(e).__name__}: {str(e).replace(key, '***')[:300]}"
+            log.warning("could not store key for %s: %s", provider, reason)
+            result["saved"] = False
+            result["warning"] = save_failure_message(type(e).__name__, reason)
+        return result
+
+    def save_failure_message(kind: str, reason: str) -> str:
+        if kind == "PermissionDenied":
+            how = ("Google Cloud did not let SASI save keys. In Cloud Shell run: "
+                   "cd ~/SASI-AI && git pull && bash deploy/setup-gcp.sh , wait 2 minutes, then save the key again.")
+        elif kind == "NotFound":
+            how = "The place for this key does not exist in Secret Manager yet. In Cloud Shell run: cd ~/SASI-AI && bash deploy/setup-gcp.sh , then save the key again."
+        else:
+            how = "Try saving it again in a minute."
+        return f"The key works and SASI is using it now, but it was not saved, so it will be lost when the app restarts. {how} (Details: {reason})"
 
     @app.delete("/api/keys/{provider}")
     async def delete_key(provider: str):

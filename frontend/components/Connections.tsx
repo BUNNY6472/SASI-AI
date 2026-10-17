@@ -25,16 +25,16 @@ const WHERE: Record<Provider, { label: string; url: string }> = {
 function KeyForm({ p, onChange }: { p: ProviderStatus; onChange: () => Promise<void> }) {
   const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [msg, setMsg] = useState<{ ok: boolean; warn?: boolean; text: string } | null>(null);
 
   async function save(e: FormEvent) {
     e.preventDefault();
     setBusy(true);
     setMsg(null);
     try {
-      const r = await api<{ model: string }>(`/api/keys/${p.provider}`, { method: "PUT", body: JSON.stringify({ key }) });
+      const r = await api<{ model: string; saved: boolean; warning?: string }>(`/api/keys/${p.provider}`, { method: "PUT", body: JSON.stringify({ key }) });
       setKey("");
-      setMsg({ ok: true, text: `Saved and working. Using ${r.model}.` });
+      setMsg(r.saved ? { ok: true, text: `Saved and working. Using ${r.model}.` } : { ok: false, warn: true, text: r.warning || "Working, but not saved." });
       await onChange();
     } catch (err) {
       setMsg({ ok: false, text: (err as Error).message });
@@ -73,7 +73,7 @@ function KeyForm({ p, onChange }: { p: ProviderStatus; onChange: () => Promise<v
         <button className="btn primary" disabled={busy || key.trim().length < 10}>{busy ? "Checking…" : p.connected ? "Replace key" : "Save key"}</button>
         {p.connected && <button type="button" className="btn ghost" disabled={busy} onClick={remove}>Remove</button>}
       </div>
-      {msg && <p className={msg.ok ? "ok small" : "error small"}>{msg.text}</p>}
+      {msg && <p className={msg.ok ? "ok small" : msg.warn ? "warn-text small" : "error small"}>{msg.text}</p>}
       {!p.connected && (
         <p className="small muted">
           Get a key at <a href={where.url} target="_blank" rel="noreferrer">{where.label}</a>.

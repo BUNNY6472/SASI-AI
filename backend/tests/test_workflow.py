@@ -144,6 +144,26 @@ def test_keys_saved_from_app_are_never_returned(monkeypatch):
         assert not any(p["configured"] for p in client.get("/api/keys").json())
 
 
+def test_working_key_is_used_even_if_saving_fails(monkeypatch):
+    with make_client(allow_simulated=False) as client:
+        registry = client.app.state.registry
+
+        async def fake_test(provider, key):
+            return "model-x"
+
+        async def broken_save(provider, key):
+            raise PermissionError(f"403 denied while saving {key}")
+
+        monkeypatch.setattr(registry, "test_key", fake_test)
+        monkeypatch.setattr(client.app.state.key_store, "save", broken_save)
+        secret = "sk-test-1234567890abcdWXYZ"
+        r = client.put("/api/keys/claude", json={"key": secret})
+        assert r.status_code == 200 and secret not in r.text
+        body = r.json()
+        assert body["saved"] is False and "PermissionError" in body["warning"]
+        assert client.get("/api/providers").json()["needs_keys"] is False, "key is usable right away"
+
+
 def test_files_all_three_analyse_compare_and_delete():
     """Files reach every model, each analyses on its own, they cross-check, and delete removes everything."""
     with make_client() as client:

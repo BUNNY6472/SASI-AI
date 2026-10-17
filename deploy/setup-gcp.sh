@@ -111,8 +111,10 @@ for name in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY; do
   gcloud secrets describe "$name" >/dev/null 2>&1 || \
     gcloud secrets create "$name" --replication-policy automatic >/dev/null
   # The app may add a new key version and remove old ones, for these three secrets only.
-  gcloud secrets add-iam-policy-binding "$name" --member "serviceAccount:$RUNTIME_SA" \
-    --role roles/secretmanager.secretVersionManager >/dev/null
+  for role in roles/secretmanager.secretVersionManager roles/secretmanager.viewer; do
+    gcloud secrets add-iam-policy-binding "$name" --member "serviceAccount:$RUNTIME_SA" \
+      --role "$role" >/dev/null
+  done
   echo "  $name ready"
 done
 

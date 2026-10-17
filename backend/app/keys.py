@@ -70,9 +70,13 @@ class SecretManagerKeyStore:
     def _write(self, provider: str, key: str) -> None:
         new = self._client.add_secret_version(parent=self._secret(provider), payload={"data": key.encode("utf-8")})
         # Keep one version per key (Secret Manager free tier covers 6 active versions).
-        for name in self._enabled_versions(provider):
-            if name != new.name:
+        # The key is already saved at this point, so cleanup problems are only logged.
+        try:
+            old = [n for n in self._enabled_versions(provider) if n.rsplit("/", 1)[-1] != new.name.rsplit("/", 1)[-1]]
+            for name in old:
                 self._client.destroy_secret_version(name=name)
+        except Exception as e:  # noqa: BLE001
+            log.warning("saved %s, but could not remove its older versions: %s", SECRET_NAMES[provider], type(e).__name__)
 
     def _remove(self, provider: str) -> None:
         for name in self._enabled_versions(provider):
