@@ -346,7 +346,7 @@ export default function RunView({
 
       {(run.team?.length || 0) > 0 && (
         <div
-          className={`notice team-note small ${run.skipped && Object.keys(run.skipped).length ? "warn" : ""}`}
+          className={`notice team-note small ${!bridge && run.skipped && Object.keys(run.skipped).length ? "warn" : ""}`}
         >
           {teamOrder(run).some((p) => !(p in (run.skipped || {}))) ? (
             <b>
@@ -361,7 +361,14 @@ export default function RunView({
           ) : (
             <b>No model could take part.</b>
           )}{" "}
-          {Object.entries(run.skipped || {}).map(([p, why]) => (
+          {bridge && Object.keys(run.skipped || {}).length > 0 ? (
+            <details>
+              <summary>{Object.keys(run.skipped || {}).length} unavailable models</summary>
+              <ul>{Object.entries(run.skipped || {}).map(([p, why]) => (
+                <li key={p}>{providerMeta(p).name}: {why.replace(/\.+$/, "")}.</li>
+              ))}</ul>
+            </details>
+          ) : Object.entries(run.skipped || {}).map(([p, why]) => (
             <span key={p}>
               {providerMeta(p).name}: {why.replace(/\.+$/, "")}.{" "}
             </span>
