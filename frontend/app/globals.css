@@ -1068,6 +1068,7 @@ summary {
   background: #f9efdf;
 }
 .badge.field {
+  display: inline-flex;
   color: #6d8075;
   background: #edf2ed;
 }
@@ -2988,8 +2989,8 @@ code {
 .bridge-active-models > span { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 12px; }
 .bridge-activity { margin-top: 12px; border-top: 1px solid var(--border, #e3e7de); padding-top: 12px; }
 .bridge-activity summary, .bridge-evidence > summary { cursor: pointer; font-size: 13px; color: #445d4b; }
-.bridge-activity ol { padding: 0; list-style: none; max-height: 360px; overflow-y: auto; }
-.bridge-activity li { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 12px; padding: 9px 0; border-top: 1px solid #e9ece6; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.bridge-activity > ol { padding: 0; list-style: none; max-height: 360px; overflow-y: auto; }
+.bridge-activity > ol > li { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 12px; padding: 9px 0; border-top: 1px solid #e9ece6; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 .bridge-event-label { color: #627759; font-weight: 600; }
 .bridge-routing { font-size: 12px; line-height: 1.8; }
 .bridge-routing > p:first-child { display: flex; flex-wrap: wrap; gap: 10px 20px; }
@@ -3012,7 +3013,7 @@ code {
   .bridge-collaboration { padding: 16px; }
   .bridge-collaboration-head > .small { width: 100%; padding-left: 19px; }
   .bridge-answer-heading h2 { font-size: 21px; }
-  .bridge-activity li { grid-template-columns: 1fr; gap: 2px; }
+  .bridge-activity > ol > li { grid-template-columns: 1fr; gap: 2px; }
   .bridge-evidence > summary { padding: 15px; gap: 6px; }
   .bridge-evidence > summary > span:last-child { width: 100%; }
 }
