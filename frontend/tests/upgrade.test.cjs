@@ -10,7 +10,9 @@ const { renderToStaticMarkup } = require("react-dom/server");
 // Compile the same production modules without a browser, credentials or network.
 const modules = new Map();
 function load(relative) {
-  const target = path.resolve(__dirname, "..", relative);
+  const base = path.resolve(__dirname, "..", relative);
+  const target = fs.existsSync(base) ? base : [base + ".ts", base + ".tsx"].find((candidate) => fs.existsSync(candidate));
+  if (!target) throw new Error(`Test module not found: ${relative}`);
   if (modules.has(target)) return modules.get(target).exports;
   const module = { exports: {} };
   modules.set(target, module);
@@ -19,8 +21,8 @@ function load(relative) {
     fileName: target,
   }).outputText;
   const localRequire = (name) => {
-    if (name.startsWith("@/")) return load(name.slice(2) + ".ts");
-    if (name.startsWith(".")) return load(path.relative(path.resolve(__dirname, ".."), path.resolve(path.dirname(target), name)) + ".ts");
+    if (name.startsWith("@/")) return load(name.slice(2));
+    if (name.startsWith(".")) return load(path.relative(path.resolve(__dirname, ".."), path.resolve(path.dirname(target), name)));
     return require(name);
   };
   vm.runInThisContext(`(function(require,module,exports){${output}\n})`, { filename: target })(localRequire, module, module.exports);
@@ -29,6 +31,11 @@ function load(relative) {
 const { uploadFile, committedBytes, validateAttachment, uploadSettings } = load("lib/uploads.ts");
 const UsageDetails = load("components/UsageDetails.tsx").default;
 const FileCoverage = load("components/FileCoverage.tsx").default;
+const { RunClock, ActiveCalls } = load("components/RunTiming.tsx");
+const { CollaborationSummary } = load("components/BridgeSession.tsx");
+const BridgeSession = load("components/BridgeSession.tsx").default;
+const Workspace = load("components/Workspace.tsx").default;
+const { questionRequest } = load("lib/question-request.ts");
 const GiB = 1024 ** 3;
 const MiB = 1024 ** 2;
 const limits = { max_run_bytes: 10 * GiB, max_file_bytes: 10 * GiB, max_files_per_run: 20, resumable_uploads: true, upload_storage: "cloud" };
@@ -224,4 +231,59 @@ test("ZIP coverage keeps server evidence and describes large-archive inspection 
   assert.match(html, /A bounded prefix was examined/);
   assert.match(html, /Large ZIP archives are stored unchanged/);
   assert.match(html, /member files are not automatically inspected/);
+});
+
+test("question-driven runs never render legacy timers even when stale timing fields are present", () => {
+  const base = { status: "running", time_limit_s: 7200, total_time_limit_s: 7200, clock_started_at: Date.now() / 1000, used_s: 10, active_calls: { a: { provider: "gemini", kind: "answer", label: "Preparing answer", started_at: 1, soft_deadline_at: 2, hard_deadline_at: 3 } } };
+  for (const route of [{ workflow: "bridge" }, { timing_policy: "question_driven" }]) {
+    assert.equal(renderToStaticMarkup(React.createElement(RunClock, { run: { ...base, ...route } })), "");
+    assert.equal(renderToStaticMarkup(React.createElement(ActiveCalls, { run: { ...base, ...route } })), "");
+  }
+  const historical = renderToStaticMarkup(React.createElement(RunClock, { run: { ...base, status: "completed", timing_policy: "strict" } }));
+  assert.match(historical, /legacy limit/);
+});
+
+test("bridge collaboration presents actual usage, stop reasons and review caveat without countdowns", () => {
+  const html = renderToStaticMarkup(React.createElement(CollaborationSummary, { run: {
+    status: "completed", usage: { calls: 3, input_tokens: 1200, output_tokens: 400 },
+    events: [{ at: 10, provider: "gemini", type: "no_progress", message: "A repeated unresolved issue stopped further revision." }],
+    active_calls: {},
+  } }));
+  assert.match(html, /3 calls/);
+  assert.match(html, /1,600/);
+  assert.match(html, /repeated unresolved issue/);
+  assert.match(html, /not proof of correctness/);
+  assert.doesNotMatch(html, /minutes|timeout|countdown|accuracy|CUDA|SLM/);
+});
+
+test("new-question payload drops obsolete timing and approval inputs and preserves selected files", () => {
+  const payload = questionRequest({ request: "  Explain the evidence  ", materials: "Background", eris: false, mode: "deep", file_ids: ["stored-file"], time_limit_minutes: 120, require_plan_approval: true });
+  assert.equal(payload.workflow, "bridge");
+  assert.equal(payload.request, "Explain the evidence");
+  assert.deepEqual(payload.file_ids, ["stored-file"]);
+  assert.ok(!("time_limit_minutes" in payload));
+  assert.ok(!("require_plan_approval" in payload));
+  assert.ok(!("compare_all" in payload));
+});
+
+test("question workspace has effort choices and upload recovery without a time selector", () => {
+  const html = renderToStaticMarkup(React.createElement(Workspace, { open() {}, needsKeys: false, providers: [] }));
+  assert.match(html, /Ask SASI|Checking limits/);
+  assert.match(html, /Answer effort/);
+  assert.match(html, /Attach files/);
+  assert.match(html, /50,00,000/);
+  assert.doesNotMatch(html, /<select|Research time target|minutes total|Approve the plan|Always compare/);
+});
+
+test("bridge answer retains failed assurance and limits instead of presenting completed work as verified", () => {
+  const html = renderToStaticMarkup(React.createElement(BridgeSession, { run: {
+    status: "completed", live: {}, events: [], usage: { calls: 2, input_tokens: 100, output_tokens: 20, by_provider: {} },
+    final: { output: "", verification_status: "failed", meets_criteria: false, gaps: ["The data was not independently checked."], limitations: ["No execution evidence."] },
+  }, evidence: null, solution: null, copyAnswer: null }));
+  assert.equal((html.match(/aria-label="SASI answer"/g) || []).length, 1);
+  assert.match(html, /unmet criteria/);
+  assert.match(html, /Checks found an issue/);
+  assert.match(html, /The data was not independently checked/);
+  assert.match(html, /No execution evidence/);
+  assert.doesNotMatch(html, /Plan &amp; tasks|Model review score|minute|accuracy guarantee/);
 });

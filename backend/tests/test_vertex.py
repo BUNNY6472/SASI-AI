@@ -498,7 +498,9 @@ def test_with_vertex_on_runs_need_no_keys(monkeypatch):
         assert r["status"] == "completed", r.get("error")
         team = next(e["message"] for e in r["events"] if e["type"] == "team")
         assert team.startswith("Team for this run: Claude (Google Cloud), Gemini (Google Cloud), GLM (Google Cloud) and "
-                               "DeepSeek (Google Cloud). New-work target 120 min"), team
+                               "DeepSeek (Google Cloud)"), team
+        assert r["workflow"] == "bridge" and r["time_limit_s"] == 0
+        assert "New-work target" not in team
         assert r["team"] == ["claude", "gemini", "glm", "deepseek"]
 
         assert client.delete("/api/keys").status_code == 200

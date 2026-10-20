@@ -174,7 +174,30 @@ export interface PartialOutput {
   usage_estimated: boolean;
 }
 
+export interface BridgeState {
+  phase: "routing" | "planning" | "answering" | "verifying" | "correcting" | "complete";
+  complexity: string;
+  reasons: string[];
+  answerer: string | null;
+  verifier: string | null;
+  plan: Record<string, unknown> | null;
+  plan_attempted: boolean;
+  reviews: {
+    provider: string;
+    model: string;
+    artifact_hash: string;
+    context_hash: string;
+    round: number;
+    packet: Record<string, unknown> | null;
+    error: string;
+  }[];
+  correction_attempted: boolean;
+  correction_completed: boolean;
+}
+
 export interface Run {
+  workflow?: "legacy" | "bridge";
+  bridge?: BridgeState | null;
   mode?: "adaptive" | "quick" | "deep";
   evidence?: Evidence[];
   research_status?: string;
@@ -227,7 +250,7 @@ export interface Run {
   /** The code file in the final result (solution.py on Project Eris runs), when there is one. */
   solution?: { name: string; code: string; lines: number } | null;
   /** Missing policy means a historical strict deadline. Approval pauses elapsed time. */
-  timing_policy?: "strict" | "graceful";
+  timing_policy?: "strict" | "graceful" | "question_driven";
   model_phase_min_s?: number;
   model_phase_grace_s?: number;
   finalization_deadline_elapsed_s?: number | null;
@@ -282,6 +305,7 @@ export function clock(seconds: number): string {
 }
 
 export interface RunSummary {
+  workflow?: "legacy" | "bridge";
   mode?: "adaptive" | "quick" | "deep";
   id: string;
   created_at: number;
@@ -297,14 +321,15 @@ export interface RunSummary {
   team?: string[];
   elapsed_s?: number;
   time_limit_s?: number;
-  timing_policy?: "strict" | "graceful";
+  timing_policy?: "strict" | "graceful" | "question_driven";
   total_time_limit_s?: number;
 }
 
 export interface RunLimits {
+  workflow?: "legacy" | "bridge";
   time_limit_minutes: number;
   wrap_up_minutes: number;
-  timing_policy?: "strict" | "graceful";
+  timing_policy?: "strict" | "graceful" | "question_driven";
   minimum_time_target_minutes?: number;
   max_total_run_minutes?: number;
   model_phase_min_minutes?: number;

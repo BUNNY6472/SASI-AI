@@ -349,13 +349,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def limits():
         s = settings
         return {
-            "time_limit_minutes": s.run_time_limit_minutes,
-            "wrap_up_minutes": s.wrap_up_minutes,
-            "timing_policy": "graceful",
-            "minimum_time_target_minutes": 20,
-            "max_total_run_minutes": settings.max_total_run_minutes,
-            "model_phase_min_minutes": s.model_phase_min_minutes,
-            "model_phase_grace_minutes": s.model_phase_grace_minutes,
+            "workflow": "bridge",
+            "time_limit_minutes": 0,
+            "wrap_up_minutes": 0,
+            "timing_policy": "question_driven",
+            "minimum_time_target_minutes": 0,
+            "max_total_run_minutes": 0,
+            "model_phase_min_minutes": 0,
+            "model_phase_grace_minutes": 0,
+            "provider_request_timeout_seconds": s.provider_request_timeout_seconds,
             "team_size": s.team_size,
             "max_model_calls_per_run": s.max_model_calls_per_run,  # 0: no cap
             "max_tokens_per_run": s.max_tokens_per_run,  # 0: no cap
@@ -547,7 +549,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             profile = detect_profile(body.request, body.materials, [f.name for f in files])
         run = Run(request=body.request.strip(), materials=body.materials, profile=profile, eris=eris,
                   require_plan_approval=body.require_plan_approval, compare_all=body.compare_all,
-                  mode=body.mode, time_limit_minutes=body.time_limit_minutes,
+                  mode=body.mode, workflow="bridge", timing_policy="question_driven",
+                  time_limit_minutes=None,
                   files=[FileRef(**f.ref()) for f in files])
         try:
             await file_store.attach(run.id, files)

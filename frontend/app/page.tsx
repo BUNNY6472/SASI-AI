@@ -169,11 +169,11 @@ export default function Page() {
         <button className="brand" onClick={newRun}>
           <span className="brand-mark">S</span>
           <span>
-            SASI<span className="brand-sub">RESEARCH WORKSPACE</span>
+            SASI<span className="brand-sub">CONNECTED INTELLIGENCE</span>
           </span>
         </button>
         <button className="btn new-run" onClick={newRun}>
-          <Icon name="plus" /> New research <span>↗</span>
+          <Icon name="plus" /> New question <span>↗</span>
         </button>
         <nav className="main-nav" aria-label="Main navigation">
           <button
@@ -191,9 +191,9 @@ export default function Page() {
           </button>
         </nav>
         <div className="sidebar-history">
-          <p className="nav-caption">RECENT RESEARCH</p>
+          <p className="nav-caption">RECENT QUESTIONS</p>
           {recent.length === 0 ? (
-            <p className="sidebar-empty">Your research will appear here.</p>
+            <p className="sidebar-empty">Your questions will appear here.</p>
           ) : (
             recent.slice(0, 7).map((r) => (
               <button
@@ -248,7 +248,7 @@ export default function Page() {
               {route.view === "settings"
                 ? "Connections"
                 : route.view === "run"
-                  ? "Research session"
+                  ? "Your answer"
                   : "Workspace"}
             </b>
           </div>

@@ -92,9 +92,11 @@ def grade(case: dict, output: str) -> dict:
 
 
 def make_payload(case: dict, mode: str, minutes: float) -> dict:
+    # minutes is the experiment client's watchdog, never a session timer sent
+    # to the question-driven application.
     return {"request": case["request"], "materials": case.get("materials", ""),
             "profile": "research" if case["kind"] == "human_review" else "general",
-            "mode": mode, "time_limit_minutes": minutes, "require_plan_approval": False}
+            "mode": mode, "require_plan_approval": False}
 
 
 def model_ids(run: dict) -> list[str]:
@@ -132,6 +134,8 @@ def run_case(client: httpx.Client, case: dict, mode: str, minutes: float, *, pol
             minimum = min(3600, max(1200, float(run.get("model_phase_min_s", 1200))))
             grace = min(900, max(60, float(run.get("model_phase_grace_s", 300))))
             extra_wait_s = 2 * (2 * minimum + grace) + 60
+        elif run.get("timing_policy") == "question_driven":
+            extra_wait_s = 0
         else:
             extra_wait_s = 60
     watchdog_s = minutes * 60 + extra_wait_s
@@ -183,7 +187,7 @@ def main(argv=None) -> int:
     gate.add_argument("--dry-run", "--validate", action="store_true", help="Validate and preview locally (the default)")
     parser.add_argument("--max-cases", type=int, default=3)
     parser.add_argument("--modes", default=",".join(MODES))
-    parser.add_argument("--minutes", type=float, default=20, help="Same research time target for every mode (active work may finish later)")
+    parser.add_argument("--minutes", type=float, default=20, help="Client experiment watchdog; never sets an application session timer")
     parser.add_argument("--poll-seconds", type=float, default=2)
     parser.add_argument("--output", type=Path, help="New JSONL result file (existing files are never overwritten)")
     args = parser.parse_args(argv)
@@ -193,7 +197,7 @@ def main(argv=None) -> int:
     if not 1 <= args.max_cases <= 20 or not 20 <= args.minutes <= 120 or not 0.1 <= args.poll_seconds <= 30:
         parser.error("Use 1–20 cases, 20–120 minutes, and 0.1–30 seconds between polls")
     cases = load_cases(args.cases)[:args.max_cases]
-    print(f"Validated {len(cases)} selected cases; {len(cases) * len(modes)} planned runs; common research target {args.minutes:g} minutes per run.")
+    print(f"Validated {len(cases)} selected cases; {len(cases) * len(modes)} planned runs; client watchdog {args.minutes:g} minutes per run.")
     if not args.execute:
         for case in cases:
             print(f"  {case['id']}: {case['kind']} ({', '.join(modes)})")
@@ -219,7 +223,7 @@ def main(argv=None) -> int:
         providers = client.get("/api/providers")
         providers.raise_for_status()
         metadata = {"record_type": "experiment", "started_at": stamp, "app_origin": args.base_url, "modes": modes,
-                    "minutes_per_run": args.minutes, "case_ids": [c["id"] for c in cases],
+                    "watchdog_minutes_per_run": args.minutes, "case_ids": [c["id"] for c in cases],
                     "fixture_sha256": hashlib.sha256(args.cases.read_bytes()).hexdigest(), "server_limits": limits.json(),
                     "providers": [{k: p.get(k) for k in ("provider", "model", "via", "ok", "simulated", "context")}
                                   for p in providers.json().get("providers", [])],

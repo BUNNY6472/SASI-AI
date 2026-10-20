@@ -47,7 +47,9 @@ class Settings(BaseSettings):
     simulated_delay: float = 0.6
 
     # The run duration is a planning target. Admitted calls keep their own allowance and finishing grace.
+    # Legacy saved runs only. New bridge runs finish by task/review completion.
     run_time_limit_minutes: float = 120
+    provider_request_timeout_seconds: float = Field(default=900, ge=30, le=3600)
     max_total_run_minutes: float = Field(default=120, ge=50, le=120)
     wrap_up_minutes: float = 5
     model_phase_min_minutes: float = Field(default=20, ge=20, le=60)

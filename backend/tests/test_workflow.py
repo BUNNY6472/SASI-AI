@@ -12,9 +12,19 @@ from app.workflow.prompts import parse_json
 
 
 def make_client(**overrides) -> TestClient:
+    """Exercise the retained legacy pipeline using explicitly legacy run fixtures.
+
+    New API bridge behavior is covered separately in test_bridge_workflow.py.
+    """
     opts = {"allow_simulated": True, "simulated_delay": 0.0, **overrides}
     settings = Settings(_env_file=None, static_dir="/nonexistent", **opts)
-    return TestClient(create_app(settings))
+    app = create_app(settings)
+    start = app.state.controller.start
+    async def start_legacy_fixture(run):
+        run.workflow = "legacy"
+        await start(run)
+    app.state.controller.start = start_legacy_fixture
+    return TestClient(app)
 
 
 def wait_for(client: TestClient, run_id: str, statuses: set[str], timeout: float = 10) -> dict:
@@ -36,7 +46,8 @@ def test_full_run_in_demo_mode_with_plan_approval():
     with make_client() as client:
         providers = client.get("/api/providers").json()
         assert providers["demo_mode"] is True
-        run = client.post("/api/runs", json={"request": "Design a todo app API", "profile": "software"}).json()
+        run = client.post("/api/runs", json={"request": "Design a todo app API", "profile": "software",
+                                             "require_plan_approval": True}).json()
         run = wait_for(client, run["id"], {"awaiting_approval"})
         assert run["plan"]["tasks"], "plan has tasks"
         assert run["plan_review"]["reviewer"] != run["plan"]["planner"], "plan reviewed by a different model"

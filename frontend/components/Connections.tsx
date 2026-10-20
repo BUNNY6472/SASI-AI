@@ -612,45 +612,18 @@ export default function Connections({
 
       {limits && (
         <>
-          <h2>Timing & run limits</h2>
+          <h2>Question handling & usage limits</h2>
           <p className="muted small">
-            {limits.timing_policy === "graceful"
-              ? "The research time target guides new work. Research stops earlier when needed to reserve the working allowance, finishing grace and final assembly within the total maximum. Work can finish early; provider errors, cancellation and usage budgets still apply."
-              : "Historical strict timing sets an upper limit and reserves time to assemble a result. Work may finish earlier."}{" "}
-            The session clock pauses while a plan waits for approval.
+            New questions use a question-driven workflow. SASI selects work and
+            reviews according to the request and available evidence. Usage
+            limits, provider failures and cancellation still apply. Model
+            agreement is not proof of correctness.
           </p>
           <div className="glass limits">
             <div>
-              <b>{limits.time_limit_minutes} min</b>
-              <span>
-                {limits.timing_policy === "graceful"
-                  ? "default research time target"
-                  : "strict time limit"}
-              </span>
+              <b>Question-driven</b>
+              <span>work selected for each request</span>
             </div>
-            {!!limits.max_total_run_minutes && (
-              <div>
-                <b>{limits.max_total_run_minutes} min total</b>
-                <span>hard active-time maximum, including finishing</span>
-              </div>
-            )}
-            {limits.timing_policy === "graceful" ? (
-              <>
-                <div>
-                  <b>{limits.model_phase_min_minutes ?? 20} min minimum</b>
-                  <span>working allowance per active model call</span>
-                </div>
-                <div>
-                  <b>+ {limits.model_phase_grace_minutes ?? 5} min</b>
-                  <span>finishing grace before an unfinished call stops</span>
-                </div>
-              </>
-            ) : (
-              <div>
-                <b>Up to {limits.wrap_up_minutes} min</b>
-                <span>delivery reserve, adjusted per run</span>
-              </div>
-            )}
             <div>
               <b>
                 {trialCreditsOnly

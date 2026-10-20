@@ -94,6 +94,13 @@ def finalization_allowance(run: Run) -> float:
 
 def reasoning_effort(run: Run, kind: str, remaining: float | None) -> str:
     """Provider reasoning effort, independently bounded by delivery time."""
+    if run.workflow == "bridge":
+        if kind == "plan":
+            return "low"
+        if kind == "final_eval":
+            from .bridge import route
+            return "medium" if route(run).complexity != "simple" else "low"
+        return "high" if run.mode == "deep" or complex_request(run) else "medium"
     if run.mode == "quick":
         return "low" if kind in {"analysis", "plan", "plan_review", "cross_check"} else "medium"
     core = kind in {"task", "integrate", "final_eval"}
@@ -103,3 +110,16 @@ def reasoning_effort(run: Run, kind: str, remaining: float | None) -> str:
     if kind == "task":
         needed += finish_reserve(run)
     return "high" if remaining is None or remaining >= needed else "medium"
+
+
+def answer_tokens(run: Run, ceiling: int) -> int:
+    """Room for the requested final artifact; compact handoffs have separate limits."""
+    explicit_long = bool(re.search(
+        r"\b(?:full|complete|entire|comprehensive|detailed|long.form|production)\b", run.request, re.I))
+    if run.eris or run.profile == "software":
+        desired = 32_000 if explicit_long or run.mode == "deep" else 16_000
+    elif run.mode == "deep" or explicit_long:
+        desired = 16_000 if complex_request(run) else 8_000
+    else:
+        desired = 8_000 if complex_request(run) else 4_000
+    return min(ceiling, desired)

@@ -42,7 +42,7 @@ def test_live_run_records_external_outcome_actual_model_checks_and_hash():
         requests.append(request)
         if request.method == "POST":
             body = json.loads(request.content)
-            assert body["mode"] == "quick" and body["time_limit_minutes"] == 20
+            assert body["mode"] == "quick" and "time_limit_minutes" not in body
             assert body["require_plan_approval"] is False
             return httpx.Response(200, json={"id": "run-one", "status": "running"})
         return httpx.Response(200, json={"id": "run-one", "status": "completed", "simulated": False,
@@ -80,6 +80,23 @@ def test_unknown_create_outcome_is_not_retried():
         with pytest.raises(evaluation.EvaluationError, match="unknown"):
             evaluation.run_case(client, evaluation.load_cases(evaluation.DEFAULT_CASES)[0], "adaptive", 20)
     assert len(calls) == 1
+
+
+def test_question_driven_watchdog_does_not_reinstate_session_timer(monkeypatch):
+    now = iter([0, 1201, 1202])
+    monkeypatch.setattr(evaluation.time, "monotonic", lambda: next(now))
+    cancelled = []
+    def handler(request):
+        if request.url.path.endswith("/cancel"):
+            cancelled.append(True)
+            return httpx.Response(200, json={"ok": True})
+        assert "time_limit_minutes" not in json.loads(request.content)
+        return httpx.Response(200, json={"id": "run-one", "status": "running",
+                                         "timing_policy": "question_driven"})
+    with httpx.Client(base_url="http://localhost", transport=httpx.MockTransport(handler)) as client:
+        result = evaluation.run_case(client, evaluation.load_cases(evaluation.DEFAULT_CASES)[0], "adaptive", 20)
+    assert cancelled and result["harness_watchdog_s"] == 1200
+    assert result["external_outcome"]["verdict"] == "unscored"
 
 
 def test_graceful_run_can_complete_after_its_research_target(monkeypatch):

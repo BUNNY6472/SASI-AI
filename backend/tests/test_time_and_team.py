@@ -13,8 +13,15 @@ from app.main import create_app
 
 
 def make_client(**overrides) -> TestClient:
+    """Explicit legacy fixtures preserve timing regressions for saved runs."""
     opts = {"allow_simulated": True, "simulated_delay": 0.0, **overrides}
-    return TestClient(create_app(Settings(_env_file=None, static_dir="/nonexistent", **opts)))
+    app = create_app(Settings(_env_file=None, static_dir="/nonexistent", **opts))
+    start = app.state.controller.start
+    async def start_legacy_fixture(run):
+        run.workflow = "legacy"
+        await start(run)
+    app.state.controller.start = start_legacy_fixture
+    return TestClient(app)
 
 
 def wait_for(client: TestClient, run_id: str, statuses: set[str], timeout: float = 15) -> dict:
@@ -204,5 +211,7 @@ def test_time_and_resource_caps_are_bounded_by_default():
     assert s.max_total_run_minutes == 120
     with make_client() as client:
         limits = client.get("/api/limits").json()
-        assert limits["time_limit_minutes"] == 120 and limits["wrap_up_minutes"] == 5 and limits["team_size"] == 4
-        assert limits["max_total_run_minutes"] == 120
+        assert limits["time_limit_minutes"] == 0 and limits["team_size"] == 4
+        assert limits["max_total_run_minutes"] == 0
+        assert limits["timing_policy"] == "question_driven"
+        assert limits["provider_request_timeout_seconds"] == 900

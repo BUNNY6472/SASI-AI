@@ -4,39 +4,39 @@
 
 ## What this version changes
 
-- **Adaptive effort:** Quick, Adaptive and Deep modes select initial analysis breadth and task limits. Measured call durations update the time reserved for synthesis and review. Complex runs can add one bounded investigation when reviews expose unresolved gaps. Claude reasoning effort also varies by task, mode and remaining time.
+- **Question-driven bridge:** new requests have no session timer. One model writes the answer and another returns compact, structured findings. A targeted correction and recheck run only when needed. Deep and Eris can add a short approach brief.
 - **Evidence before synthesis:** explicit HTTPS links are fetched with size/time limits and SSRF protection. Research/current-information requests can use the existing Gemini connection with Google Search grounding. Sources, retrieval times, search queries and unavailable evidence are visible.
 - **Honest quality labels:** invalid review JSON cannot pass; `"false"` is not a boolean verdict; incomplete model responses are rejected. Each review is bound to an answer version and SHA-256. Editing an answer invalidates its old score.
 - **Deterministic checks:** Python syntax is parsed without executing it. Citation coverage checks whether links occur in fetched evidence or provider search metadata. These checks can trigger a repair; they do not prove functional correctness or claim truth.
-- **A focused interface:** responsive navigation, a readable composer, selectable effort and time, upload progress, live work, final result, sources/checks, and retained run history. The decorative 3D background is removed from the active interface.
+- **A focused interface:** ask a question, optionally attach files and choose effort, then read one complete answer. Compact collaboration activity, actual usage and expandable sources/checks remain available.
 - **Operational controls:** durable SQLite storage for local use, explicit cloud checkpoint failures, bounded extraction, serialized run admission, graceful interruption, and deployment only after successful CI.
 
 ## How work proceeds
 
 ```text
-request + files + selected mode/time
-  -> retrieve supplied evidence; search public sources when needed
-  -> select analysis breadth -> independent analyses/cross-checks when useful
-  -> validated plan -> independent plan review -> optional user approval
-  -> dependency-aware tasks -> independent reviews -> bounded repair/reassignment
-  -> synthesize -> deterministic checks + independent final reviews
-  -> investigate a remaining gap if time/budget allow -> repair -> recheck exact result
-  -> deliver answer + sources + current checks + limitations + usage
+question + optional files
+  -> source evidence and CPU passage selection
+  -> route to healthy, policy-allowed providers
+  -> compact approach brief only when warranted
+  -> one complete answer
+  -> deterministic checks + compact independent verifier packet
+  -> targeted correction and recheck only when needed
+  -> one answer + evidence + actual usage + unresolved checks
 ```
 
-The selected time is a research planning target. At the target, no new research work is admitted, while active workflow model calls retain at least a 20-minute working allowance and five minutes of finishing grace. Actual response times can increase their allowance; completed replies proceed immediately. The total active runtime is capped at **120 minutes, including final assembly**. New work stops earlier when necessary to reserve finishing time before that cap. One bounded final synthesis may extend beyond a shorter research target, within the total cap. Approval pauses the working clock, and resume retains spent call allowances. Interrupted text is saved separately as incomplete, unreviewed work. Explicit cancellation and token/call/trial guards still apply. Source-fetch and search-tool timeouts remain separate, shorter bounds.
+New requests use `workflow=bridge` and `timing_policy=question_driven`. They finish according to completed work and checks, without a session target or a 120-minute session cutoff. Finite provider request timeouts still bound stalled network/model calls. Cancellation, token/call/trial limits and bounded correction attempts remain. Persisted legacy pipeline runs retain their original workflow and timing behavior.
 
 | Mode | Starting policy | Appropriate use |
 |---|---|---|
-| Quick | One analyst, no preliminary cross-comparison, up to two plan tasks, one final reviewer when available | Focused questions and inexpensive first passes |
-| Adaptive | One analyst for a simple request; two or three for complex/research work; bounded gap investigation | Default everyday work |
-| Deep | Available team analyses and cross-checks; larger reserve for review and repair | Difficult research and multi-part problems |
+| Quick | Direct answer and compact independent review | Focused questions |
+| Adaptive | Question-sized answer allowance, independent review and targeted correction | Default everyday work |
+| Deep | Short approach brief before answering and review; more answer room | Difficult research and multi-part problems |
 
-The initial complexity policy is a transparent heuristic, not a trained optimal router. Actual call times update its estimates during a run. `compare_all=true/false` remains a legacy API override; the UI leaves it unset. More effort may cost more without improving quality: use the evaluation runner to compare.
+Routing is an auditable heuristic, not a trained optimal router. The bridge is CPU orchestration, not a hosted SLM or a CUDA engine. A connected provider handles the generative roles; credential and billing policies still decide eligibility. No GPT integration was added. See [the research, competition adaptations and security contract](docs/COLLABORATION_BRIDGE.md).
 
 ## Understand the result
 
-**Model review score** is a peer model’s opinion, not a correctness probability or benchmark score. Only reviews for the current answer contribute to it. Past reviews remain in the audit history.
+New bridge answers display findings and verification status rather than a model-generated numerical score. Historical pipeline runs may contain a **model review score**: it is a peer model’s opinion, not a correctness probability or benchmark score. Only reviews for the current answer contribute to that assessment. Past reviews remain in the audit history.
 
 | Status/check | Meaning |
 |---|---|
@@ -91,10 +91,9 @@ The deployment enforces **`TRIAL_CREDITS_ONLY=true`** for Google Cloud routes: V
 
 | Setting | Default |
 |---|---|
-| `RUN_TIME_LIMIT_MINUTES` | 120; each new request can select a 20–120 minute research target within the server ceiling |
-| `MAX_TOTAL_RUN_MINUTES` | 120; hard total active-runtime cap including final assembly, retained across resume |
-| `MODEL_PHASE_MIN_MINUTES` | 20; minimum working allowance for an admitted workflow model call (completed replies proceed immediately) |
-| `MODEL_PHASE_GRACE_MINUTES` | 5; finishing grace after a call's allowance; active work and final synthesis stay inside the total cap |
+| `PROVIDER_REQUEST_TIMEOUT_SECONDS` | 900; transport timeout for a single bridge request, not a session duration |
+| `RUN_TIME_LIMIT_MINUTES`, `MAX_TOTAL_RUN_MINUTES` | Legacy pipeline only; ignored by new bridge requests |
+| `MODEL_PHASE_MIN_MINUTES`, `MODEL_PHASE_GRACE_MINUTES` | Legacy pipeline only |
 | `MAX_MODEL_CALLS_PER_RUN` | 300 |
 | `MAX_TOKENS_PER_RUN` | 5,000,000 |
 | `ERIS_MAX_TOKENS_PER_RUN` | 5,000,000 |
@@ -116,7 +115,7 @@ With `UPLOAD_BUCKET` configured, uploads support **10 GiB combined per run**, up
 
 The upload allowance is not a model context window: text previews inspect at most the first 2 MiB and tables have further row/column/cell bounds. CSV/JSON datasets become compact statistical reports and examples instead of repeated raw dumps. Stage-specific excerpts preserve source references and explicitly identify omissions. Large binary/media files are stored for download but are not claimed to have been inspected; eligible complete media is bounded to 8 MiB per file and 64 MiB resident per run. Generated ML scripts can use the complete original datasets when executed separately; SASI does not execute arbitrary training code inside its API process.
 
-Adaptive mode uses at most two independent analyses plus task/final verification; full comparison is available in Deep mode. Claude caches shared Eris rules for one hour and eligible repeated file prefixes for five minutes; Gemini implicit cache usage is recorded. Cache hits depend on exact prefixes and are not guaranteed. Token accounting separates cache reads/writes, uncached input, reported thinking, stage totals and conservative estimates. It does not invent dollar amounts or reinterpret historical totals as uncached billing.
+Bridge messages have bounded plan/review output allowances; the complete user request and answer under review remain intact. Repeated unchanged failed drafts do not start an endless discussion. Claude caches shared Eris rules for one hour and eligible repeated file prefixes for five minutes; Gemini implicit cache usage is recorded. Cache hits depend on exact prefixes and are not guaranteed. Token accounting separates cache reads/writes, uncached input, reported thinking, stage totals and conservative estimates. It does not invent dollar amounts or reinterpret historical totals as uncached billing.
 
 ## Deployment and limits
 

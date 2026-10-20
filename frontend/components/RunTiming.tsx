@@ -24,8 +24,10 @@ function useNow(running: boolean) {
 
 export function RunClock({ run }: { run: Run }) {
   const terminal = TERMINAL.has(run.status);
-  const running = !!run.clock_started_at && !terminal;
+  const questionDriven = run.workflow === "bridge" || run.timing_policy === "question_driven";
+  const running = !!run.clock_started_at && !terminal && !questionDriven;
   const now = useNow(running);
+  if (questionDriven) return null;
   const target = run.time_limit_s || 0;
   if (!target) return null;
   const used = elapsed(run, now);
@@ -74,8 +76,10 @@ export function RunClock({ run }: { run: Run }) {
 
 export function ActiveCalls({ run }: { run: Run }) {
   const terminal = TERMINAL.has(run.status);
+  const questionDriven = run.workflow === "bridge" || run.timing_policy === "question_driven";
   const calls = Object.entries(run.active_calls || {});
-  const now = useNow(!terminal && (calls.length > 0 || !!run.clock_started_at));
+  const now = useNow(!questionDriven && !terminal && (calls.length > 0 || !!run.clock_started_at));
+  if (questionDriven) return null;
   const used = elapsed(run, now);
   const graceful = run.timing_policy === "graceful";
   const targetReached = !!run.time_limit_s && used >= run.time_limit_s;

@@ -4,6 +4,12 @@ SASI means **Sasidhar’s Artificial Super Intelligence**. This release improves
 
 ## Implemented
 
+### Question-driven collaboration bridge
+
+New requests use a provider-independent bridge with a compact optional approach brief, one full answer, an independent structured verifier and at most one targeted correction plus recheck. New runs have no session timer. Original requests and complete answers under review are protected from context trimming. File and model messages are untrusted JSON data; invalid packets cannot pass review. Owner access, 10 GiB uploads, 5,000,000-token ceilings and existing billing policy remain.
+
+See [research and security decisions](COLLABORATION_BRIDGE.md). This replaces the timed orchestration policy below for new requests; older entries describe previous releases and saved legacy runs. No small model or GPU hosting is activated, and no frontier accuracy claim is made.
+
 ### Competition adaptations and 10 GiB uploads — 18 October 2026
 
 The follow-up release adds passage ranking, exact duplicate provenance, shared evidence budgets and no-progress guards for unchanged rejected artifacts. The user increased the combined upload allowance from 2 GiB to 10 GiB. See [competition evidence, implementation and evaluation limits](COMPETITION_EFFICIENCY.md). HTML entry pages revalidate on navigation so cached pages do not keep obsolete upload clients; already-open old tabs must be reloaded.

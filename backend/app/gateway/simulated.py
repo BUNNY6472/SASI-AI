@@ -88,6 +88,28 @@ class SimulatedAdapter:
     def _respond(self, call: ModelCall) -> str:
         name_, angle = persona(self.provider)
         request = call.hints.get("request", "the request")
+        phase = call.hints.get("phase", "")
+        if phase == "bridge-plan":
+            return json.dumps({
+                "focus": ["Produce one complete answer to the original request."],
+                "checks": ["Check the requested format and supplied constraints."],
+                "open_questions": [],
+            })
+        if phase.startswith("bridge-review:"):
+            # This is a UI/control-flow fixture, never evidence of correctness.
+            return json.dumps({
+                "verdict": "uncertain",
+                "checks": ["Simulated protocol round-trip only; no real reasoning or evidence check."],
+                "findings": [],
+                "limitations": ["Simulated models cannot independently verify an answer."],
+            })
+        if phase in {"bridge-answer", "bridge-correction"}:
+            return (
+                f"# Result\n\n_Simulated output by {name_}. Connect real models for an actual answer._\n\n"
+                f"**Request:** {request}\n\n"
+                "This fixture exercises one answer and a compact independent review. It is not a solved task."
+                + (SIMULATED_SOLUTION if call.rules else "")
+            )
         if call.kind == "plan":
             return json.dumps({
                 "goal": f"Deliver a clear, checked answer to: {request}",

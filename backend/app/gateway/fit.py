@@ -76,7 +76,7 @@ def fit(call: ModelCall, context: int, reads: set[str], reply: int | None = None
             notes.append(f.name)
         call.attachments = [new_files[f.id] for f in call.attachments]
     # 2. Then the middle of the prompt, where shared material sits; the request and the instructions stay.
-    if over > 0 and call.kind not in {"review", "plan_review", "final_eval"}:
+    if over > 0 and not call.preserve_prompt and call.kind not in {"review", "plan_review", "final_eval"}:
         keep = max(4_000, tokens(call.prompt) - over - NOTE_TOKENS)
         cut = _cut(call.prompt, int(keep * CHARS_PER_TOKEN), "the shared material")
         if cut != call.prompt:

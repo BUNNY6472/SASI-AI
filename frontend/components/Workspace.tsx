@@ -16,6 +16,7 @@ import { isZipArchive, ZIP_COVERAGE_NOTE } from "@/lib/file-coverage";
 import { AgentChip, StatusBadge, fmt, timeAgo } from "./ui";
 import Icon from "./Icon";
 import { researchTitle } from "@/lib/research-title";
+import { questionRequest } from "@/lib/question-request";
 
 interface Attachment {
   key: string;
@@ -50,16 +51,16 @@ const EXAMPLES = [
 ];
 type Mode = "quick" | "adaptive" | "deep";
 const MODES: { key: Mode; name: string; description: string }[] = [
-  { key: "quick", name: "Quick", description: "A focused path to an answer" },
+  { key: "quick", name: "Quick", description: "Keep the work focused" },
   {
     key: "adaptive",
-    name: "Adaptive",
-    description: "Match the work to your question",
+    name: "Auto",
+    description: "Choose the work your question needs",
   },
   {
     key: "deep",
-    name: "Deep research",
-    description: "More exploration and comparison",
+    name: "Deep",
+    description: "Explore more evidence and alternatives",
   },
 ];
 
@@ -80,11 +81,8 @@ export default function Workspace({
   const [request, setRequest] = useState("");
   const [materials, setMaterials] = useState("");
   const [showMaterials, setShowMaterials] = useState(false);
-  const [approval, setApproval] = useState(false);
-  const [compare, setCompare] = useState(false);
   const [eris, setEris] = useState(false);
   const [mode, setMode] = useState<Mode>("adaptive");
-  const [minutes, setMinutes] = useState(120);
   const [limits, setLimits] = useState<RunLimits | null>(null);
   const [limitsLoading, setLimitsLoading] = useState(true);
   const [limitsError, setLimitsError] = useState("");
@@ -283,17 +281,13 @@ export default function Workspace({
     try {
       const run = await api<Run>("/api/runs", {
         method: "POST",
-        body: JSON.stringify({
-          request: request.trim(),
+        body: JSON.stringify(questionRequest({
+          request,
           materials,
-          profile: "auto",
           eris,
           mode,
-          time_limit_minutes: minutes,
-          require_plan_approval: approval,
-          compare_all: compare ? true : null,
-          file_ids: files.filter((f) => f.id).map((f) => f.id),
-        }),
+          file_ids: files.flatMap((f) => f.id ? [f.id] : []),
+        })),
       });
       updateFiles(() => []);
       fileObjects.current.clear();
@@ -310,18 +304,17 @@ export default function Workspace({
     <div className="workspace">
       <section className="hero">
         <div className="eyebrow hero-eyebrow">
-          <span className="tiny-star">✳</span> A LITTLE CURIOSITY. A BIGGER
-          POSSIBILITY.
+          <span className="tiny-star">✳</span> YOUR QUESTION. CONNECTED MODELS.
         </div>
         <h1>
-          Bring your hardest question.
+          Ask once.
           <br />
-          <span>Give it room to unfold.</span>
+          <span>Let the models work together.</span>
         </h1>
         <p className="sub">
-          A focused space for research, code and complex problems.
-          <br className="desktop-only" /> Bring together capable models, your
-          context and evidence you can inspect.
+          Bring a question, a complex problem or your own data.
+          <br className="desktop-only" /> SASI coordinates your connected models
+          and brings their work into one answer.
         </p>
       </section>
       {demoMode && (
@@ -362,9 +355,9 @@ export default function Workspace({
         <div className="composer-heading">
           <Icon name="spark" size={20} />
           <label htmlFor="research-question">
-            What would you like to work on?
+            What would you like to know or solve?
           </label>
-          <span className="small muted">YOUR NEXT IDEA STARTS HERE</span>
+          <span className="small muted">EVIDENCE · COLLABORATION · ANSWER</span>
         </div>
         <textarea
           id="research-question"
@@ -477,7 +470,7 @@ export default function Workspace({
           <span>{ZIP_COVERAGE_NOTE}</span>
         </div>
         <div className="composer-bottom">
-          <div className="mode-picker" role="group" aria-label="Research mode">
+          <div className="mode-picker" role="group" aria-label="Answer effort">
             {MODES.map((m) => (
               <button
                 type="button"
@@ -492,71 +485,27 @@ export default function Workspace({
               </button>
             ))}
           </div>
-          <label className="time-picker">
-            <Icon name="clock" size={16} />
-            <span className="time-picker-copy">
-              <span>Research time target</span>
-              <select
-                value={minutes}
-                aria-describedby="research-timing-note"
-                onChange={(e) => setMinutes(Number(e.target.value))}
-              >
-                {[20, 30, 60, 120].map((m) => (
-                  <option key={m} value={m}>
-                    {m} minutes
-                  </option>
-                ))}
-              </select>
-            </span>
-          </label>
           <button
             className="btn primary start-btn"
             disabled={
               busy || uploading || limitsLoading || inventoryLoading || failedUploads || needsKeys || request.trim().length < 3
             }
           >
-            {busy ? "Starting…" : limitsLoading ? "Checking limits…" : inventoryLoading ? "Loading files…" : uploading ? "Uploading…" : failedUploads ? "Retry or remove failed files" : "Start research"}
+            {busy ? "Starting…" : limitsLoading ? "Checking limits…" : inventoryLoading ? "Loading files…" : uploading ? "Uploading…" : failedUploads ? "Retry or remove failed files" : "Ask SASI"}
             <Icon name="arrow" size={17} />
           </button>
         </div>
         <div className="mode-description">
           <span>
-            {MODES.find((m) => m.key === mode)?.description}. Finishes when the
-            work is ready.
+            {MODES.find((m) => m.key === mode)?.description}. Effort follows the
+            question and the evidence.
           </span>
           <span className="keyboard-hint">Ctrl / ⌘ ↵</span>
         </div>
-        <p className="token-budget-note"><strong>{(eris ? limits?.eris_max_tokens_per_run : limits?.max_tokens_per_run)?.toLocaleString("en-IN") ?? "50,00,000"} tokens maximum per session.</strong> Shared across model calls, input, cached input and output. Each model has its own per-request context limit. Adaptive research uses focused context and expands work when needed.</p>
-        <p id="research-timing-note" className="timing-note">
-          <strong>
-            {limits?.max_total_run_minutes ?? 120} minutes total active time
-            maximum, including finishing.
-          </strong>{" "}
-          Work can finish early. New research stops before the target when
-          needed to leave a {limits?.model_phase_min_minutes ?? 20}-minute
-          working allowance, {limits?.model_phase_grace_minutes ?? 5} minutes of
-          finishing grace, and final assembly within that maximum. Provider
-          errors and usage budgets still apply.
-        </p>
+        <p className="token-budget-note"><strong>{(eris ? limits?.eris_max_tokens_per_run : limits?.max_tokens_per_run)?.toLocaleString("en-IN") ?? "50,00,000"} tokens maximum per question.</strong> Shared across model calls, input, cached input and output. Usage is shown as the models work; the allowance is a ceiling, not a target.</p>
         <details className="advanced-options">
-          <summary>Research preferences</summary>
+          <summary>Question preferences</summary>
           <div className="preferences-grid">
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={approval}
-                onChange={(e) => setApproval(e.target.checked)}
-              />
-              <span>Approve the plan before work begins</span>
-            </label>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={compare}
-                onChange={(e) => setCompare(e.target.checked)}
-              />
-              <span>Always compare independent approaches</span>
-            </label>
             <label className="toggle">
               <input
                 type="checkbox"
@@ -622,7 +571,7 @@ export default function Workspace({
       </section>
       <section className="history" id="recent-research">
         <div className="section-heading">
-          <h2>Recent research</h2>
+          <h2>Recent questions</h2>
           <span className="small muted">
             {runs.length
               ? runs.length + " SESSIONS"
@@ -662,7 +611,7 @@ export default function Workspace({
                 <div className="run-item-body">
                   <p>{researchTitle(r.request)}</p>
                   <span className="muted small">
-                    {r.eris ? "Project Eris" : r.profile} · {r.tasks} tasks ·{" "}
+                    {r.eris ? "Project Eris" : r.workflow === "bridge" ? "Answer" : r.profile} · {r.workflow !== "bridge" ? `${r.tasks} tasks · ` : ""}
                     {fmt(r.tokens)} tokens
                     {r.simulated ? " · simulated run" : ""}
                   </span>

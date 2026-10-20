@@ -17,6 +17,7 @@ import { ActiveCalls, RunClock } from "./RunTiming";
 import IncompleteWork from "./IncompleteWork";
 import UsageDetails from "./UsageDetails";
 import FileCoverage from "./FileCoverage";
+import BridgeSession from "./BridgeSession";
 import { AgentChip, StatusBadge, fmt } from "./ui";
 
 const LIVE = new Set([
@@ -145,6 +146,7 @@ export default function RunView({
   useEffect(() => {
     const s = run?.status;
     if (!s || !followStage) return;
+    if (run?.workflow === "bridge" || run?.timing_policy === "question_driven") { setTab("result"); return; }
     if (s === "researching") setTab("evidence");
     else if (s === "analyzing" || s === "cross_checking") setTab("compare");
     else if (
@@ -214,6 +216,7 @@ export default function RunView({
       </div>
     );
   const live = LIVE.has(run.status);
+  const bridge = run.workflow === "bridge" || run.timing_policy === "question_driven";
   const total = run.plan?.tasks.length || 0;
   const done =
     run.plan?.tasks.filter((t) => t.status === "accepted").length || 0;
@@ -272,7 +275,7 @@ export default function RunView({
           {["interrupted", "budget_stopped", "failed", "cancelled"].includes(
             run.status,
           ) &&
-            (run.plan || run.analyses.length > 0) && (
+            (bridge || run.plan || run.analyses.length > 0) && (
               <button
                 className="btn"
                 disabled={busy}
@@ -366,6 +369,12 @@ export default function RunView({
         </div>
       )}
 
+      {bridge ? <BridgeSession
+        run={run}
+        evidence={<EvidencePanel run={run} />}
+        solution={run.solution ? <SolutionFile run={run} /> : null}
+        copyAnswer={run.final ? <CopyButton text={run.final.output} label="Copy answer" /> : null}
+      /> : <>
       <div className="progress-strip glass">
         {run.research_status &&
           !["not_started", "not_needed"].includes(run.research_status) && (
@@ -720,6 +729,7 @@ export default function RunView({
           ))}
         </div>
       )}
+      </>}
     </div>
   );
 }

@@ -1,21 +1,12 @@
-"""Workflow controller.
+"""Question-driven bridge orchestration, with compatibility for legacy saved runs.
 
-Owns run state and decides progression. Application rules, not model opinion,
-control what happens next:
+New runs use one answerer, an independent bounded critique and at most one
+correction followed by review. Optional planning stays a short checklist.
+Original requirements and complete answer artifacts stay intact. The controller
+enforces provider request timeouts, usage caps, trial expiry and cancellation;
+there is no new-run session timer. Exact completed reviews are checkpointed.
 
-  pick the team -> independent analyses -> cross-checks and scores -> plan ->
-  independent plan review -> (user approval) -> parallel tasks behind dependency
-  gates -> independent cross-review per task (bounded revise / reassign) ->
-  integrate -> the other models test the result and it is fixed -> deliver with
-  evidence, limitations and usage.
-
-The run target stops admission of new work. Admitted model phases keep their
-adaptive allowance and bounded finishing grace; completed work proceeds early.
-Call/token caps, cancellation, trial expiry and the inclusive total runtime cap
-remain hard controls. One reserved finalization may follow the target. Approval
-pauses the run clock.
-
-Accepted work is checkpointed, so an interrupted run resumes without redoing it.
+Legacy saved runs retain their analyses/task pipeline and active-time policy.
 """
 from __future__ import annotations
 
@@ -40,7 +31,7 @@ from .context import compact_attachments
 from ..gateway.catalog import name, reads, seat
 from ..gateway.registry import FRONTIER, ModelRegistry
 from ..gateway.routes import VIA, lasting_problem
-from ..models import (TERMINAL, Attempt, CallTiming, CheckResult, Consensus, Event, FinalResult, Judgement, LiveText, Opinion,
+from ..models import (TERMINAL, Attempt, BridgeReview, BridgeState, CallTiming, CheckResult, Consensus, Event, FinalResult, Judgement, LiveText, Opinion,
                       PartialOutput, Plan, Review, Run, Task, now)
 from ..store.base import RunStore
 from . import eris, policy, prompts
@@ -309,6 +300,10 @@ class Controller:
     def _refresh_final_assessment(self, run: Run, final: FinalResult) -> None:
         self._stamp_final(final)
         current = [j for j in final.judges if j.artifact_hash == final.artifact_hash]
+        if run.workflow == "bridge" and run.bridge:
+            contexts = {(r.provider, r.round, r.artifact_hash) for r in run.bridge.reviews
+                        if r.context_hash == run.bridge.review_context_hash}
+            current = [j for j in current if (j.judge, j.round, j.artifact_hash) in contexts]
         if current:
             last_round = max(j.round for j in current)
             current = [j for j in current if j.round == last_round]
@@ -368,6 +363,13 @@ class Controller:
         self._launch(run)
 
     def _set_limit(self, run: Run) -> None:
+        if run.workflow == "bridge":
+            run.timing_policy = "question_driven"
+            run.time_limit_minutes = None
+            run.time_limit_s = run.total_time_limit_s = run.wrap_up_s = 0
+            run.model_phase_min_s = run.model_phase_grace_s = 0
+            run.finalization_deadline_elapsed_s = run.deadline_at = None
+            return
         run.timing_policy = "graceful"
         run.model_phase_min_s = self.settings.model_phase_min_minutes * 60
         run.model_phase_grace_s = self.settings.model_phase_grace_minutes * 60
@@ -411,7 +413,9 @@ class Controller:
         run.error = None
         run.wrapping_up = False
         run.finished_at = None
-        if not run.time_limit_s:  # a run from before time limits
+        if run.workflow == "bridge":
+            self._set_limit(run)
+        elif not run.time_limit_s:  # a run from before time limits
             self._set_limit(run)
         elif run.timing_policy != "graceful":
             run.timing_policy = "graceful"
@@ -522,7 +526,7 @@ class Controller:
         return spare
 
     def _check_budget(self, run: Run, reserve: int = 0) -> None:
-        """Optional caps on calls and tokens (0 means no cap). Time is the main limit."""
+        """Usage/trial controls; legacy timed runs also retain their saved deadline."""
         if run.timing_policy == "graceful" and run.elapsed_s >= run.total_time_limit_s:
             raise OutOfTime("total")
         window_error = self.registry.trial_credit_window_error()
@@ -553,6 +557,8 @@ class Controller:
             run.clock_started_at = None
         if not run.time_limit_s:
             run.deadline_at = None
+            if run.workflow == "bridge":
+                run.clock_started_at = now()
             return
         t = now()
         run.clock_started_at = t
@@ -567,6 +573,8 @@ class Controller:
 
     def _time_left(self, run: Run) -> tuple[float | None, str]:
         """Time for admitting new work; graceful calls keep their own active windows."""
+        if run.workflow == "bridge":
+            return None, ""
         if run.timing_policy == "graceful":
             total_left = run.total_time_limit_s - run.elapsed_s
             if run.wrapping_up and run.finalization_deadline_elapsed_s is not None:
@@ -615,6 +623,8 @@ class Controller:
         """Longest answer one call may write. Eris runs need room for a whole training script."""
         s = self.settings
         ceiling = s.eris_max_output_tokens_per_call if run.eris else s.max_output_tokens_per_call
+        if run.workflow == "bridge":
+            return ceiling
         if run.mode == "deep":
             return ceiling
         return min(ceiling, 32_000 if run.eris else 16_000)
@@ -790,6 +800,29 @@ class Controller:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
+    async def _wait_for_request(self, run: Run, awaitable: Awaitable, timeout: float) -> ModelResult:
+        """Finite transport timeout, trial expiry and checkpoints without a session timer."""
+        task = asyncio.ensure_future(awaitable)
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                if task.done():
+                    return task.result()
+                if error := self.registry.trial_credit_window_error():
+                    raise BudgetExceeded(error)
+                if time.monotonic() >= deadline:
+                    raise asyncio.TimeoutError()
+                heartbeat = self._scheduled_checkpoint(run)
+                watched = {task, heartbeat} if heartbeat else {task}
+                await asyncio.wait(watched, timeout=max(.001, min(30.0, deadline - time.monotonic())),
+                                   return_when=asyncio.FIRST_COMPLETED)
+                if heartbeat and heartbeat.done():
+                    heartbeat.result()
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
     def _keep_partial(self, run: Run, provider: str, call: ModelCall, text: str, reason: str,
                       reserve: int, usage_recorded: bool = False, model: str = "") -> None:
         partial = PartialOutput(provider=provider, model=model or self.registry.status.get(provider, {}).get("model") or "",
@@ -839,11 +872,18 @@ class Controller:
         token_limit = self.settings.eris_max_tokens_per_run if run.eris else self.settings.max_tokens_per_run
         if token_limit:
             remaining = max(0, token_limit - run.usage.total_tokens - self._token_reservations.get(run.id, 0))
-            call.prompt += (f"\n\nController resource context: about {remaining:,} aggregate tokens remain across the team. "
-                            "This is a ceiling, not a target to spend. Reuse established facts; focus on unresolved requirements "
-                            "and concrete checks. Return the requested artifact when complete. Do not repeat analyses or "
-                            "claim that omitted file content was inspected. Preserve all material uncertainty.")
+            resource_note = ("Resource allowances are ceilings, not targets to spend. Reuse established facts; focus on unresolved "
+                             "requirements and concrete checks. Return the requested artifact when complete. Do not repeat "
+                             "analyses or claim that omitted file content was inspected. Preserve all material uncertainty.")
+            if run.workflow == "bridge":
+                # Keep the packet a single valid JSON object and the cacheable prefix stable.
+                call.system += "\n\n" + resource_note
+            else:
+                call.prompt += f"\n\nController resource context: about {remaining:,} aggregate tokens remain across the team. " + resource_note
         base_timeout = 1200 if (call.attachments or run.eris or call.max_output_tokens > 8000) else 600
+        if run.workflow == "bridge":
+            base_timeout = self.settings.provider_request_timeout_seconds
+            call.timeout_seconds = base_timeout + 30
         last: Exception | None = None
         again = shrunk = roomier = 0
         while True:
@@ -867,6 +907,11 @@ class Controller:
             self._check_budget(run, reserve)
             self._token_reservations[run.id] = self._token_reservations.get(run.id, 0) + reserve
             run.usage.calls += 1
+            if run.workflow == "bridge":
+                run.bridge = run.bridge or BridgeState()
+                run.bridge.inflight_tokens = reserve
+                run.bridge.inflight_provider, run.bridge.inflight_stage = provider, call.kind
+                await self._publish(run, checkpoint=True)
             chunks: list[str] = []
             captured = 0
             async def capture(piece: str) -> None:
@@ -886,6 +931,7 @@ class Controller:
             result = None
             try:
                 result = (await self._wait_for_model(run, provider, adapter.generate(call), window) if window else
+                          await self._wait_for_request(run, adapter.generate(call), timeout) if run.workflow == "bridge" else
                           await asyncio.wait_for(adapter.generate(call), timeout=timeout))
                 if not result.text.strip():  # adapters raise for this already; an empty answer is never recorded
                     raise ProviderError(provider, "the model returned no answer text", retryable=True)
@@ -911,8 +957,12 @@ class Controller:
                                 f"{limit:,} tokens and is trying again", provider)
                     continue
                 if ("no answer text" in str(e) or "truncated" in str(e)) and roomier < 1:
+                    if run.workflow == "bridge" and call.kind in {"plan", "final_eval"}:
+                        break  # compact handoff schemas never grow to narrative-sized output
                     roomier += 1
-                    call.max_output_tokens = min(int(call.max_output_tokens * 1.5) + 2_000, model_max)
+                    call.max_output_tokens = min(int(call.max_output_tokens * 1.5) + 2_000,
+                                                 self._out_cap(run), model_max // 2) if run.workflow == "bridge" else min(
+                                                     int(call.max_output_tokens * 1.5) + 2_000, model_max)
                     self._event(run, "retry", f"{name(provider)} did not finish its answer, so SASI is asking again "
                                 "with more output room", provider)
                     continue
@@ -947,11 +997,17 @@ class Controller:
                 if not complete:
                     self._keep_partial(run, provider, call, "".join(chunks) or (result.text if result else ""),
                                        failed_reason, reserve, usage_recorded, result.model if result else "")
+                    if run.workflow == "bridge" and run.bridge:
+                        run.bridge.inflight_tokens = 0
+                        await self._publish(run, checkpoint=True)
                 self._token_reservations[run.id] = max(0, self._token_reservations.get(run.id, 0) - reserve)
             policy.observe(run, call.kind, time.monotonic() - started)
             self._record_usage(run, call.kind, result)
             self._record(run, call, result)
             self.registry.sync(provider)  # the route that answered may have changed
+            if run.workflow == "bridge" and run.bridge:
+                run.bridge.inflight_tokens = 0
+                await self._publish(run, checkpoint=True)
             return result
         self._unhealthy.setdefault(run.id, set()).add(provider)
         reason = str(last or "unknown error")
@@ -969,12 +1025,14 @@ class Controller:
 
     async def _call_any(self, run: Run, role: str, call: ModelCall, load: dict[str, int],
                         exclude: set[str] | None = None, live: tuple[str, str] | None = None,
-                        frontier_first: bool = False) -> tuple[str, ModelResult, str]:
+                        frontier_first: bool = False, strict_exclude: bool = False) -> tuple[str, ModelResult, str]:
         """Pick a provider for a role; on provider failure fall back to the next one and record it.
         Planning and writing the final result go to a frontier model when one works."""
         tried: set[str] = set()
         while True:
             eligible = [p for p in self._eligible(run) if p not in tried]
+            if strict_exclude:
+                eligible = [p for p in eligible if p not in (exclude or set())]
             if run.timing_policy == "graceful" and not run.wrapping_up:
                 continuing = [p for p in eligible if self._can_continue(
                     run, p, call.kind, str(call.hints.get("task_id", "")), str(call.hints.get("phase", call.hints.get("round", ""))))]
@@ -986,7 +1044,7 @@ class Controller:
                 raise NoProviders(f"every model failed as {role}")
             if frontier_first:
                 eligible = [p for p in eligible if p in FRONTIER] or eligible
-            kind = "review" if "review" in role or "evaluator" in role else "work"
+            kind = "review" if call.kind in {"review", "plan_review", "final_eval", "cross_check"} or "review" in role or "evaluator" in role else "work"
             choice = self.router.pick(eligible, run.profile, load, role, exclude, kind=kind)
             try:
                 return choice.provider, await self._call(run, choice.provider, call, live), choice.reason
@@ -995,6 +1053,191 @@ class Controller:
                 self._event(run, "fallback", f"Reassigning {role} after {name(choice.provider)} failed")
 
     # ------------------------------------------------------------------ main flow
+
+    def _bridge_context(self, run: Run, kind: str) -> str:
+        """Source excerpts and coverage, never a replacement for the original request."""
+        checks = []
+        if run.final and kind in {"final_eval", "correction"}:
+            hashes = self._current_artifact_hashes(run, run.final)
+            checks = [c.model_dump() for c in run.final.checks
+                      if c.kind != "model_review" and c.artifact_hash in hashes]
+        return json.dumps({
+            "source_context": prompts.evidence_block(run.evidence, run.request, kind),
+            "files": [f.model_dump() for f in run.files],
+            "research_status": run.research_status,
+            "deterministic_checks": checks,
+        }, ensure_ascii=False)
+
+    async def _bridge_review(self, run: Run, load: dict[str, int], files: list[StoredFile], plan):
+        from . import bridge
+
+        state, final = run.bridge, run.final
+        assert state is not None and final is not None
+        await self._verify_final(run)
+        system, prompt = bridge.verifier_prompt(run, final.output, context=self._bridge_context(run, "final_eval"), plan=plan)
+        context_hash = self._review_context_hash(run, system, prompt, files)
+        state.review_context_hash = context_hash
+        self._refresh_final_assessment(run, final)
+        saved = next((r for r in reversed(state.reviews)
+                      if r.context_hash == context_hash and r.artifact_hash == final.artifact_hash
+                      and r.provider != final.integrator), None)
+        if saved:
+            self._event(run, "bridge_reused", "Reused the saved review of this exact answer and unchanged evidence.", saved.provider)
+        else:
+            state.phase, run.status = "verifying", "integrating"
+            await self._publish(run, checkpoint=True)
+            try:
+                provider, result, _ = await self._call_any(
+                    run, "independent bridge verifier",
+                    ModelCall(system, prompt, "final_eval", bridge.REVIEW_MAX_OUTPUT_TOKENS,
+                              {"request": run.request, "phase": f"bridge-review:{final.artifact_version}"},
+                              attachments=files, preserve_prompt=True),
+                    load, exclude={final.integrator} if final.integrator else set(), strict_exclude=True,
+                    live=("bridge_review", "Checking the complete answer"))
+            except NoProviders:
+                note = "No independent model was available to review this answer. Its correctness remains unverified."
+                if note not in final.limitations:
+                    final.limitations.insert(0, note)
+                return None
+            state.verifier = provider
+            try:
+                packet = bridge.parse_review(result.text, allowed_refs=bridge.reference_ids(run), answer=final.output)
+                payload, error = packet.model_dump(), ""
+            except (ValidationError, ValueError, TypeError):
+                payload, error = None, "The model's review was invalid or incomplete; it cannot verify this answer."
+            saved = BridgeReview(provider=provider, model=result.model, artifact_hash=final.artifact_hash,
+                                 context_hash=context_hash, round=max((j.round for j in final.judges), default=-1) + 1,
+                                 packet=payload, error=error)
+            state.reviews.append(saved)
+        state.verifier = saved.provider
+        try:
+            packet = (bridge.parse_review(json.dumps(saved.packet), allowed_refs=bridge.reference_ids(run),
+                                          answer=final.output) if saved.packet else None)
+        except (ValidationError, ValueError, TypeError):
+            packet = None
+        # A passing model opinion with disclosed limitations is still a partial review.
+        verdict = (False if packet and packet.verdict == "revise" else
+                   True if packet and packet.verdict == "pass" and not packet.limitations else None)
+        findings = [f.problem for f in packet.findings] if packet else []
+        judgment = Judgement(
+            judge=saved.provider, model=saved.model, round=saved.round, artifact_hash=final.artifact_hash,
+            artifact_version=final.artifact_version, meets_criteria=verdict,
+            must_fix=findings if packet and packet.verdict == "revise" else [],
+            gaps=(findings + packet.limitations if packet and verdict is None else
+                  [saved.error or "The saved review is invalid."] if packet is None else []))
+        # Restoring a review is idempotent; no duplicate history or paid model call.
+        final.judges = [j for j in final.judges if not (
+            j.judge == judgment.judge and j.round == judgment.round and j.artifact_hash == judgment.artifact_hash)] + [judgment]
+        if packet:
+            final.limitations = list(dict.fromkeys(final.limitations + packet.limitations))
+        self._refresh_final_assessment(run, final)
+        self._event(run, "bridge_review", "Independent review: " + (packet.verdict if packet else "unverified") + ".",
+                    saved.provider)
+        await self._publish(run, checkpoint=True)
+        return packet
+
+    async def _execute_bridge(self, run: Run, load: dict[str, int], files: list[StoredFile]) -> None:
+        """Answer -> independent compact critique -> at most one correction -> review."""
+        from . import bridge
+
+        state = run.bridge = run.bridge or BridgeState()
+        route = bridge.route(run)
+        state.complexity, state.reasons = route.complexity, list(route.reasons)
+        self._event(run, "bridge", "One answerer and an independent verifier exchange a bounded critique; "
+                    "the final answer remains complete. Work finishes when these stages finish.")
+        plan = None
+        if state.plan:
+            try:
+                plan = bridge.parse_plan(json.dumps(state.plan))
+            except (ValidationError, ValueError, TypeError):
+                state.plan = None
+        if (route.needs_plan or run.require_plan_approval) and not state.plan_attempted and not run.final:
+            state.phase, run.status = "planning", "planning"
+            state.plan_attempted = True
+            await self._publish(run, checkpoint=True)
+            system, prompt = bridge.planner_prompt(run, context=self._bridge_context(run, "plan"))
+            try:
+                provider, result, _ = await self._call_any(
+                    run, "bridge planner",
+                    ModelCall(system, prompt, "plan", bridge.PLAN_MAX_OUTPUT_TOKENS,
+                              {"request": run.request, "phase": "bridge-plan"}, attachments=files, preserve_prompt=True), load,
+                    live=("bridge_plan", "Selecting requirements and checks"))
+                plan = bridge.parse_plan(result.text)
+                state.plan = plan.model_dump()
+                run.plan = Plan(goal="Answer the original request", deliverables=plan.focus,
+                                success_criteria=plan.checks, assumptions=plan.open_questions, planner=provider)
+            except (ValidationError, ValueError, TypeError):
+                self._event(run, "bridge_plan_invalid", "The planning packet was invalid; the answerer will use the full original requirements.")
+            except NoProviders:
+                self._event(run, "bridge_plan_unavailable", "The optional planner was unavailable.")
+            await self._publish(run, checkpoint=True)
+        if run.require_plan_approval and not run.plan_approved and not run.final:
+            run.plan = run.plan or Plan(goal="Answer the original request", deliverables=["One complete answer"],
+                                       success_criteria=get_profile(run.profile).final_checks)
+            run.status = "awaiting_approval"
+            self._clock_stop(run)
+            self._event(run, "awaiting_approval", "Review the proposed checks and approve to start the answer.")
+            await self._publish(run, checkpoint=True)
+            await self._approvals.setdefault(run.id, asyncio.Event()).wait()
+            self._clock_start(run)
+        if not run.final or not run.final.output:
+            state.phase, run.status = "answering", "running"
+            await self._publish(run, checkpoint=True)
+            system, prompt = bridge.answer_prompt(run, plan=plan, context=self._bridge_context(run, "task"))
+            provider, result, _ = await self._call_any(
+                run, "bridge answerer",
+                ModelCall(system, prompt, "task", policy.answer_tokens(run, self._out_cap(run)),
+                          {"request": run.request, "phase": "bridge-answer"}, attachments=files, preserve_prompt=True),
+                load, live=("final", "Writing the complete answer"))
+            state.answerer = provider
+            run.final = FinalResult(output=result.text, integrator=provider)
+            await self._verify_final(run)
+            await self._publish(run, checkpoint=True)
+        final = run.final
+        state.answerer = final.integrator
+        packet = await self._bridge_review(run, load, files, plan)
+        current_hashes = self._current_artifact_hashes(run, final)
+        deterministic_failures = [c for c in final.checks if c.kind != "model_review"
+                                  and c.artifact_hash in current_hashes and c.status == "fail"]
+        needs_correction = packet is not None and (
+            packet.verdict == "revise" or deterministic_failures or
+            (packet.verdict == "uncertain" and any(f.severity in {"blocker", "major"} for f in packet.findings)))
+        if needs_correction and not state.correction_attempted:
+            # Persist before dispatch: restart after an unknown outcome cannot launch another correction.
+            state.correction_attempted = True
+            state.phase, run.status = "correcting", "running"
+            await self._publish(run, checkpoint=True)
+            system, prompt = bridge.correction_prompt(run, final.output, packet,
+                                                       context=self._bridge_context(run, "correction"))
+            old_output = final.output
+            try:
+                provider, result, _ = await self._call_any(
+                    run, "bridge corrector",
+                    ModelCall(system, prompt, "task", policy.answer_tokens(run, self._out_cap(run)),
+                              {"request": run.request, "phase": "bridge-correction"}, attachments=files,
+                              preserve_prompt=True), load, live=("final", "Applying the review to the complete answer"),
+                    exclude={state.verifier} if state.verifier else set(), strict_exclude=True)
+                state.correction_completed = True
+                if result.text == old_output:
+                    final.limitations.insert(0, STALLED_FINAL_LIMITATION)
+                    self._event(run, "no_progress", "The correction returned identical answer bytes. Existing findings remain unresolved; no duplicate review was requested.")
+                else:
+                    final.output, final.integrator, state.answerer = result.text, provider, provider
+                    final.fixes += 1
+                    self._stamp_final(final)
+                    await self._verify_final(run)
+                    await self._publish(run, checkpoint=True)
+                    await self._bridge_review(run, load, files, plan)
+            except NoProviders:
+                final.limitations.insert(0, "The correction could not be completed by an available independent answerer; the reviewed draft is retained.")
+        if state.correction_attempted and not state.correction_completed:
+            final.limitations.insert(0, "The single correction was interrupted or unavailable. Its completion is not confirmed; the saved answer and unresolved review findings are retained.")
+        if final.verification_status != "reviewed":
+            final.limitations.insert(0, "Review did not establish that every requirement is met. Read the checks and unresolved findings before relying on this result.")
+        final.limitations.append("Model review is an opinion against the supplied requirements and evidence, not an executed test.")
+        final.limitations = list(dict.fromkeys(final.limitations))[:14]
+        state.phase = "complete"
+        self._deliver(run, final, "Delivered one complete answer with its verification status and recorded usage.")
 
     @staticmethod
     def _estimate(run: Run, files: list[StoredFile]) -> int:
@@ -1040,9 +1283,18 @@ class Controller:
                 if run.timing_policy == "graceful" and run.elapsed_s >= run.total_time_limit_s:
                     raise OutOfTime("total")
                 files = await self.files.get(run.id) if run.files else []
+                if run.workflow == "bridge" and run.bridge and run.bridge.inflight_tokens:
+                    state = run.bridge
+                    run.usage.record(state.inflight_provider, state.inflight_stage, 0, state.inflight_tokens, estimated=True)
+                    self._event(run, "usage_estimated", "An interrupted provider request had no saved usage. Its reserved token allowance was conservatively charged.")
+                    state.inflight_tokens = 0
+                    await self._publish(run, checkpoint=True)
                 self._note_team(run, self._estimate(run, files))
                 await self._gather_evidence(run, files)
                 await self._publish(run)
+                if run.workflow == "bridge":
+                    await self._execute_bridge(run, load, files)
+                    return
                 effort = policy.allocate(run, len(self._eligible(run)), self.settings.max_tasks_per_plan)
                 self._event(run, "effort", f"{effort.reason}; {effort.analysts} initial analyst(s)")
                 analyst_ids = self._eligible(run)[:effort.analysts]
@@ -1501,6 +1753,7 @@ class Controller:
         context = {
             "system": system, "prompt": prompt, "request": run.request, "materials": run.materials,
             "profile": run.profile, "eris": run.eris,
+            "rules": eris.RULES if run.eris else "",
             "evidence": [item.model_dump() for item in run.evidence],
             "file_refs": [item.model_dump() for item in run.files],
             "plan": ({"goal": plan.goal, "assumptions": plan.assumptions, "deliverables": plan.deliverables,

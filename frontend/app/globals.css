@@ -2973,6 +2973,49 @@ code {
 .check-status.fail {
   color: #934a32;
 }
+
+/* Question-first sessions keep one answer visible while details remain inspectable. */
+.bridge-session { display: grid; gap: 20px; min-width: 0; }
+.bridge-collaboration { padding: 18px 22px; }
+.bridge-collaboration-head, .bridge-collaboration-head > div,
+.bridge-answer-heading, .bridge-evidence > summary { display: flex; align-items: center; gap: 12px; }
+.bridge-collaboration-head, .bridge-answer-heading, .bridge-evidence > summary { justify-content: space-between; flex-wrap: wrap; }
+.bridge-collaboration-head strong { font-size: 14px; }
+.bridge-state-dot { width: 7px; height: 7px; border-radius: 50%; background: #7d8b72; flex: 0 0 auto; }
+.bridge-state-dot.active { background: #2b8774; box-shadow: 0 0 0 4px #2b877412; }
+.bridge-latest { margin: 12px 0; font-size: 13px; color: #56644f; overflow-wrap: anywhere; }
+.bridge-active-models { display: flex; flex-wrap: wrap; gap: 10px 20px; margin: 14px 0; }
+.bridge-active-models > span { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 12px; }
+.bridge-activity { margin-top: 12px; border-top: 1px solid var(--border, #e3e7de); padding-top: 12px; }
+.bridge-activity summary, .bridge-evidence > summary { cursor: pointer; font-size: 13px; color: #445d4b; }
+.bridge-activity ol { padding: 0; list-style: none; max-height: 360px; overflow-y: auto; }
+.bridge-activity li { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 12px; padding: 9px 0; border-top: 1px solid #e9ece6; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.bridge-event-label { color: #627759; font-weight: 600; }
+.bridge-routing { font-size: 12px; line-height: 1.8; }
+.bridge-routing > p:first-child { display: flex; flex-wrap: wrap; gap: 10px 20px; }
+.bridge-routing ul { padding-left: 20px; }
+.bridge-answer { min-width: 0; }
+.bridge-answer-heading { margin-bottom: 18px; }
+.bridge-answer-heading h2 { margin: 5px 0 0; font-size: 24px; font-weight: 550; letter-spacing: -.025em; }
+.bridge-answer-placeholder { font-size: 14px; color: #65735c; line-height: 1.85; margin: 0; }
+.bridge-answer .result-meta { margin-bottom: 20px; flex-wrap: wrap; }
+.bridge-assurance:empty { display: none; }
+.bridge-assurance { border-top: 1px solid #e3e7de; margin-top: 28px; padding-top: 18px; font-size: 13px; line-height: 1.8; }
+.bridge-assurance h3 { font-size: 13px; margin: 14px 0 5px; }
+.bridge-assurance ul { padding-left: 20px; }
+.bridge-evidence { border: 1px solid #e3e7de; border-radius: 12px; background: #ffffff70; min-width: 0; }
+.bridge-evidence > summary { padding: 17px 20px; font-weight: 600; }
+.bridge-evidence > summary > span:last-child { font-size: 12px; font-weight: 400; }
+.bridge-evidence > .evidence-layout, .bridge-evidence > .incomplete-work { margin: 0 16px 16px; }
+.bridge-session .usage-details { margin: 0; }
+@media (max-width: 680px) {
+  .bridge-collaboration { padding: 16px; }
+  .bridge-collaboration-head > .small { width: 100%; padding-left: 19px; }
+  .bridge-answer-heading h2 { font-size: 21px; }
+  .bridge-activity li { grid-template-columns: 1fr; gap: 2px; }
+  .bridge-evidence > summary { padding: 15px; gap: 6px; }
+  .bridge-evidence > summary > span:last-child { width: 100%; }
+}
 .source-card p,
 .check-item p {
   line-height: 1.8;

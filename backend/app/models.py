@@ -238,6 +238,35 @@ class PartialOutput(BaseModel):
     usage_estimated: bool = True
 
 
+class BridgeReview(BaseModel):
+    """A compact review bound to exact answer bytes and their full review context."""
+    provider: str
+    model: str = ""
+    artifact_hash: str
+    context_hash: str
+    round: int
+    packet: dict | None = None
+    error: str = ""
+
+
+class BridgeState(BaseModel):
+    phase: Literal["routing", "planning", "answering", "verifying", "correcting", "complete"] = "routing"
+    complexity: str = "simple"
+    reasons: list[str] = Field(default_factory=list)
+    answerer: str | None = None
+    verifier: str | None = None
+    plan: dict | None = None
+    plan_attempted: bool = False
+    reviews: list[BridgeReview] = Field(default_factory=list)
+    review_context_hash: str = ""
+    correction_attempted: bool = False
+    correction_completed: bool = False
+    # Conservatively charged after a crash if provider usage was never checkpointed.
+    inflight_tokens: int = 0
+    inflight_provider: str = ""
+    inflight_stage: str = ""
+
+
 class Run(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
     created_at: float = Field(default_factory=now)
@@ -249,6 +278,9 @@ class Run(BaseModel):
     require_plan_approval: bool = True
     compare_all: bool | None = None  # explicit legacy setting; None lets the effort policy decide
     mode: Literal["adaptive", "quick", "deep"] = "adaptive"
+    # Missing on old checkpoints: keep their original workflow and timing semantics.
+    workflow: Literal["legacy", "bridge"] = "legacy"
+    bridge: BridgeState | None = None
     time_limit_minutes: float | None = Field(default=None, ge=5, le=120)
     evidence: list[SourceEvidence] = Field(default_factory=list)
     search_queries: list[str] = Field(default_factory=list)
@@ -278,9 +310,9 @@ class Run(BaseModel):
     usage: Usage = Field(default_factory=Usage)
     events: list[Event] = []
     error: str | None = None
-    # Older records used a strict deadline. New runs use a soft admission target and per-call grace.
-    # Clock and elapsed finalization allowance pause while waiting for approval.
-    timing_policy: Literal["strict", "graceful"] = "strict"
+    # Older records retain strict/graceful deadlines. New bridge runs only track elapsed time.
+    # Working-time accounting pauses while waiting for approval.
+    timing_policy: Literal["strict", "graceful", "question_driven"] = "strict"
     model_phase_min_s: float = 1200
     model_phase_grace_s: float = 300
     total_time_limit_s: float = 7200  # hard active-runtime ceiling including final assembly; pauses exclude approval/downtime
@@ -325,6 +357,7 @@ class Run(BaseModel):
             "total_time_limit_s": self.total_time_limit_s,
             "timing_policy": self.timing_policy,
             "mode": self.mode,
+            "workflow": self.workflow,
             "verification_status": self.final.verification_status if self.final else "unverified",
         }
 
@@ -333,12 +366,13 @@ class CreateRun(BaseModel):
     request: str = Field(min_length=3, max_length=20_000)
     materials: str = Field(default="", max_length=60_000)
     profile: str = "auto"  # "auto" lets SASI pick the field from the request
-    require_plan_approval: bool = True
+    require_plan_approval: bool = False
     compare_all: bool | None = None
     mode: Literal["adaptive", "quick", "deep"] = "adaptive"
+    # Accepted for older clients, but new question-driven runs do not use a timer.
     time_limit_minutes: float | None = Field(default=None, ge=20, le=120)
     eris: bool = False  # Project Eris switch
-    file_ids: list[str] = Field(default=[], max_length=10)
+    file_ids: list[str] = Field(default=[], max_length=20)
 
 
 class ApprovePlan(BaseModel):
