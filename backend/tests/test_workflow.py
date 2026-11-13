@@ -90,8 +90,9 @@ def test_dependency_cycles_are_broken():
     assert not (tasks[0].depends_on and tasks[1].depends_on)
 
 
-def test_failing_provider_is_replaced():
+def test_failing_provider_is_replaced(monkeypatch):
     """A provider that errors is skipped and its work is reassigned; the run still completes."""
+    monkeypatch.setattr("app.gateway.registry._utc_date", lambda: "2026-10-20")  # before the spares retired
     with make_client(open_models="glm,deepseek,qwen") as client:
         registry = client.app.state.registry
 
@@ -518,8 +519,9 @@ def test_secret_manager_remove_writes_a_marker_and_destroys_old_versions():
     assert enabled == [REMOVED], "only the removal marker is left"
 
 
-def test_runs_go_ahead_with_whichever_keys_work():
+def test_runs_go_ahead_with_whichever_keys_work(monkeypatch):
     """With two failing keys, the run finishes on the one that works; failing keys are skipped next time and named."""
+    monkeypatch.setattr("app.gateway.registry._utc_date", lambda: "2026-10-20")  # before the spares retired
     from app.gateway.simulated import SimulatedAdapter
 
     class BadKey:

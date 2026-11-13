@@ -2,6 +2,84 @@
 
 **Sasidhar’s Artificial Super Intelligence** is a research and problem-solving workspace that coordinates existing models, supplied files, public evidence, and independent review. It is an orchestration application, not a newly trained frontier model. Its quality must be measured on real tasks; adding more models does not guarantee a better answer.
 
+> **Status, 13 November 2026.** SASI is a working multi-model prototype on Google Cloud. The next build is
+> **SASI ML Solver**, a Google ADK agent system that trains and verifies ML models. See
+> [What is completed](#what-is-completed), [What is not done yet](#what-is-not-done-yet) and
+> [Next plan](#next-plan-sasi-ml-solver-on-google-adk).
+
+## At a glance
+
+| | |
+|---|---|
+| Live app | Cloud Run, `us-central1`, project `sasi-511906` (private: owner access code) |
+| Models | Vertex AI: Gemini, Claude on Vertex (opt-in) and Model Garden open models (GLM 5.2, DeepSeek V4.1 Flash, gpt-oss); Claude and Gemini API keys as a second route |
+| Stack | FastAPI + Next.js in one container on Cloud Run; BigQuery; Cloud Storage; Secret Manager; Artifact Registry; Cloud Build and GitHub Actions |
+| Tests | 319 backend test functions (542 test cases), run by CI on every push |
+
+## What is completed
+
+- **Live on Google Cloud.** One container on Cloud Run with images in Artifact Registry. Pushes to `main` deploy
+  automatically, but only after CI passes, using keyless GitHub sign-in (Workload Identity Federation).
+  `deploy/deploy-now.sh` deploys from Cloud Shell through Cloud Build.
+- **Vertex AI model gateway, not only Gemini.** SASI reaches several model families through Vertex AI and Model
+  Garden: Gemini, Claude on Vertex (opt-in), and open models as a service (GLM 5.2, DeepSeek V4.1 Flash,
+  gpt-oss-120b; the Qwen, Kimi and MiniMax endpoints retired on 21 October 2026). It tries each model ID and
+  location, checks health, shows why a model is not working and falls back to the next one. Claude and Gemini API
+  keys are a second route. A trial-credit guard (`TRIAL_CREDITS_ONLY`) can limit the live app to Vertex Gemini to
+  protect free-trial credit, with an owner-funded Claude key allowed separately.
+- **Collaboration bridge.** One model writes the answer, a different model returns structured findings, and a
+  targeted correction and recheck run only when needed. Quick, Adaptive and Deep effort modes.
+- **Evidence and checks.** Safe link fetching, Gemini Google Search grounding with visible sources, citation
+  coverage checks, Python syntax checks, and reviews tied to the exact answer version (SHA-256).
+- **Data intake.** CSV, Parquet, Excel, Word, PowerPoint, JSON, PDF, ZIP and more. Resumable uploads of up to
+  10 GiB per run go to private Cloud Storage. Runs are saved in BigQuery (SQLite locally) and can be resumed,
+  cancelled and deleted.
+- **Project Eris ML-challenge mode.** Every model follows the challenge guidebook, only dry runs are allowed, and
+  the result downloads as one `solution.py`.
+- **Security and quality.** Owner access code with a signed session cookie; API keys kept in Secret Manager and
+  never sent back to the browser; 319 backend test functions; an opt-in evaluation harness in `evals/`.
+
+## What is not done yet
+
+- SASI does not run generated code or train ML models. There is no sandbox or GPU execution yet.
+- Orchestration is custom Python (a fixed bridge), not Google ADK agents.
+- There is no technique search: one answer per question, not parallel technique agents with sub-agents.
+- Reviews are model opinions, not verified re-runs with real metrics.
+- There is no CX Agent Studio front end and no memory across runs.
+
+## Next plan: SASI ML Solver on Google ADK
+
+The user describes an ML problem and uploads data. A Gemini root agent frames the task and writes a brief and a
+budget for each specialist. Every suitable technique family is tried in parallel on Google Cloud GPUs, an
+independent verifier re-runs the best candidates, and only verified models reach the final solution.
+
+```text
+User: CX Agent Studio chat or the SASI web app
+  -> Root orchestrator (ADK LlmAgent, Gemini Pro on Vertex AI)
+       reads the problem, frames the task, writes a brief and budget per specialist, re-plans as results arrive
+  -> Data Profiler agent: schema, statistics, leakage risks -> problem card
+  -> ParallelAgent of technique specialists (Gemini Flash), each Coder -> Tuner -> Evaluator
+       classical ML | deep learning | time series | NLP and vision | feature engineering
+       code runs only in sandboxed Vertex AI custom jobs or Cloud Run GPU jobs (L4, A100)
+  -> Verifier (LoopAgent): re-runs the best candidates on a frozen hold-out split,
+       checks leakage, metrics and seeds, sends targeted fixes back
+  -> Ensemble and report agent: solution.py, model card, Vertex AI Model Registry and Endpoint
+  -> Memory: experiment ledger in BigQuery and Vertex AI Experiments; Gemini Embedding for warm starts
+```
+
+| Step | What gets built | Done when |
+|---|---|---|
+| 1. Foundation | ADK project (built in Antigravity), Gemini root agent and Data Profiler, prompts tuned in AI Studio | The root agent writes a correct problem card for 10 sample datasets |
+| 2. Model access | The existing Vertex AI gateway wrapped for ADK: Gemini leads, Model Garden models stay available as optional reviewers | ADK agents call Gemini and a Model Garden model through the gateway |
+| 3. Technique agents | ParallelAgent for classical ML, deep learning, time series, NLP/vision and feature engineering, with an Agent Skill per technique | Each agent trains and scores a model on its own |
+| 4. GPU execution | Sandboxed Vertex AI custom jobs or Cloud Run GPU jobs, with budgets and approval for costly runs | 5 techniques run in parallel on one dataset in under 30 minutes |
+| 5. Verify and combine | LoopAgent verifier, shared findings, early stopping, ensemble and report agent | Every reported metric is reproduced by an independent re-run |
+| 6. Front end and deploy | CX Agent Studio front end, hosting on Vertex AI Agent Engine, final models on Vertex AI Endpoints | A user goes from a problem description to a live endpoint in one conversation |
+| 7. Evaluate | Benchmark against a single-agent baseline on public Kaggle-style tasks | A published table of score, reproducibility, time and cost per task |
+
+Success is measured three ways: the score against a single Gemini agent and a human baseline on the same tasks; the
+share of reported results that reproduce on re-run (target 100%); and the minutes and cost per solved problem.
+
 ## What this version changes
 
 - **Question-driven bridge:** new requests have no session timer. One model writes the answer and another returns compact, structured findings. A targeted correction and recheck run only when needed. Deep and Eris can add a short approach brief.
